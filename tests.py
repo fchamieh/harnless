@@ -515,6 +515,16 @@ class TestStatus(unittest.TestCase):
         self.assertNotIn("exit", out.split("tools: ")[1])
 
 
+class TestHelp(unittest.TestCase):
+    def test_lists_all_commands(self):
+        out = h.format_help()
+        for cmd in ("/new", "/clear-screen", "/status", "/help", "/exit"):
+            self.assertIn(cmd, out)
+
+    def test_mentions_quit_alias(self):
+        self.assertIn("/quit", h.format_help())
+
+
 class TestParseSseLine(unittest.TestCase):
     def _line(self, delta):
         return "data: " + json.dumps({"choices": [{"delta": delta}]})

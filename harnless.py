@@ -1208,6 +1208,17 @@ def format_status(messages: list) -> str:
     )
 
 
+def format_help() -> str:
+    """Build the /help report: list of REPL commands."""
+    return (
+        "/new            clear session history and start over\n"
+        "/clear-screen   clear the terminal screen\n"
+        "/status         show context usage, api url, and tools\n"
+        "/help           show this help\n"
+        "/exit           quit (alias: /quit)"
+    )
+
+
 # ---------------------------------------------------------------- loop
 
 
@@ -1381,7 +1392,7 @@ def main():
     print(colorize(f"harnless ready in {CWD} (api: {API_URL})", "dim"))
     print(
         colorize(
-            "type /new to start over, /clear-screen to clear the screen, /status for session info, /exit to quit\n"
+            "type /new to start over, /clear-screen to clear the screen, /status for session info, /help for commands, /exit to quit\n"
             "use up/down arrows to recall previous input\n",
             "dim",
         )
@@ -1406,6 +1417,9 @@ def main():
             continue
         if user_input == "/status":
             print(colorize(format_status(messages), "dim"))
+            continue
+        if user_input == "/help":
+            print(colorize(format_help(), "dim"))
             continue
         messages.append({"role": "user", "content": user_input})
         run_agent(
