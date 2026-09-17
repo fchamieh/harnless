@@ -1192,6 +1192,22 @@ def execute_tool(name: str, raw_args: str) -> str:
         return f"error: {type(e).__name__}: {e}"
 
 
+def format_status(messages: list) -> str:
+    """Build the /status report: context usage, API URL, tool names."""
+    total_chars = 0
+    for m in messages:
+        total_chars += len(m.get("content") or "")
+        for tc in m.get("tool_calls") or []:
+            total_chars += len((tc.get("function") or {}).get("arguments") or "")
+    approx_tokens = total_chars // 4
+    tool_names = ", ".join(s["function"]["name"] for s in OPENAI_TOOLS_INTERACTIVE)
+    return (
+        f"context: {approx_tokens} tokens (~{total_chars} chars) in {len(messages)} messages\n"
+        f"api url: {API_URL}\n"
+        f"tools: {tool_names}"
+    )
+
+
 # ---------------------------------------------------------------- loop
 
 
@@ -1365,7 +1381,7 @@ def main():
     print(colorize(f"harnless ready in {CWD} (api: {API_URL})", "dim"))
     print(
         colorize(
-            "type /new to start over, /clear-screen to clear the screen, /exit to quit\n"
+            "type /new to start over, /clear-screen to clear the screen, /status for session info, /exit to quit\n"
             "use up/down arrows to recall previous input\n",
             "dim",
         )
@@ -1387,6 +1403,9 @@ def main():
             continue
         if user_input == "/clear-screen":
             os.system("cls" if os.name == "nt" else "clear")
+            continue
+        if user_input == "/status":
+            print(colorize(format_status(messages), "dim"))
             continue
         messages.append({"role": "user", "content": user_input})
         run_agent(

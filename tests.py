@@ -475,6 +475,46 @@ class TestDispatch(Base):
         self.assertTrue(h.execute_tool("read_file", '{"path": "nope.txt"}').startswith("error:"))
 
 
+class TestStatus(unittest.TestCase):
+    def test_context_usage_counts_content_and_tool_args(self):
+        messages = [
+            {"role": "system", "content": "a" * 100},
+            {"role": "user", "content": "b" * 50},
+            {
+                "role": "assistant",
+                "content": "c" * 10,
+                "tool_calls": [
+                    {
+                        "id": "1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "d" * 40},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "1", "content": "e" * 20},
+        ]
+        out = h.format_status(messages)
+        # 100 + 50 + 10 + 40 + 20 = 220 chars -> 55 approx tokens
+        self.assertTrue(out.startswith("context: 55 tokens (~220 chars) in 4 messages"))
+
+    def test_empty_history(self):
+        out = h.format_status([])
+        self.assertTrue(out.startswith("context: 0 tokens (~0 chars) in 0 messages"))
+
+    def test_api_url_line(self):
+        old = h.API_URL
+        h.API_URL = "http://example.com/v1/chat/completions"
+        self.addCleanup(setattr, h, "API_URL", old)
+        out = h.format_status([{"role": "system", "content": "x"}])
+        self.assertIn("api url: http://example.com/v1/chat/completions", out)
+
+    def test_tool_names(self):
+        out = h.format_status([{"role": "system", "content": "x"}])
+        names = [s["function"]["name"] for s in h.OPENAI_TOOLS_INTERACTIVE]
+        self.assertIn("tools: " + ", ".join(names), out)
+        self.assertNotIn("exit", out.split("tools: ")[1])
+
+
 class TestParseSseLine(unittest.TestCase):
     def _line(self, delta):
         return "data: " + json.dumps({"choices": [{"delta": delta}]})
