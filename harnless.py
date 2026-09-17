@@ -767,6 +767,204 @@ def load_agents_md() -> str:
     return content
 
 
+# ---------------------------------------------------------------- line editor
+
+HISTORY = []
+HISTORY_MAX = 100
+
+
+def _history_add(entry: str):
+    entry = entry.strip()
+    if not entry:
+        return
+    if HISTORY and HISTORY[-1] == entry:
+        return
+    HISTORY.append(entry)
+    if len(HISTORY) > HISTORY_MAX:
+        HISTORY.pop(0)
+
+
+def _iter_keys_windows():
+    """Yield key tokens from the Windows console via msvcrt."""
+    import msvcrt
+
+    ext_map = {
+        "H": "up",
+        "J": "down",
+        "K": "left",
+        "L": "right",
+        "G": "home",
+        "M": "end",
+        "P": "delete",
+    }
+    while True:
+        ch = msvcrt.getwch()
+        if ch in ("\x00", "\xe0"):
+            code = msvcrt.getwch()
+            yield ext_map.get(code, "ignore")
+        elif ch == "\r":
+            yield "enter"
+        elif ch == "\x08":
+            yield "backspace"
+        elif ch == "\x03":
+            yield "ctrl_c"
+        elif ch == "\x04":
+            yield "ctrl_d"
+        elif ch == "\x15":
+            yield "ctrl_u"
+        elif ch == "\t" or ord(ch) < 32:
+            yield "ignore"
+        else:
+            yield ("char", ch)
+
+
+def _iter_keys_posix():
+    """Yield key tokens from a POSIX terminal in raw mode via termios/tty."""
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+
+    def read_char():
+        b = os.read(fd, 1)
+        if not b:
+            return None
+        first = b[0]
+        if first < 0x80:
+            return chr(first)
+        if first >= 0xF0:
+            n = 4
+        elif first >= 0xE0:
+            n = 3
+        elif first >= 0xC0:
+            n = 2
+        else:
+            return chr(first)
+        rest = b""
+        for _ in range(n - 1):
+            rest += os.read(fd, 1)
+        return (b + rest).decode("utf-8", errors="replace")
+
+    try:
+        tty.setraw(fd)
+        while True:
+            ch = read_char()
+            if ch is None:
+                yield "ctrl_d"
+                return
+            if ch == "\x1b":
+                seq = read_char()
+                if seq == "[":
+                    key = read_char()
+                    yield {"A": "up", "B": "down", "C": "right", "D": "left",
+                           "H": "home", "F": "end"}.get(key, "ignore")
+                else:
+                    yield "ignore"
+            elif ch in ("\r", "\n"):
+                yield "enter"
+            elif ch in ("\x7f", "\x08"):
+                yield "backspace"
+            elif ch == "\x03":
+                yield "ctrl_c"
+            elif ch == "\x04":
+                yield "ctrl_d"
+            elif ch == "\x15":
+                yield "ctrl_u"
+            elif ch == "\t" or ord(ch) < 32:
+                yield "ignore"
+            else:
+                yield ("char", ch)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _edit_line(prompt: str, keys) -> str:
+    """Run a minimal line editor over a key-token iterator. Returns the line."""
+    buf = []
+    pos = 0
+    hist_idx = len(HISTORY)
+
+    prev_len = 0
+
+    def render():
+        nonlocal prev_len
+        line = "".join(buf)
+        pad = max(0, prev_len - max(len(line), pos))
+        sys.stdout.write(
+            "\r" + prompt + line + " " * pad
+            + "\r" + prompt + line[:pos]
+        )
+        sys.stdout.flush()
+        prev_len = len(line)
+
+    def newline():
+        sys.stdout.write("\r\n")
+        sys.stdout.flush()
+
+    render()
+    while True:
+        token = next(keys)
+        if token == "enter":
+            break
+        elif token == "ctrl_c":
+            newline()
+            raise KeyboardInterrupt
+        elif token == "ctrl_d":
+            if not buf:
+                newline()
+                raise EOFError
+            break
+        elif token == "backspace":
+            if pos > 0:
+                del buf[pos - 1]
+                pos -= 1
+        elif token == "delete":
+            if pos < len(buf):
+                del buf[pos]
+        elif token == "ctrl_u":
+            buf = buf[pos:]
+            pos = 0
+        elif token == "left":
+            pos = max(0, pos - 1)
+        elif token == "right":
+            pos = min(len(buf), pos + 1)
+        elif token == "home":
+            pos = 0
+        elif token == "end":
+            pos = len(buf)
+        elif token == "up":
+            if hist_idx > 0:
+                hist_idx -= 1
+                buf = list(HISTORY[hist_idx])
+                pos = len(buf)
+        elif token == "down":
+            if hist_idx < len(HISTORY):
+                hist_idx += 1
+                buf = list(HISTORY[hist_idx]) if hist_idx < len(HISTORY) else []
+                pos = len(buf)
+        elif isinstance(token, tuple) and token[0] == "char":
+            buf.insert(pos, token[1])
+            pos += 1
+        render()
+    newline()
+    return "".join(buf)
+
+
+def readline_prompt(prompt: str) -> str:
+    """Read a line with arrow-key history. Falls back to input() when stdin
+    is not a TTY (piped input, tests)."""
+    if not sys.stdin.isatty():
+        return input(prompt)
+    try:
+        keys = _iter_keys_windows() if os.name == "nt" else _iter_keys_posix()
+    except Exception:
+        return input(prompt)
+    line = _edit_line(prompt, keys)
+    _history_add(line)
+    return line
+
+
 # ---------------------------------------------------------------- client
 
 
@@ -777,14 +975,16 @@ def _headers() -> dict:
     return headers
 
 
-def chat(messages: list, model: str, interactive: bool = False) -> dict:
+def chat(
+    messages: list, model: str, interactive: bool = False, temperature: float = 0.2
+) -> dict:
     payload = json.dumps(
         {
             "model": model,
             "messages": messages,
             "tools": OPENAI_TOOLS_INTERACTIVE if interactive else OPENAI_TOOLS,
             "tool_choice": "auto",
-            "temperature": 1.0,
+            "temperature": temperature,
         }
     ).encode("utf-8")
     req = urllib.request.Request(API_URL, data=payload, headers=_headers())
@@ -793,7 +993,11 @@ def chat(messages: list, model: str, interactive: bool = False) -> dict:
 
 
 def _build_request(
-    messages: list, model: str, stream: bool, interactive: bool = False
+    messages: list,
+    model: str,
+    stream: bool,
+    interactive: bool = False,
+    temperature: float = 0.2,
 ) -> urllib.request.Request:
     payload = json.dumps(
         {
@@ -801,7 +1005,7 @@ def _build_request(
             "messages": messages,
             "tools": OPENAI_TOOLS_INTERACTIVE if interactive else OPENAI_TOOLS,
             "tool_choice": "auto",
-            "temperature": 1.0,
+            "temperature": temperature,
             "stream": stream,
         }
     ).encode("utf-8")
@@ -828,9 +1032,13 @@ def parse_sse_line(line: str):
     return choice.get("delta") or {}
 
 
-def stream_chat(messages: list, model: str, interactive: bool = False):
+def stream_chat(
+    messages: list, model: str, interactive: bool = False, temperature: float = 0.2
+):
     """Yield deltas from a streaming chat response until [DONE]."""
-    req = _build_request(messages, model, stream=True, interactive=interactive)
+    req = _build_request(
+        messages, model, stream=True, interactive=interactive, temperature=temperature
+    )
     with urllib.request.urlopen(req, timeout=600) as resp:
         for raw in resp:
             parsed = parse_sse_line(raw.decode("utf-8"))
@@ -873,7 +1081,9 @@ def accumulate_delta(message: dict, delta: dict) -> dict:
     return message
 
 
-def stream_once(messages: list, model: str, interactive: bool = False):
+def stream_once(
+    messages: list, model: str, interactive: bool = False, temperature: float = 0.2
+):
     """Stream one chat turn, printing reasoning and content live.
 
     Returns (message, streamed) where streamed is False if no deltas
@@ -883,7 +1093,9 @@ def stream_once(messages: list, model: str, interactive: bool = False):
     started_reasoning = False
     started_content = False
     streamed = False
-    for delta in stream_chat(messages, model, interactive=interactive):
+    for delta in stream_chat(
+        messages, model, interactive=interactive, temperature=temperature
+    ):
         streamed = True
         reasoning = delta.get("reasoning_content")
         if reasoning:
@@ -934,12 +1146,16 @@ def execute_tool(name: str, raw_args: str) -> str:
 # ---------------------------------------------------------------- loop
 
 
-def run_agent(messages: list, model: str, interactive: bool = False) -> int:
+def run_agent(
+    messages: list, model: str, interactive: bool = False, temperature: float = 0.2
+) -> int:
     while True:
         message = None
         streamed = False
         try:
-            message, streamed = stream_once(messages, model, interactive=interactive)
+            message, streamed = stream_once(
+                messages, model, interactive=interactive, temperature=temperature
+            )
             if not streamed:
                 message = None
         except (urllib.error.URLError, ConnectionError, OSError) as e:
@@ -951,7 +1167,9 @@ def run_agent(messages: list, model: str, interactive: bool = False) -> int:
             )
         if message is None:
             try:
-                data = chat(messages, model, interactive=interactive)
+                data = chat(
+                    messages, model, interactive=interactive, temperature=temperature
+                )
             except urllib.error.URLError as e:
                 print(colorize(f"{icon('error')} connection error: {e}", "error"))
                 return 1
@@ -1042,6 +1260,12 @@ def main():
         help="one-shot mode: send this as the only user message, then exit",
     )
     parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.2,
+        help="sampling temperature (default: 0.2; lower = more deterministic tool calls)",
+    )
+    parser.add_argument(
         "--no-color",
         action="store_true",
         help="disable ANSI color output (also auto-disabled for piped output and NO_COLOR)",
@@ -1085,19 +1309,20 @@ def main():
     if args.prompt is not None:
         print(colorize(f"harnless one-shot in {CWD} (api: {API_URL})", "dim"))
         messages.append({"role": "user", "content": args.prompt})
-        sys.exit(run_agent(messages, args.model))
+        sys.exit(run_agent(messages, args.model, temperature=args.temperature))
 
     print(colorize(f"harnless ready in {CWD} (api: {API_URL})", "dim"))
     print(
         colorize(
-            "type /new to start over, /clear-screen to clear the screen, /exit to quit\n",
+            "type /new to start over, /clear-screen to clear the screen, /exit to quit\n"
+            "use up/down arrows to recall previous input\n",
             "dim",
         )
     )
 
     while True:
         try:
-            user_input = input(colorize(f"{icon('user')} you> ", "user")).strip()
+            user_input = readline_prompt(colorize(f"{icon('user')} you> ", "user")).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
@@ -1113,7 +1338,9 @@ def main():
             os.system("cls" if os.name == "nt" else "clear")
             continue
         messages.append({"role": "user", "content": user_input})
-        run_agent(messages, args.model, interactive=True)
+        run_agent(
+            messages, args.model, interactive=True, temperature=args.temperature
+        )
 
 
 if __name__ == "__main__":

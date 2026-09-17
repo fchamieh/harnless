@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+import sys
 import unittest
 
 import harnless as h
@@ -560,6 +561,102 @@ class TestStreamAccumulation(unittest.TestCase):
         msg = {"role": "assistant"}
         result = h.accumulate_delta(msg, {"content": "x"})
         self.assertIs(result, msg)
+
+
+class TestLineEditor(unittest.TestCase):
+    def setUp(self):
+        self._old_history = h.HISTORY
+        h.HISTORY = []
+        self.addCleanup(setattr, h, "HISTORY", self._old_history)
+
+    def edit(self, keys):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            line = h._edit_line("you> ", iter(keys))
+        return line, buf.getvalue()
+
+    def test_typing_and_enter(self):
+        keys = [("char", c) for c in "hello"] + ["enter"]
+        line, out = self.edit(keys)
+        self.assertEqual(line, "hello")
+        self.assertTrue(out.endswith("you> hello\r\n"))
+
+    def test_backspace_and_delete(self):
+        keys = [("char", c) for c in "abc"] + ["left", "left", "delete", "enter"]
+        self.assertEqual(self.edit(keys)[0], "ac")
+        keys = [("char", c) for c in "abc"] + ["backspace", "left", "delete", "enter"]
+        self.assertEqual(self.edit(keys)[0], "a")
+
+    def test_cursor_movement(self):
+        keys = [("char", c) for c in "abcd"] + ["left", "left", ("char", "X"), "enter"]
+        self.assertEqual(self.edit(keys)[0], "abXcd")
+
+    def test_home_end(self):
+        keys = [("char", c) for c in "ab"] + ["home", ("char", "X"), "end", ("char", "Y"), "enter"]
+        self.assertEqual(self.edit(keys)[0], "XabY")
+
+    def test_ctrl_u_clears_to_end(self):
+        keys = [("char", c) for c in "abc"] + ["left", "ctrl_u", "enter"]
+        self.assertEqual(self.edit(keys)[0], "c")
+
+    def test_history_up_down(self):
+        h.HISTORY = ["first", "second"]
+        keys = ["up", "enter"]
+        self.assertEqual(self.edit(keys)[0], "second")
+        keys = ["up", "up", "enter"]
+        self.assertEqual(self.edit(keys)[0], "first")
+        keys = ["up", "down", "enter"]
+        self.assertEqual(self.edit(keys)[0], "")
+        keys = ["up", "up", "down", "enter"]
+        self.assertEqual(self.edit(keys)[0], "second")
+        keys = ["up", "up", "down", "down", "enter"]
+        self.assertEqual(self.edit(keys)[0], "")
+
+    def test_history_up_at_top_stays(self):
+        h.HISTORY = ["only"]
+        self.assertEqual(self.edit(["up", "up", "enter"])[0], "only")
+
+    def test_ctrl_c_raises(self):
+        with self.assertRaises(KeyboardInterrupt):
+            self.edit([("char", "a"), "ctrl_c"])
+
+    def test_ctrl_d_empty_raises_eof(self):
+        with self.assertRaises(EOFError):
+            self.edit(["ctrl_d"])
+
+    def test_ctrl_d_nonempty_submits(self):
+        self.assertEqual(self.edit([("char", "a"), "ctrl_d"])[0], "a")
+
+    def test_ignore_tokens(self):
+        keys = [("char", "a"), "ignore", ("char", "b"), "enter"]
+        self.assertEqual(self.edit(keys)[0], "ab")
+
+    def test_history_add_dedup_and_cap(self):
+        h._history_add("a")
+        h._history_add("a")
+        h._history_add("b")
+        self.assertEqual(h.HISTORY, ["a", "b"])
+        h._history_add("")
+        h._history_add("   ")
+        self.assertEqual(h.HISTORY, ["a", "b"])
+        old_max = h.HISTORY_MAX
+        h.HISTORY_MAX = 3
+        self.addCleanup(setattr, h, "HISTORY_MAX", old_max)
+        for i in range(10):
+            h._history_add(f"e{i}")
+        self.assertEqual(len(h.HISTORY), 3)
+        self.assertEqual(h.HISTORY, ["e7", "e8", "e9"])
+
+    def test_readline_prompt_falls_back_without_tty(self):
+        import io
+        old = sys.stdin
+        sys.stdin = io.StringIO("piped line\n")
+        try:
+            self.assertEqual(h.readline_prompt("you> "), "piped line")
+        finally:
+            sys.stdin = old
 
 
 class TestEndToEndScenario(Base):
