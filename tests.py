@@ -691,6 +691,56 @@ class TestLineEditor(Base):
             sys.stdin = old
 
 
+class TestCsiSequences(unittest.TestCase):
+    def feed(self, seq):
+        it = iter(list(seq))
+        return h._parse_csi_seq(lambda: next(it, None))
+
+    def test_delete(self):
+        self.assertEqual(self.feed("3~"), "delete")
+
+    def test_arrows(self):
+        self.assertEqual(self.feed("A"), "up")
+        self.assertEqual(self.feed("B"), "down")
+        self.assertEqual(self.feed("C"), "right")
+        self.assertEqual(self.feed("D"), "left")
+
+    def test_home_end(self):
+        self.assertEqual(self.feed("H"), "home")
+        self.assertEqual(self.feed("F"), "end")
+
+    def test_unknown_ignored(self):
+        self.assertEqual(self.feed("2~"), "ignore")
+        self.assertEqual(self.feed("1;5C"), "ignore")
+
+    def test_truncated_ignored(self):
+        self.assertEqual(self.feed("3"), "ignore")
+
+    @unittest.skipIf(os.name == "nt", "pty not available on Windows")
+    def test_delete_key_via_pty(self):
+        import pty
+
+        master, slave = pty.openpty()
+        old = sys.stdin
+        stdin_file = os.fdopen(slave, "r")
+        try:
+            sys.stdin = stdin_file
+            os.write(master, b"abc\x1b[3~\r")
+            tokens = []
+            for tok in h._iter_keys_posix():
+                tokens.append(tok)
+                if tok == "enter":
+                    break
+            self.assertEqual(
+                tokens,
+                [("char", "a"), ("char", "b"), ("char", "c"), "delete", "enter"],
+            )
+        finally:
+            sys.stdin = old
+            stdin_file.close()
+            os.close(master)
+
+
 class TestEndToEndScenario(Base):
     def test_agent_workflow(self):
         proj = os.path.join(self.tmp, "proj").replace("\\", "/")

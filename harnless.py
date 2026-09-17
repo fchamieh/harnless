@@ -844,6 +844,31 @@ def _iter_keys_windows():
             yield ("char", ch)
 
 
+def _parse_csi_seq(read_char):
+    """Consume a CSI sequence (after ESC [) and return a key token.
+
+    Reads until the final byte (0x40-0x7E) so the whole sequence is
+    consumed; e.g. Delete sends ESC [ 3 ~ and must not leak the '~'.
+    """
+    params = ""
+    while True:
+        c = read_char()
+        if c is None:
+            return "ignore"
+        params += c
+        if 0x40 <= ord(c) <= 0x7E:
+            break
+    return {
+        "A": "up",
+        "B": "down",
+        "C": "right",
+        "D": "left",
+        "H": "home",
+        "F": "end",
+        "3~": "delete",
+    }.get(params, "ignore")
+
+
 def _iter_keys_posix():
     """Yield key tokens from a POSIX terminal in raw mode via termios/tty."""
     import termios
@@ -882,9 +907,7 @@ def _iter_keys_posix():
             if ch == "\x1b":
                 seq = read_char()
                 if seq == "[":
-                    key = read_char()
-                    yield {"A": "up", "B": "down", "C": "right", "D": "left",
-                           "H": "home", "F": "end"}.get(key, "ignore")
+                    yield _parse_csi_seq(read_char)
                 else:
                     yield "ignore"
             elif ch in ("\r", "\n"):
