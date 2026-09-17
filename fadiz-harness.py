@@ -13,8 +13,11 @@ import urllib.error
 
 API_URL = "http://127.0.0.1:11434/v1/chat/completions"
 CWD = os.getcwd()
-SHELL_NOTE = " Commands run in cmd.exe; prefer cross-platform commands (e.g. dir, type, copy, del) over bash-specific syntax." \
-    if os.name == "nt" else " Commands run in bash."
+SHELL_NOTE = (
+    " Commands run in cmd.exe; prefer cross-platform commands (e.g. dir, type, copy, del) over bash-specific syntax."
+    if os.name == "nt"
+    else " Commands run in bash."
+)
 
 
 class ExitSignal(Exception):
@@ -39,6 +42,7 @@ def safe_resolve(rel_path: str) -> str:
 
 
 # ---------------------------------------------------------------- tools
+
 
 def tool_get_cwd(args: dict) -> str:
     return CWD
@@ -134,7 +138,7 @@ def tool_write_file(args: dict) -> str:
     if offset > len(existing) + 1:
         return f"error: offset {offset} is beyond end of file ({len(existing)} lines)"
     start = offset - 1
-    result = existing[:start] + content_lines + existing[start + n:]
+    result = existing[:start] + content_lines + existing[start + n :]
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(result) + ("\n" if result else ""))
     if n > 0:
@@ -149,15 +153,22 @@ def tool_grep(args: dict) -> str:
     file_pattern = args.get("file_pattern")
     file_re = None
     if file_pattern:
-        file_re = re.compile("^" + file_pattern.replace("?", ".").replace("*", ".*") + "$") \
-            if not any(c in file_pattern for c in "[](){}|\\^$") else re.compile(file_pattern)
+        file_re = (
+            re.compile("^" + file_pattern.replace("?", ".").replace("*", ".*") + "$")
+            if not any(c in file_pattern for c in "[](){}|\\^$")
+            else re.compile(file_pattern)
+        )
     matches = []
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in (".git", "node_modules", "__pycache__")]
+        dirnames[:] = [
+            d for d in dirnames if d not in (".git", "node_modules", "__pycache__")
+        ]
         for name in filenames:
             fp = os.path.join(dirpath, name)
             rel = os.path.relpath(fp, CWD).replace("\\", "/")
-            if file_re is not None and not (file_re.search(rel) or file_re.search(os.path.basename(rel))):
+            if file_re is not None and not (
+                file_re.search(rel) or file_re.search(os.path.basename(rel))
+            ):
                 continue
             try:
                 lines = _read_lines(fp)
@@ -170,7 +181,9 @@ def tool_grep(args: dict) -> str:
                 hits = set(hit_idx)
                 shown = []
                 for i in hit_idx:
-                    for j in range(max(0, i - context), min(len(lines), i + context + 1)):
+                    for j in range(
+                        max(0, i - context), min(len(lines), i + context + 1)
+                    ):
                         if j not in shown:
                             shown.append(j)
                 for k, j in enumerate(shown):
@@ -201,9 +214,13 @@ def tool_patch_file(args: dict) -> str:
         lines = content.split("\n")
         if offset > len(lines):
             return f"error: offset {offset} is beyond end of file ({len(lines)} lines)"
-        start = sum(len(line) + 1 for line in lines[:offset - 1])
+        start = sum(len(line) + 1 for line in lines[: offset - 1])
         if n > 0:
-            end = start + sum(len(line) + 1 for line in lines[offset - 1:offset - 1 + n]) - 1
+            end = (
+                start
+                + sum(len(line) + 1 for line in lines[offset - 1 : offset - 1 + n])
+                - 1
+            )
         else:
             end = len(content)
         region = content[start:end]
@@ -235,18 +252,25 @@ def tool_patch_file(args: dict) -> str:
 def tool_glob(args: dict) -> str:
     root = safe_resolve(args["path"])
     pattern = args["pattern"]
-    regex = re.compile("^" + pattern.replace("?", ".").replace("*", ".*") + "$") \
-        if not any(c in pattern for c in "[](){}|\\^$") else re.compile(pattern)
+    regex = (
+        re.compile("^" + pattern.replace("?", ".").replace("*", ".*") + "$")
+        if not any(c in pattern for c in "[](){}|\\^$")
+        else re.compile(pattern)
+    )
     results = []
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in (".git", "node_modules", "__pycache__")]
+        dirnames[:] = [
+            d for d in dirnames if d not in (".git", "node_modules", "__pycache__")
+        ]
         for name in filenames:
             rel = os.path.relpath(os.path.join(dirpath, name), CWD)
             if regex.search(rel.replace("\\", "/")):
                 results.append(rel.replace("\\", "/"))
     if not results:
         return "no files matched"
-    return "\n".join(sorted(results)[:500]) + ("\n... [truncated at 500 files]" if len(results) > 500 else "")
+    return "\n".join(sorted(results)[:500]) + (
+        "\n... [truncated at 500 files]" if len(results) > 500 else ""
+    )
 
 
 def tool_list_dir(args: dict) -> str:
@@ -262,7 +286,9 @@ def tool_list_dir(args: dict) -> str:
             break
     if not out:
         return "(empty)"
-    return "\n".join(out) + ("\n... [truncated at 500 entries]" if len(entries) > 500 else "")
+    return "\n".join(out) + (
+        "\n... [truncated at 500 entries]" if len(entries) > 500 else ""
+    )
 
 
 def tool_delete_file(args: dict) -> str:
@@ -297,150 +323,331 @@ def tool_copy_file(args: dict) -> str:
 
 TOOLS = {
     "get_cwd": (
-        {"type": "function", "function": {
-            "name": "get_cwd",
-            "description": "Get the current working directory of the harness.",
-            "parameters": {"type": "object", "properties": {}},
-        }},
+        {
+            "type": "function",
+            "function": {
+                "name": "get_cwd",
+                "description": "Get the current working directory of the harness.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
         tool_get_cwd,
     ),
     "run_shell": (
-        {"type": "function", "function": {
-            "name": "run_shell",
-            "description": "Run a command in the current working directory." + SHELL_NOTE,
-            "parameters": {"type": "object", "properties": {
-                "command": {"type": "string", "description": "The command to run"},
-                "timeout": {"type": "integer", "description": "Timeout in seconds (default 120)"},
-            }, "required": ["command"]},
-        }},
+        {
+            "type": "function",
+            "function": {
+                "name": "run_shell",
+                "description": "Run a command in the current working directory."
+                + SHELL_NOTE,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The command to run",
+                        },
+                        "timeout": {
+                            "type": "integer",
+                            "description": "Timeout in seconds (default 120)",
+                        },
+                    },
+                    "required": ["command"],
+                },
+            },
+        },
         tool_run_shell,
     ),
     "mkdir": (
-        {"type": "function", "function": {
-            "name": "mkdir",
-            "description": "Create a directory (and parents) given its relative path to CWD, e.g. ./x/y/z.",
-            "parameters": {"type": "object", "properties": {
-                "path": {"type": "string", "description": "Relative path to create, e.g. ./x/y/z"},
-            }, "required": ["path"]},
-        }},
+        {
+            "type": "function",
+            "function": {
+                "name": "mkdir",
+                "description": "Create a directory (and parents) given its relative path to CWD, e.g. ./x/y/z.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Relative path to create, e.g. ./x/y/z",
+                        },
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
         tool_mkdir,
     ),
     "read_file": (
-        {"type": "function", "function": {
-            "name": "read_file",
-            "description": "Read a file given its relative path to CWD, e.g. ./x/y/z/file. Can read a line range; line numbers help target subsequent patch_file/write_file operations.",
-            "parameters": {"type": "object", "properties": {
-                "path": {"type": "string", "description": "Relative path to the file"},
-                "offset": {"type": "integer", "description": "First line to read, 1-based (default 1)"},
-                "lines": {"type": "integer", "description": "Number of lines to read (default: rest of file)"},
-                "line_numbers": {"type": "boolean", "description": "Prefix each line with its line number (default true)"},
-            }, "required": ["path"]},
-        }},
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file given its relative path to CWD, e.g. ./x/y/z/file. Can read a line range; line numbers help target subsequent patch_file/write_file operations.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Relative path to the file",
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "First line to read, 1-based (default 1)",
+                        },
+                        "lines": {
+                            "type": "integer",
+                            "description": "Number of lines to read (default: rest of file)",
+                        },
+                        "line_numbers": {
+                            "type": "boolean",
+                            "description": "Prefix each line with its line number (default true)",
+                        },
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
         tool_read_file,
     ),
     "write_file": (
-        {"type": "function", "function": {
-            "name": "write_file",
-            "description": "Write a file given its relative path to CWD. Without offset: create/overwrite the whole file. With offset: replace lines [offset, offset+lines) with the content (lines=0 inserts before line offset).",
-            "parameters": {"type": "object", "properties": {
-                "path": {"type": "string", "description": "Relative path to the file"},
-                "content": {"type": "string", "description": "File (or line-range) content to write"},
-                "offset": {"type": "integer", "description": "1-based line to start at. Omit to overwrite the whole file"},
-                "lines": {"type": "integer", "description": "With offset: number of existing lines to replace (default 0 = insert)"},
-            }, "required": ["path", "content"]},
-        }},
+        {
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Write a file given its relative path to CWD. Without offset: create/overwrite the whole file. With offset: replace lines [offset, offset+lines) with the content (lines=0 inserts before line offset).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Relative path to the file",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "File (or line-range) content to write",
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "1-based line to start at. Omit to overwrite the whole file",
+                        },
+                        "lines": {
+                            "type": "integer",
+                            "description": "With offset: number of existing lines to replace (default 0 = insert)",
+                        },
+                    },
+                    "required": ["path", "content"],
+                },
+            },
+        },
         tool_write_file,
     ),
     "grep": (
-        {"type": "function", "function": {
-            "name": "grep",
-            "description": "Recursively search file contents inside a relative directory path using a regex pattern.",
-            "parameters": {"type": "object", "properties": {
-                "path": {"type": "string", "description": "Relative directory path to search, e.g. ./x/y/z"},
-                "pattern": {"type": "string", "description": "Regex pattern to search"},
-                "context": {"type": "integer", "description": "Lines of context around each match (default 0); match lines are prefixed with '>'"},
-                "file_pattern": {"type": "string", "description": "Optional glob (e.g. *.py) or regex matched against relative file paths to restrict files scanned"},
-            }, "required": ["path", "pattern"]},
-        }},
+        {
+            "type": "function",
+            "function": {
+                "name": "grep",
+                "description": "Recursively search file contents inside a relative directory path using a regex pattern.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Relative directory path to search, e.g. ./x/y/z",
+                        },
+                        "pattern": {
+                            "type": "string",
+                            "description": "Regex pattern to search",
+                        },
+                        "context": {
+                            "type": "integer",
+                            "description": "Lines of context around each match (default 0); match lines are prefixed with '>'",
+                        },
+                        "file_pattern": {
+                            "type": "string",
+                            "description": "Optional glob (e.g. *.py) or regex matched against relative file paths to restrict files scanned",
+                        },
+                    },
+                    "required": ["path", "pattern"],
+                },
+            },
+        },
         tool_grep,
     ),
     "patch_file": (
-        {"type": "function", "function": {
-            "name": "patch_file",
-            "description": "Patch a file by replacing an exact old_string with new_string (changes certain lines). Provide enough context in old_string so it matches exactly once; if it matches multiple times, narrow the search with offset/lines.",
-            "parameters": {"type": "object", "properties": {
-                "path": {"type": "string", "description": "Relative path to the file"},
-                "old_string": {"type": "string", "description": "Exact text to replace (must match, including whitespace)"},
-                "new_string": {"type": "string", "description": "Replacement text"},
-                "offset": {"type": "integer", "description": "Optional: first line (1-based) of the region where old_string must be found"},
-                "lines": {"type": "integer", "description": "Optional: number of lines in the search region, starting at offset (default: to end of file)"},
-                "replace_all": {"type": "boolean", "description": "Replace all occurrences (default false)"},
-            }, "required": ["path", "old_string", "new_string"]},
-        }},
+        {
+            "type": "function",
+            "function": {
+                "name": "patch_file",
+                "description": "Patch a file by replacing an exact old_string with new_string (changes certain lines). Provide enough context in old_string so it matches exactly once; if it matches multiple times, narrow the search with offset/lines.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Relative path to the file",
+                        },
+                        "old_string": {
+                            "type": "string",
+                            "description": "Exact text to replace (must match, including whitespace)",
+                        },
+                        "new_string": {
+                            "type": "string",
+                            "description": "Replacement text",
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "Optional: first line (1-based) of the region where old_string must be found",
+                        },
+                        "lines": {
+                            "type": "integer",
+                            "description": "Optional: number of lines in the search region, starting at offset (default: to end of file)",
+                        },
+                        "replace_all": {
+                            "type": "boolean",
+                            "description": "Replace all occurrences (default false)",
+                        },
+                    },
+                    "required": ["path", "old_string", "new_string"],
+                },
+            },
+        },
         tool_patch_file,
     ),
     "glob": (
-        {"type": "function", "function": {
-            "name": "glob",
-            "description": "Find files under a relative directory path by glob pattern (e.g. **/*.py) or regex.",
-            "parameters": {"type": "object", "properties": {
-                "path": {"type": "string", "description": "Relative directory path to search, e.g. ./x/y/z"},
-                "pattern": {"type": "string", "description": "Glob pattern (e.g. **/*.ts) or regex matched against relative file paths"},
-            }, "required": ["path", "pattern"]},
-        }},
+        {
+            "type": "function",
+            "function": {
+                "name": "glob",
+                "description": "Find files under a relative directory path by glob pattern (e.g. **/*.py) or regex.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Relative directory path to search, e.g. ./x/y/z",
+                        },
+                        "pattern": {
+                            "type": "string",
+                            "description": "Glob pattern (e.g. **/*.ts) or regex matched against relative file paths",
+                        },
+                    },
+                    "required": ["path", "pattern"],
+                },
+            },
+        },
         tool_glob,
     ),
     "list_dir": (
-        {"type": "function", "function": {
-            "name": "list_dir",
-            "description": "List the contents of a directory given its relative path to CWD. Directories end with '/'.",
-            "parameters": {"type": "object", "properties": {
-                "path": {"type": "string", "description": "Relative directory path, e.g. ./src"},
-            }, "required": ["path"]},
-        }},
+        {
+            "type": "function",
+            "function": {
+                "name": "list_dir",
+                "description": "List the contents of a directory given its relative path to CWD. Directories end with '/'.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Relative directory path, e.g. ./src",
+                        },
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
         tool_list_dir,
     ),
     "delete_file": (
-        {"type": "function", "function": {
-            "name": "delete_file",
-            "description": "Delete a file given its relative path to CWD. Cannot delete directories.",
-            "parameters": {"type": "object", "properties": {
-                "path": {"type": "string", "description": "Relative path of the file to delete"},
-            }, "required": ["path"]},
-        }},
+        {
+            "type": "function",
+            "function": {
+                "name": "delete_file",
+                "description": "Delete a file given its relative path to CWD. Cannot delete directories.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Relative path of the file to delete",
+                        },
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
         tool_delete_file,
     ),
     "move_file": (
-        {"type": "function", "function": {
-            "name": "move_file",
-            "description": "Move (rename) a file between relative paths. Creates destination parent directories.",
-            "parameters": {"type": "object", "properties": {
-                "src": {"type": "string", "description": "Relative source path"},
-                "dst": {"type": "string", "description": "Relative destination path"},
-            }, "required": ["src", "dst"]},
-        }},
+        {
+            "type": "function",
+            "function": {
+                "name": "move_file",
+                "description": "Move (rename) a file between relative paths. Creates destination parent directories.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "src": {
+                            "type": "string",
+                            "description": "Relative source path",
+                        },
+                        "dst": {
+                            "type": "string",
+                            "description": "Relative destination path",
+                        },
+                    },
+                    "required": ["src", "dst"],
+                },
+            },
+        },
         tool_move_file,
     ),
     "copy_file": (
-        {"type": "function", "function": {
-            "name": "copy_file",
-            "description": "Copy a file to a new relative path. Creates destination parent directories.",
-            "parameters": {"type": "object", "properties": {
-                "src": {"type": "string", "description": "Relative source path"},
-                "dst": {"type": "string", "description": "Relative destination path"},
-            }, "required": ["src", "dst"]},
-        }},
+        {
+            "type": "function",
+            "function": {
+                "name": "copy_file",
+                "description": "Copy a file to a new relative path. Creates destination parent directories.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "src": {
+                            "type": "string",
+                            "description": "Relative source path",
+                        },
+                        "dst": {
+                            "type": "string",
+                            "description": "Relative destination path",
+                        },
+                    },
+                    "required": ["src", "dst"],
+                },
+            },
+        },
         tool_copy_file,
     ),
     "exit": (
-        {"type": "function", "function": {
-            "name": "exit",
-            "description": "Finish the harness and exit with a given exit code. Use 0 for success, non-zero for failure. Call this when the task is complete.",
-            "parameters": {"type": "object", "properties": {
-                "code": {"type": "integer", "description": "Exit code (default 0)"},
-                "message": {"type": "string", "description": "Optional final message"},
-            }, "required": []},
-        }},
+        {
+            "type": "function",
+            "function": {
+                "name": "exit",
+                "description": "Finish the harness and exit with a given exit code. Use 0 for success, non-zero for failure. Call this when the task is complete.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": {
+                            "type": "integer",
+                            "description": "Exit code (default 0)",
+                        },
+                        "message": {
+                            "type": "string",
+                            "description": "Optional final message",
+                        },
+                    },
+                    "required": [],
+                },
+            },
+        },
         tool_exit,
     ),
 }
@@ -448,28 +655,49 @@ TOOLS = {
 OPENAI_TOOLS = [spec for spec, _ in TOOLS.values()]
 DISPATCH = {name: fn for name, (_, fn) in TOOLS.items()}
 
-SYSTEM_PROMPT = (
-    "You are a coding assistant running inside a harness. Your working directory is {cwd}. "
-    "All file paths you use must be relative to it (e.g. ./src/main.py). "
-    "Use the provided tools to inspect and modify files, run commands, and search the codebase. "
-    "Explore with list_dir, glob, and grep; read files (the trailer shows total line count) before editing them, "
-    "and use patch_file with exact matches for edits. "
-    "If patch_file reports multiple matches, re-read the area with line numbers and retry using offset/lines. "
-    "When a task is done, summarize what you did concisely and call the exit tool with code 0. "
-    "If the task cannot be completed, call the exit tool with a non-zero code and explain why."
-).format(cwd=CWD)
+
+def get_system_prompt(cwd, additional) -> str:
+    return (
+        "You are a coding assistant running inside a harness. Your working directory is {cwd}. "
+        "All file paths you use must be relative to it (e.g. ./src/main.py). "
+        "Use the provided tools to inspect and modify files, run commands, and search the codebase. "
+        "Explore with list_dir, glob, and grep; read files (the trailer shows total line count) before editing them, "
+        "and use patch_file with exact matches for edits. "
+        "If patch_file reports multiple matches, re-read the area with line numbers and retry using offset/lines. "
+        "{additional}"
+    ).format(cwd=cwd, additional="")
+
+
+def load_agents_md() -> str:
+    """Read AGENTS.md (case-insensitive) from CWD, truncated. Returns "" if absent."""
+    path = os.path.join(CWD, "AGENTS.md")
+    if not os.path.exists(path):
+        for name in os.listdir(CWD):
+            if name.upper() == "AGENTS.MD":
+                path = os.path.join(CWD, name)
+                break
+        else:
+            return ""
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        content = f.read()
+    if len(content) > 20_000:
+        content = content[:20_000] + "\n... [truncated]"
+    return content
 
 
 # ---------------------------------------------------------------- client
 
+
 def chat(messages: list, model: str) -> dict:
-    payload = json.dumps({
-        "model": model,
-        "messages": messages,
-        "tools": OPENAI_TOOLS,
-        "tool_choice": "auto",
-        "temperature": 0.2,
-    }).encode("utf-8")
+    payload = json.dumps(
+        {
+            "model": model,
+            "messages": messages,
+            "tools": OPENAI_TOOLS,
+            "tool_choice": "auto",
+            "temperature": 0.2,
+        }
+    ).encode("utf-8")
     req = urllib.request.Request(
         API_URL,
         data=payload,
@@ -496,6 +724,7 @@ def execute_tool(name: str, raw_args: str) -> str:
 
 
 # ---------------------------------------------------------------- loop
+
 
 def run_agent(messages: list, model: str) -> int:
     while True:
@@ -526,24 +755,57 @@ def run_agent(messages: list, model: str) -> int:
                     print(f"[exit] {e.message}")
                 sys.exit(e.code)
             print(f"[result] {result[:500]}{'...' if len(result) > 500 else ''}")
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc["id"],
-                "content": result,
-            })
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": result,
+                }
+            )
 
 
 def main():
-    parser = argparse.ArgumentParser(description="fadiz-harness: minimal LLM agent harness")
-    parser.add_argument("--model", default="local-model",
-                        help="model name to send in the request (llama-server usually ignores it)")
-    parser.add_argument("--system-prompt", default=None,
-                        help="system prompt to use (replaces the built-in one)")
-    parser.add_argument("--prompt", default=None,
-                        help="one-shot mode: send this as the only user message, then exit")
+    parser = argparse.ArgumentParser(
+        description="fadiz-harness: minimal LLM agent harness"
+    )
+    parser.add_argument(
+        "--model",
+        default="local-model",
+        help="model name to send in the request (llama-server usually ignores it)",
+    )
+    parser.add_argument(
+        "--system-prompt",
+        default=None,
+        help="system prompt to use (replaces the built-in one)",
+    )
+    parser.add_argument(
+        "--prompt",
+        default=None,
+        help="one-shot mode: send this as the only user message, then exit",
+    )
     args = parser.parse_args()
 
-    system_prompt = args.system_prompt if args.system_prompt is not None else SYSTEM_PROMPT
+    system_prompt_additions = (
+        ""
+        if args.prompt is None
+        else (
+            "When a task is done, summarize what you did concisely and call the exit tool with code 0. "
+            "If the task cannot be completed, call the exit tool with a non-zero code and explain why."
+        )
+    )
+
+    system_prompt = (
+        args.system_prompt
+        if args.system_prompt is not None
+        else get_system_prompt(CWD, system_prompt_additions)
+    )
+    
+    agents_md = load_agents_md()
+    if agents_md:
+        system_prompt += (
+            "\n\nProject instructions (AGENTS.md in the working directory):\n"
+            + agents_md
+        )
     messages = [{"role": "system", "content": system_prompt}]
 
     if args.prompt is not None:

@@ -1,0 +1,449 @@
+"""Tests for fadiz-harness.py. Run from the repo root: python tests.py"""
+
+import importlib.util
+import os
+import shutil
+import unittest
+
+_spec = importlib.util.spec_from_file_location("harness", os.path.join(os.getcwd(), "fadiz-harness.py"))
+assert _spec is not None
+h = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(h)
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self.tmp = "./_test_tmp"
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        os.makedirs(self.tmp, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def p(self, rel: str) -> str:
+        return os.path.realpath(os.path.join(self.tmp, rel))
+
+    def w(self, rel: str, content: str):
+        return h.tool_write_file({"path": os.path.join(self.tmp, rel).replace("\\", "/"), "content": content})
+
+    def r(self, rel: str, **kw) -> str:
+        args = {"path": os.path.join(self.tmp, rel).replace("\\", "/"), "line_numbers": False}
+        args.update(kw)
+        return h.tool_read_file(args)
+
+
+class TestSafeResolve(Base):
+    def test_normal_resolution(self):
+        root_p = os.path.realpath(os.path.join(os.getcwd(), "a", "b.txt"))
+        self.assertEqual(h.safe_resolve("./a/b.txt"), root_p)
+        self.assertEqual(h.safe_resolve("a/b.txt"), root_p)
+
+    def test_absolute_rejected(self):
+        with self.assertRaises(ValueError):
+            h.safe_resolve(os.sep + "abs")
+
+    def test_dotdot_escape_rejected(self):
+        with self.assertRaises(ValueError):
+            h.safe_resolve("../evil.txt")
+        with self.assertRaises(ValueError):
+            h.safe_resolve("..\\evil.txt")
+
+
+class TestReadFile(Base):
+    def setUp(self):
+        super().setUp()
+        self.w("t.txt", "a\nb\nc\nd\n")
+
+    def test_read_all_numbered(self):
+        args = {"path": f"{self.tmp}/t.txt"}
+        self.assertEqual(h.tool_read_file(args), "1: a\n2: b\n3: c\n4: d")
+
+    def test_read_no_numbers(self):
+        self.assertEqual(self.r("t.txt"), "a\nb\nc\nd")
+
+    def test_read_range(self):
+        self.assertEqual(self.r("t.txt", offset=2, lines=2, line_numbers=True), "2: b\n3: c\n[lines 2-3 of 4]")
+
+    def test_read_beyond_eof(self):
+        self.assertEqual(self.r("t.txt", offset=9), "(empty)")
+
+    def test_read_bad_offset(self):
+        self.assertEqual(self.r("t.txt", offset=0), "error: offset must be >= 1")
+
+    def test_read_bad_lines(self):
+        self.assertEqual(self.r("t.txt", lines=-1), "error: lines must be >= 0")
+
+    def test_read_missing_file(self):
+        with self.assertRaises(FileNotFoundError):
+            self.r("nope.txt")
+
+    def test_read_empty_file(self):
+        self.w("e.txt", "")
+        self.assertEqual(self.r("e.txt"), "(empty)")
+
+    def test_read_truncation(self):
+        self.w("big.txt", "a" * 60_000 + "\n")
+        out = self.r("big.txt")
+        self.assertTrue(out.startswith("a" * 50_000))
+        self.assertTrue(out.endswith("\n... [truncated]"))
+
+    def test_read_no_trailing_newline(self):
+        self.w("nt.txt", "a\nb")
+        self.assertEqual(self.r("nt.txt"), "a\nb")
+
+
+class TestWriteFile(Base):
+    def test_full_overwrite(self):
+        msg = h.tool_write_file({"path": f"{self.tmp}/t.txt", "content": "a\nb\nc\nd\n"})
+        self.assertEqual(msg, f"wrote 8 chars to {self.p('t.txt')}")
+
+    def test_creates_parent_dirs(self):
+        self.w("deep/nested/f.txt", "hi")
+        self.assertEqual(self.r("deep/nested/f.txt"), "hi")
+
+    def test_empty_content(self):
+        msg = self.w("e.txt", "")
+        self.assertTrue(msg.startswith("wrote 0 chars to "))
+        self.assertTrue(os.path.exists(self.p("e.txt")))
+
+    def test_insert_before_line_2(self):
+        self.w("t.txt", "a\nb\nc\nd\n")
+        msg = h.tool_write_file({"path": f"{self.tmp}/t.txt", "content": "x", "offset": 2, "lines": 0})
+        self.assertEqual(msg, f"inserted 1 line(s) before line 2 in {self.p('t.txt')}")
+        self.assertEqual(self.r("t.txt"), "a\nx\nb\nc\nd")
+
+    def test_insert_at_line_1(self):
+        self.w("t.txt", "b\n")
+        self.w("t.txt", "a")
+        self.assertEqual(self.r("t.txt"), "a")
+        h.tool_write_file({"path": f"{self.tmp}/t.txt", "content": "z", "offset": 1, "lines": 0})
+        self.assertEqual(self.r("t.txt"), "z\na")
+
+    def test_replace_range(self):
+        self.w("t.txt", "a\nx\nb\nc\nd\n")
+        msg = h.tool_write_file({"path": f"{self.tmp}/t.txt", "content": "q\nr", "offset": 3, "lines": 2})
+        self.assertEqual(msg, f"replaced lines 3-4 of {self.p('t.txt')} with 2 line(s)")
+        self.assertEqual(self.r("t.txt"), "a\nx\nq\nr\nd")
+
+    def test_append_at_eof(self):
+        self.w("t.txt", "a\nb\nc\n")
+        h.tool_write_file({"path": f"{self.tmp}/t.txt", "content": "end", "offset": 4})
+        self.assertEqual(self.r("t.txt"), "a\nb\nc\nend")
+
+    def test_offset_beyond_end(self):
+        self.w("t.txt", "a\nb\n")
+        self.assertEqual(
+            h.tool_write_file({"path": f"{self.tmp}/t.txt", "content": "z", "offset": 99}),
+            "error: offset 99 is beyond end of file (2 lines)")
+
+    def test_offset_zero(self):
+        self.w("t.txt", "a\n")
+        self.assertEqual(
+            h.tool_write_file({"path": f"{self.tmp}/t.txt", "content": "z", "offset": 0}),
+            "error: offset must be >= 1 and lines must be >= 0")
+
+    def test_missing_file_with_offset(self):
+        self.assertEqual(
+            h.tool_write_file({"path": f"{self.tmp}/nope.txt", "content": "z", "offset": 1}),
+            f"error: file does not exist, cannot modify line range: {self.p('nope.txt')}")
+
+
+class TestPatchFile(Base):
+    def patch(self, rel, old, new, **kw):
+        args = {"path": os.path.join(self.tmp, rel).replace("\\", "/"), "old_string": old, "new_string": new}
+        args.update(kw)
+        return h.tool_patch_file(args)
+
+    def test_simple(self):
+        self.w("t.txt", "foo\nbar\n")
+        self.assertEqual(self.patch("t.txt", "foo", "FOO"), f"patched {self.p('t.txt')}: replaced 1 occurrence(s)")
+        self.assertEqual(self.r("t.txt"), "FOO\nbar")
+
+    def test_scoped_patch(self):
+        self.w("t.txt", "foo\nbar\nfoo\nbaz\nfoo\n")
+        self.assertEqual(self.patch("t.txt", "foo", "FOO", offset=3, lines=1),
+                         f"patched {self.p('t.txt')}: replaced 1 occurrence(s)")
+        self.assertEqual(self.r("t.txt"), "foo\nbar\nFOO\nbaz\nfoo")
+
+    def test_scoped_not_found(self):
+        self.w("t.txt", "foo\nbar\nfoo\nbaz\nfoo\n")
+        self.assertEqual(self.patch("t.txt", "bar", "BAR", offset=4, lines=1),
+                         "error: old_string not found in lines 4-4")
+
+    def test_scoped_multiple(self):
+        self.w("t.txt", "foo\nfoo\nfoo\n")
+        self.assertEqual(self.patch("t.txt", "foo", "X", offset=1, lines=2),
+                         "error: old_string found 2 times in lines 1-2; narrow the range or add context")
+
+    def test_scoped_to_eof(self):
+        self.w("t.txt", "foo\nfoo\nfoo\n")
+        self.assertEqual(self.patch("t.txt", "foo", "LAST", offset=3),
+                         f"patched {self.p('t.txt')}: replaced 1 occurrence(s)")
+        self.assertEqual(self.r("t.txt"), "foo\nfoo\nLAST")
+
+    def test_unscoped_multiple_errors(self):
+        self.w("t.txt", "foo\nfoo\nLAST\n")
+        self.assertEqual(self.patch("t.txt", "foo", "X"),
+                         "error: old_string found 2 times; provide more context, use offset/lines, or set replace_all")
+
+    def test_replace_all(self):
+        self.w("t.txt", "foo\nbar\nfoo\n")
+        self.assertEqual(self.patch("t.txt", "foo", "X", replace_all=True),
+                         f"patched {self.p('t.txt')}: replaced 2 occurrence(s)")
+        self.assertEqual(self.r("t.txt"), "X\nbar\nX")
+
+    def test_multiline_scoped(self):
+        self.w("t.txt", "l1\nmid\nl3\nmid\nl5\n")
+        self.assertEqual(self.patch("t.txt", "mid\nl3", "MID\nL3", offset=2, lines=2),
+                         f"patched {self.p('t.txt')}: replaced 1 occurrence(s)")
+        self.assertEqual(self.r("t.txt"), "l1\nMID\nL3\nmid\nl5")
+
+    def test_whitespace_sensitive(self):
+        self.w("t.txt", "foo\nbar\n")
+        self.assertEqual(self.patch("t.txt", "foo ", "X"), "error: old_string not found in file")
+
+    def test_whole_file(self):
+        self.w("t.txt", "only")
+        self.assertEqual(self.patch("t.txt", "only", "changed"),
+                         f"patched {self.p('t.txt')}: replaced 1 occurrence(s)")
+        self.assertEqual(self.r("t.txt"), "changed")
+
+    def test_missing_file(self):
+        with self.assertRaises(FileNotFoundError):
+            self.patch("nope.txt", "a", "b")
+
+
+class TestGrep(Base):
+    def grep(self, pattern, **kw):
+        args = {"path": self.tmp, "pattern": pattern}
+        args.update(kw)
+        return h.tool_grep(args)
+
+    def test_basic(self):
+        self.w("st/g1.txt", "l1\nAAA mid\nl3\n")
+        self.assertEqual(self.grep("AAA"), "_test_tmp/st/g1.txt:2: AAA mid")
+
+    def test_no_matches(self):
+        self.w("st/g1.txt", "nothing here\n")
+        self.assertEqual(self.grep("AAA"), "no matches")
+
+    def test_case_insensitive(self):
+        self.w("st/g1.txt", "AAA\n")
+        self.assertEqual(self.grep("aaa"), "_test_tmp/st/g1.txt:1: AAA")
+
+    def test_context(self):
+        self.w("st/g1.txt", "l1\nAAA mid\nl3\nl9\nl10\nAAA end\n")
+        self.assertEqual(self.grep("AAA", context=1),
+                         "  _test_tmp/st/g1.txt:1: l1\n> _test_tmp/st/g1.txt:2: AAA mid\n  _test_tmp/st/g1.txt:3: l3\n"
+                         "--\n  _test_tmp/st/g1.txt:5: l10\n> _test_tmp/st/g1.txt:6: AAA end")
+
+    def test_file_pattern_regex(self):
+        self.w("st/g1.txt", "AAA\n")
+        self.w("st/g2.txt", "AAA\n")
+        self.assertEqual(self.grep("AAA", file_pattern=".*g1.*"), "_test_tmp/st/g1.txt:1: AAA")
+
+    def test_file_pattern_glob(self):
+        self.w("st/g1.txt", "AAA\n")
+        self.w("st/other.md", "AAA\n")
+        self.assertEqual(self.grep("AAA", file_pattern="*.txt"), "_test_tmp/st/g1.txt:1: AAA")
+
+    def test_file_pattern_no_match(self):
+        self.w("st/g1.txt", "AAA\n")
+        self.assertEqual(self.grep("AAA", file_pattern="nope.*"), "no matches")
+
+    def test_node_modules_skipped(self):
+        os.makedirs(os.path.join(self.tmp, "node_modules", "pkg"), exist_ok=True)
+        with open(os.path.join(self.tmp, "node_modules", "pkg", "p.js"), "w", encoding="utf-8") as f:
+            f.write("AAA\n")
+        self.assertEqual(self.grep("AAA"), "no matches")
+
+    def test_match_truncation(self):
+        self.w("st/many.txt", "\n".join("AAA" for _ in range(250)))
+        out = self.grep("AAA")
+        self.assertTrue(out.endswith("... [truncated at 200 matches]"))
+
+
+class TestGlob(Base):
+    def glob(self, pattern):
+        return h.tool_glob({"path": self.tmp, "pattern": pattern})
+
+    def test_star(self):
+        self.w("a.txt", "x")
+        self.w("b.md", "x")
+        self.assertEqual(self.glob("*.txt"), "_test_tmp/a.txt")
+
+    def test_nested(self):
+        self.w("src/deep/c.py", "x")
+        self.assertEqual(self.glob("**/*.py"), "_test_tmp/src/deep/c.py")
+
+    def test_no_match(self):
+        self.w("a.txt", "x")
+        self.assertEqual(self.glob("*.py"), "no files matched")
+
+    def test_pycache_skipped(self):
+        os.makedirs(os.path.join(self.tmp, "__pycache__"), exist_ok=True)
+        with open(os.path.join(self.tmp, "__pycache__", "m.cpython-311.pyc"), "w") as f:
+            f.write("x")
+        self.assertEqual(self.glob("**/*.pyc"), "no files matched")
+
+
+class TestDirOps(Base):
+    def test_mkdir_nested(self):
+        path = os.path.join(self.tmp, "x", "y", "z").replace("\\", "/")
+        self.assertEqual(h.tool_mkdir({"path": path}), f"created directory: {self.p('x/y/z')}")
+
+    def test_mkdir_existing_ok(self):
+        os.makedirs(os.path.join(self.tmp, "x"))
+        h.tool_mkdir({"path": f"{self.tmp}/x"})
+
+    def test_list_dir(self):
+        os.makedirs(os.path.join(self.tmp, "st", "sub"))
+        os.makedirs(os.path.join(self.tmp, "st", "empty"))
+        self.w("st/a.txt", "one")
+        self.w("st/sub/b.txt", "one")
+        self.assertEqual(h.tool_list_dir({"path": f"{self.tmp}/st"}), "a.txt\nempty/\nsub/")
+
+    def test_list_dir_empty(self):
+        os.makedirs(os.path.join(self.tmp, "empty"))
+        self.assertEqual(h.tool_list_dir({"path": f"{self.tmp}/empty"}), "(empty)")
+
+    def test_list_dir_missing(self):
+        self.assertEqual(h.tool_list_dir({"path": f"{self.tmp}/missing"}), "error: not a directory: " + f"{self.tmp}/missing")
+
+    def test_list_dir_truncation(self):
+        for i in range(502):
+            with open(os.path.join(self.tmp, f"f{i:03d}.txt"), "w") as f:
+                f.write("x")
+        out = h.tool_list_dir({"path": self.tmp})
+        self.assertEqual(len(out.split("\n")), 501)
+        self.assertTrue(out.endswith("... [truncated at 500 entries]"))
+
+    def test_copy(self):
+        self.w("st/a.txt", "one\ntwo\n")
+        self.assertEqual(h.tool_copy_file({"src": f"{self.tmp}/st/a.txt", "dst": f"{self.tmp}/st/c.txt"}),
+                         f"copied {self.p('st/a.txt')} -> {self.p('st/c.txt')}")
+        self.assertEqual(self.r("st/c.txt"), "one\ntwo")
+
+    def test_move_creates_parents(self):
+        self.w("st/a.txt", "one")
+        self.assertEqual(h.tool_move_file({"src": f"{self.tmp}/st/a.txt", "dst": f"{self.tmp}/st/new/d.txt"}),
+                         f"moved {self.p('st/a.txt')} -> {self.p('st/new/d.txt')}")
+        self.assertEqual(self.r("st/new/d.txt"), "one")
+
+    def test_delete(self):
+        self.w("st/a.txt", "one")
+        self.assertEqual(h.tool_delete_file({"path": f"{self.tmp}/st/a.txt"}), f"deleted {self.p('st/a.txt')}")
+        self.assertFalse(os.path.exists(self.p("st/a.txt")))
+
+    def test_delete_missing(self):
+        self.assertEqual(h.tool_delete_file({"path": f"{self.tmp}/nope.txt"}), f"error: file does not exist: {self.tmp}/nope.txt")
+
+    def test_delete_dir_rejected(self):
+        os.makedirs(os.path.join(self.tmp, "d"))
+        self.assertEqual(h.tool_delete_file({"path": f"{self.tmp}/d"}), f"error: cannot delete a directory: {self.tmp}/d")
+
+    def test_copy_missing(self):
+        self.assertEqual(h.tool_copy_file({"src": f"{self.tmp}/nope.txt", "dst": f"{self.tmp}/x.txt"}),
+                         f"error: source does not exist: {self.tmp}/nope.txt")
+
+
+class TestRunShell(Base):
+    def sh(self, command, **kw):
+        args = {"command": command}
+        args.update(kw)
+        return h.tool_run_shell(args)
+
+    def test_success(self):
+        out = self.sh("python -c \"print('hello')\"")
+        self.assertEqual(out, "exit code: 0\nhello")
+
+    def test_nonzero_exit_with_stderr(self):
+        out = self.sh("python -c \"import sys; sys.stderr.write('boom'); sys.exit(3)\"")
+        self.assertEqual(out, "exit code: 3\n[stderr]\nboom")
+
+    def test_empty_command(self):
+        self.assertEqual(self.sh(""), "error: empty command")
+        self.assertEqual(self.sh("   "), "error: empty command")
+
+    def test_output_truncation(self):
+        r = self.sh("python -c \"import sys; sys.stdout.write('x'*30000)\"")
+        self.assertTrue(r.startswith("exit code: 0\n" + "x" * 20_000 + "\n... [truncated, 30000 chars total]"))
+
+    def test_timeout(self):
+        out = self.sh("python -c \"import time; time.sleep(2)\"", timeout=1)
+        self.assertEqual(out, "error: command timed out after 1s")
+
+
+class TestLoadAgentsMd(Base):
+    def setUp(self):
+        super().setUp()
+        self._old_cwd = h.CWD
+        setattr(h, "CWD", self.p(""))
+
+    def tearDown(self):
+        setattr(h, "CWD", self._old_cwd)
+        super().tearDown()
+
+    def test_absent(self):
+        self.assertEqual(h.load_agents_md(), "")
+
+    def test_case_insensitive(self):
+        with open(os.path.join(self.p(""), "agents.md"), "w", encoding="utf-8") as f:
+            f.write("rules here")
+        self.assertEqual(h.load_agents_md(), "rules here")
+
+    def test_exact_name(self):
+        with open(os.path.join(self.p(""), "AGENTS.md"), "w", encoding="utf-8") as f:
+            f.write("rules")
+        self.assertEqual(h.load_agents_md(), "rules")
+
+    def test_truncation(self):
+        with open(os.path.join(self.p(""), "AGENTS.md"), "w", encoding="utf-8") as f:
+            f.write("a" * 25_000)
+        out = h.load_agents_md()
+        self.assertTrue(out.startswith("a" * 20_000))
+        self.assertTrue(out.endswith("\n... [truncated]"))
+
+
+class TestDispatch(Base):
+    def test_get_cwd(self):
+        self.assertEqual(h.execute_tool("get_cwd", "{}"), h.CWD)
+
+    def test_invalid_json(self):
+        self.assertEqual(h.execute_tool("read_file", "{bad"), "error: invalid JSON arguments: {bad")
+
+    def test_unknown_tool(self):
+        self.assertEqual(h.execute_tool("nope", "{}"), "error: unknown tool: nope")
+
+    def test_exit_signal_propagates(self):
+        with self.assertRaises(h.ExitSignal) as ctx:
+            h.execute_tool("exit", '{"code": 5, "message": "done"}')
+        self.assertEqual(ctx.exception.code, 5)
+        self.assertEqual(ctx.exception.message, "done")
+
+    def test_tool_exception_caught(self):
+        self.assertTrue(h.execute_tool("read_file", '{"path": "nope.txt"}').startswith("error:"))
+
+
+class TestEndToEndScenario(Base):
+    def test_agent_workflow(self):
+        proj = os.path.join(self.tmp, "proj").replace("\\", "/")
+        h.tool_write_file({"path": f"{proj}/src/main.py", "content": "def calc(x):\n    return x + 1\n\nprint(calc(5))\n"})
+        h.tool_write_file({"path": f"{proj}/src/util.py", "content": "def other():\n    pass\n"})
+        h.tool_write_file({"path": f"{proj}/README.md", "content": "# demo\n"})
+
+        found = h.tool_grep({"path": proj, "pattern": "def calc"})
+        self.assertEqual(found, "_test_tmp/proj/src/main.py:1: def calc(x):")
+
+        self.assertEqual(
+            h.tool_patch_file({"path": f"{proj}/src/main.py", "old_string": "return x + 1", "new_string": "return x * 2"}),
+            f"patched {self.p('proj/src/main.py')}: replaced 1 occurrence(s)")
+
+        self.assertEqual(self.r("proj/src/main.py"), "def calc(x):\n    return x * 2\n\nprint(calc(5))")
+
+        out = h.tool_run_shell({"command": f"python {proj}/src/main.py".replace("\\", "/")})
+        self.assertEqual(out, "exit code: 0\n10")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
