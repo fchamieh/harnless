@@ -515,6 +515,40 @@ class TestStatus(unittest.TestCase):
         self.assertNotIn("exit", out.split("tools: ")[1])
 
 
+class TestNormalizeApiUrl(unittest.TestCase):
+    def test_full_endpoint_unchanged(self):
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        self.assertEqual(h.normalize_api_url(url), url)
+
+    def test_full_endpoint_trailing_slash(self):
+        self.assertEqual(
+            h.normalize_api_url("https://openrouter.ai/api/v1/chat/completions/"),
+            "https://openrouter.ai/api/v1/chat/completions",
+        )
+
+    def test_base_url_gets_endpoint(self):
+        self.assertEqual(
+            h.normalize_api_url("https://openrouter.ai/api/v1"),
+            "https://openrouter.ai/api/v1/chat/completions",
+        )
+
+    def test_local_default_base_url(self):
+        self.assertEqual(
+            h.normalize_api_url("http://127.0.0.1:11434/v1"),
+            "http://127.0.0.1:11434/v1/chat/completions",
+        )
+
+    def test_strips_whitespace_and_slashes(self):
+        self.assertEqual(
+            h.normalize_api_url("  http://127.0.0.1:11434/v1/  "),
+            "http://127.0.0.1:11434/v1/chat/completions",
+        )
+
+    def test_empty_stays_empty(self):
+        self.assertEqual(h.normalize_api_url(""), "")
+        self.assertEqual(h.normalize_api_url(None), "")
+
+
 class TestHelp(unittest.TestCase):
     def test_lists_all_commands(self):
         out = h.format_help()

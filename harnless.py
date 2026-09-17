@@ -1402,6 +1402,19 @@ def readline_prompt(prompt: str) -> str:
 # ---------------------------------------------------------------- client
 
 
+def normalize_api_url(url: str) -> str:
+    """Return the chat completions endpoint for a given API URL.
+
+    Accepts either a full endpoint (``https://openrouter.ai/api/v1/chat/completions``)
+    or just a base URL (``https://openrouter.ai/api/v1``), which gets
+    ``/chat/completions`` appended. A trailing slash is tolerated.
+    """
+    endpoint = (url or "").strip().rstrip("/")
+    if not endpoint or endpoint.endswith("/chat/completions"):
+        return endpoint
+    return endpoint + "/chat/completions"
+
+
 def _headers() -> dict:
     headers = {"Content-Type": "application/json"}
     if API_KEY:
@@ -1831,7 +1844,11 @@ def main():
     parser.add_argument(
         "--api-url",
         default=API_URL,
-        help=f"OpenAI-compatible chat completions endpoint (default: {API_URL})",
+        help=(
+            "OpenAI-compatible API URL: either a base URL "
+            "(e.g. https://openrouter.ai/api/v1) or a full chat completions "
+            f"endpoint (default: {API_URL})"
+        ),
     )
     parser.add_argument(
         "--api-key",
@@ -1892,7 +1909,7 @@ def main():
     )
     args = parser.parse_args()
 
-    API_URL = args.api_url
+    API_URL = normalize_api_url(args.api_url)
     API_KEY = args.api_key
 
     set_color_enabled(not args.no_color and color_enabled())
