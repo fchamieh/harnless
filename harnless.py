@@ -2,12 +2,15 @@
 """harnless: a minimal agent harness for a local llama-server (OpenAI-compatible)."""
 
 import argparse
+import atexit
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import urllib.request
 import urllib.error
 
@@ -735,6 +738,377 @@ OPENAI_TOOLS_INTERACTIVE = [
 DISPATCH = {name: fn for name, (_, fn) in TOOLS.items()}
 
 
+# ---------------------------------------------------------------- mcp
+
+MCP_PROTOCOL_VERSION = "2025-06-18"
+MCP_TIMEOUT = 60  # seconds per request
+
+MCP_TOOLS = []      # OpenAI tool specs for MCP tools
+MCP_DISPATCH = {}   # tool name -> (MCPClient, tool name)
+MCP_CLIENTS = []    # all configured MCP clients (for /status)
+
+
+class MCPError(Exception):
+    pass
+
+
+def _mcp_content_to_text(result: dict) -> str:
+    """Convert an MCP tools/call result to a string for the tool-result channel."""
+    parts = []
+    for item in result.get("content") or []:
+        t = item.get("type")
+        if t == "text":
+            parts.append(item.get("text", ""))
+        elif t == "image":
+            parts.append(f"[image: {item.get('mimeType', 'unknown')}]")
+        elif t == "resource":
+            parts.append(f"[resource: {(item.get('resource') or {}).get('uri', '')}]")
+        elif t == "resource_link":
+            parts.append(f"[resource link: {item.get('uri', '')}]")
+        else:
+            parts.append(json.dumps(item))
+    text = "\n".join(p for p in parts if p)
+    structured = result.get("structuredContent")
+    if structured is not None:
+        text = (text + "\n" if text else "") + "structured: " + json.dumps(structured)
+    if not text:
+        text = "(no content)"
+    if result.get("isError"):
+        text = "error: " + text
+    return text
+
+
+def _expand_env(value):
+    """Expand ${VAR} references in a string using os.environ; missing vars left as-is."""
+    if not isinstance(value, str):
+        return value
+    return re.sub(
+        r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}",
+        lambda m: os.environ.get(m.group(1), m.group(0)),
+        value,
+    )
+
+
+def load_mcp_config(path: str) -> dict:
+    """Load an MCP config file. Accepts {"mcpServers": {...}} or a bare {...}.
+
+    Returns a dict of server name -> config, with ${VAR} expansion applied to
+    command/args/env/headers/url.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    servers = data.get("mcpServers", data) if isinstance(data, dict) else {}
+    out = {}
+    for name, cfg in servers.items():
+        cfg = dict(cfg)
+        if "command" in cfg:
+            cfg["command"] = _expand_env(cfg["command"])
+        if "args" in cfg:
+            cfg["args"] = [_expand_env(a) for a in cfg["args"]]
+        if "env" in cfg:
+            cfg["env"] = {k: _expand_env(v) for k, v in cfg["env"].items()}
+        if "headers" in cfg:
+            cfg["headers"] = {k: _expand_env(v) for k, v in cfg["headers"].items()}
+        if "url" in cfg:
+            cfg["url"] = _expand_env(cfg["url"])
+        out[name] = cfg
+    return out
+
+
+def _parse_mcp_stdio(spec: str):
+    """Parse 'name:command args...' into (name, config)."""
+    if ":" not in spec:
+        raise MCPError(f"invalid --mcp-stdio '{spec}'; expected name:command args...")
+    name, rest = spec.split(":", 1)
+    parts = rest.split()
+    if not name or not parts:
+        raise MCPError(f"invalid --mcp-stdio '{spec}'; expected name:command args...")
+    return name, {"transport": "stdio", "command": parts[0], "args": parts[1:]}
+
+
+def _parse_mcp_http(spec: str):
+    """Parse 'name=url' into (name, config)."""
+    if "=" not in spec:
+        raise MCPError(f"invalid --mcp-http '{spec}'; expected name=url")
+    name, url = spec.split("=", 1)
+    if not name or not url:
+        raise MCPError(f"invalid --mcp-http '{spec}'; expected name=url")
+    return name, {"transport": "http", "url": url}
+
+
+class MCPClient:
+    """A minimal MCP client over stdio or Streamable HTTP (tools only)."""
+
+    def __init__(self, name: str, config: dict):
+        self.name = name
+        self.config = config
+        self.transport = config.get("transport", "stdio")
+        self.tool_names = []
+        self._id = 0
+        self._proc = None
+        self._out_q = None
+        self._stderr_buf = []
+        self._session_id = None
+        self._url = None
+        self._headers = {}
+
+    # -- lifecycle
+    def connect(self) -> dict:
+        if self.transport == "stdio":
+            self._connect_stdio()
+        elif self.transport == "http":
+            self._connect_http()
+        else:
+            raise MCPError(f"unknown transport: {self.transport}")
+        info = self._request(
+            "initialize",
+            {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "harnless", "version": "0.1"},
+            },
+        )
+        self._notify("notifications/initialized", {})
+        return info
+
+    def close(self):
+        if self.transport == "stdio" and self._proc is not None:
+            try:
+                if self._proc.stdin:
+                    self._proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+            try:
+                self._proc.wait(timeout=5)
+            except Exception:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+        self._proc = None
+
+    # -- stdio transport
+    def _connect_stdio(self):
+        command = self.config.get("command")
+        if not command:
+            raise MCPError("stdio server requires 'command'")
+        args = [command] + list(self.config.get("args") or [])
+        env = os.environ.copy()
+        for k, v in (self.config.get("env") or {}).items():
+            env[k] = v
+        self._proc = subprocess.Popen(
+            args,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=CWD,
+            env=env,
+            text=True,
+        )
+        self._out_q = queue.Queue()
+        threading.Thread(target=self._drain_stdout, daemon=True).start()
+        threading.Thread(target=self._drain_stderr, daemon=True).start()
+
+    def _drain_stdout(self):
+        try:
+            for line in self._proc.stdout:
+                self._out_q.put(line)
+        except Exception:
+            pass
+        self._out_q.put(None)  # sentinel on EOF
+
+    def _drain_stderr(self):
+        try:
+            for line in self._proc.stderr:
+                self._stderr_buf.append(line.rstrip("\n"))
+                if len(self._stderr_buf) > 500:
+                    self._stderr_buf.pop(0)
+        except Exception:
+            pass
+
+    def _send_stdio(self, msg: dict):
+        if self._proc is None or self._proc.poll() is not None:
+            raise MCPError(f"stdio server '{self.name}' is not running")
+        self._proc.stdin.write(json.dumps(msg) + "\n")
+        self._proc.stdin.flush()
+
+    def _recv_stdio(self) -> dict:
+        try:
+            line = self._out_q.get(timeout=MCP_TIMEOUT)
+        except queue.Empty:
+            raise MCPError(f"stdio server '{self.name}' timed out after {MCP_TIMEOUT}s")
+        if line is None:
+            raise MCPError(f"stdio server '{self.name}' closed the connection")
+        line = line.strip()
+        if not line:
+            return self._recv_stdio()
+        return json.loads(line)
+
+    # -- http transport
+    def _connect_http(self):
+        url = self.config.get("url")
+        if not url:
+            raise MCPError("http server requires 'url'")
+        self._url = url
+        self._headers = dict(self.config.get("headers") or {})
+
+    def _http_post(self, payload: dict):
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        headers.update(self._headers)
+        if self._session_id:
+            headers["Mcp-Session-Id"] = self._session_id
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(self._url, data=data, headers=headers)
+        with urllib.request.urlopen(req, timeout=MCP_TIMEOUT) as resp:
+            sid = resp.headers.get("Mcp-Session-Id")
+            if sid:
+                self._session_id = sid
+            ctype = resp.headers.get("Content-Type", "")
+            body = resp.read().decode("utf-8")
+        return ctype, body
+
+    def _parse_sse_response(self, body: str, want_id):
+        last = None
+        for raw in body.splitlines():
+            line = raw.strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if not data or data == "[DONE]":
+                continue
+            try:
+                obj = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if want_id is not None and obj.get("id") != want_id:
+                continue
+            last = obj
+        if last is None:
+            raise MCPError("no JSON-RPC response found in SSE stream")
+        return last
+
+    def _http_request(self, payload: dict) -> dict:
+        ctype, body = self._http_post(payload)
+        if not body.strip():
+            raise MCPError("empty response from http server")
+        if "text/event-stream" in ctype:
+            return self._parse_sse_response(body, payload.get("id"))
+        return json.loads(body)
+
+    # -- JSON-RPC
+    def _next_id(self):
+        self._id += 1
+        return self._id
+
+    def _request(self, method: str, params: dict) -> dict:
+        rid = self._next_id()
+        msg = {"jsonrpc": "2.0", "id": rid, "method": method, "params": params}
+        if self.transport == "stdio":
+            self._send_stdio(msg)
+            while True:
+                resp = self._recv_stdio()
+                if resp.get("id") == rid:
+                    break
+        else:
+            resp = self._http_request(msg)
+        if "error" in resp:
+            err = resp["error"]
+            raise MCPError(f"{method} failed: {err.get('message', err)}")
+        return resp.get("result", {})
+
+    def _notify(self, method: str, params: dict):
+        msg = {"jsonrpc": "2.0", "method": method, "params": params}
+        if self.transport == "stdio":
+            self._send_stdio(msg)
+        else:
+            self._http_post(msg)
+
+    # -- tools
+    def list_tools(self) -> list:
+        tools = []
+        cursor = None
+        while True:
+            params = {}
+            if cursor:
+                params["cursor"] = cursor
+            result = self._request("tools/list", params)
+            tools.extend(result.get("tools") or [])
+            cursor = result.get("nextCursor")
+            if not cursor:
+                break
+        return tools
+
+    def call_tool(self, name: str, args: dict) -> str:
+        result = self._request("tools/call", {"name": name, "arguments": args})
+        return _mcp_content_to_text(result)
+
+
+def register_mcp_tools(clients: list) -> None:
+    """Connect to MCP clients and register their tools into MCP_TOOLS/MCP_DISPATCH.
+
+    Tool names are used as-is. A name that collides with a built-in tool or an
+    earlier-registered MCP tool is skipped (built-ins win, then first server).
+    """
+    global MCP_TOOLS, MCP_DISPATCH, MCP_CLIENTS
+    MCP_TOOLS = []
+    MCP_DISPATCH = {}
+    MCP_CLIENTS = list(clients)
+    for client in clients:
+        try:
+            client.connect()
+        except Exception as e:
+            print(
+                colorize(
+                    f"{icon('error')} mcp server '{client.name}' failed to connect: {e}",
+                    "error",
+                )
+            )
+            continue
+        try:
+            tools = client.list_tools()
+        except Exception as e:
+            print(
+                colorize(
+                    f"{icon('error')} mcp server '{client.name}' tools/list failed: {e}",
+                    "error",
+                )
+            )
+            client.close()
+            continue
+        for t in tools:
+            name = t.get("name")
+            if not name:
+                continue
+            if name in DISPATCH or name in MCP_DISPATCH:
+                print(
+                    colorize(
+                        f"{icon('error')} mcp tool '{name}' (server '{client.name}') "
+                        f"collides with an existing tool; skipped",
+                        "error",
+                    )
+                )
+                continue
+            spec = {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": t.get("description") or "",
+                    "parameters": t.get("inputSchema")
+                    or {"type": "object", "properties": {}},
+                },
+            }
+            MCP_TOOLS.append(spec)
+            MCP_DISPATCH[name] = (client, name)
+            client.tool_names.append(name)
+
+
 def get_system_prompt(cwd, additional) -> str:
     return (
         "You are a coding assistant running inside a harness. Your working directory is {cwd}. "
@@ -1031,7 +1405,9 @@ def chat(
         {
             "model": model,
             "messages": messages,
-            "tools": OPENAI_TOOLS_INTERACTIVE if interactive else OPENAI_TOOLS,
+            "tools": (OPENAI_TOOLS_INTERACTIVE + MCP_TOOLS)
+            if interactive
+            else (OPENAI_TOOLS + MCP_TOOLS),
             "tool_choice": "auto",
             "temperature": temperature,
         }
@@ -1052,7 +1428,9 @@ def _build_request(
         {
             "model": model,
             "messages": messages,
-            "tools": OPENAI_TOOLS_INTERACTIVE if interactive else OPENAI_TOOLS,
+            "tools": (OPENAI_TOOLS_INTERACTIVE + MCP_TOOLS)
+            if interactive
+            else (OPENAI_TOOLS + MCP_TOOLS),
             "tool_choice": "auto",
             "temperature": temperature,
             "stream": stream,
@@ -1183,6 +1561,15 @@ def execute_tool(name: str, raw_args: str) -> str:
         return f"error: invalid JSON arguments: {raw_args}"
     fn = DISPATCH.get(name)
     if fn is None:
+        mcp = MCP_DISPATCH.get(name)
+        if mcp is not None:
+            client, tool_name = mcp
+            try:
+                return client.call_tool(tool_name, args)
+            except MCPError as e:
+                return f"error: {e}"
+            except Exception as e:
+                return f"error: {type(e).__name__}: {e}"
         return f"error: unknown tool: {name}"
     try:
         return str(fn(args))
@@ -1193,7 +1580,7 @@ def execute_tool(name: str, raw_args: str) -> str:
 
 
 def format_status(messages: list) -> str:
-    """Build the /status report: context usage, API URL, tool names."""
+    """Build the /status report: context usage, API URL, tool names, MCP servers."""
     total_chars = 0
     for m in messages:
         total_chars += len(m.get("content") or "")
@@ -1201,11 +1588,18 @@ def format_status(messages: list) -> str:
             total_chars += len((tc.get("function") or {}).get("arguments") or "")
     approx_tokens = total_chars // 4
     tool_names = ", ".join(s["function"]["name"] for s in OPENAI_TOOLS_INTERACTIVE)
-    return (
-        f"context: {approx_tokens} tokens (~{total_chars} chars) in {len(messages)} messages\n"
-        f"api url: {API_URL}\n"
-        f"tools: {tool_names}"
-    )
+    lines = [
+        f"context: {approx_tokens} tokens (~{total_chars} chars) in {len(messages)} messages",
+        f"api url: {API_URL}",
+        f"tools: {tool_names}",
+    ]
+    if MCP_CLIENTS:
+        mcp_lines = []
+        for c in MCP_CLIENTS:
+            names = ", ".join(c.tool_names) if c.tool_names else "no tools"
+            mcp_lines.append(f"  {c.name} ({c.transport}): {names}")
+        lines.append("mcp servers:\n" + "\n".join(mcp_lines))
+    return "\n".join(lines)
 
 
 def format_help() -> str:
@@ -1351,6 +1745,27 @@ def main():
         action="store_true",
         help="use plain ASCII labels instead of emoji icons",
     )
+    parser.add_argument(
+        "--mcp-config",
+        action="append",
+        default=None,
+        metavar="FILE",
+        help="MCP config file (JSON); repeatable. Accepts {'mcpServers': {...}} or a bare {...}",
+    )
+    parser.add_argument(
+        "--mcp-stdio",
+        action="append",
+        default=None,
+        metavar="NAME:COMMAND ARGS...",
+        help="add a stdio MCP server, e.g. --mcp-stdio 'fs:npx -y @modelcontextprotocol/server-filesystem ./data'",
+    )
+    parser.add_argument(
+        "--mcp-http",
+        action="append",
+        default=None,
+        metavar="NAME=URL",
+        help="add an http MCP server, e.g. --mcp-http 'api=http://127.0.0.1:8000/mcp'",
+    )
     args = parser.parse_args()
 
     API_URL = args.api_url
@@ -1358,6 +1773,49 @@ def main():
 
     set_color_enabled(not args.no_color and color_enabled())
     set_emoji_enabled(not args.no_emoji)
+
+    mcp_servers = {}
+    for path in args.mcp_config or []:
+        try:
+            loaded = load_mcp_config(path)
+        except Exception as e:
+            print(colorize(f"{icon('error')} failed to load mcp config {path}: {e}", "error"))
+            continue
+        for name, cfg in loaded.items():
+            if name in mcp_servers:
+                print(
+                    colorize(
+                        f"{icon('error')} duplicate mcp server name '{name}'; later definition wins",
+                        "error",
+                    )
+                )
+            mcp_servers[name] = cfg
+    for spec in args.mcp_stdio or []:
+        try:
+            name, cfg = _parse_mcp_stdio(spec)
+        except MCPError as e:
+            print(colorize(f"{icon('error')} {e}", "error"))
+            continue
+        mcp_servers[name] = cfg
+    for spec in args.mcp_http or []:
+        try:
+            name, cfg = _parse_mcp_http(spec)
+        except MCPError as e:
+            print(colorize(f"{icon('error')} {e}", "error"))
+            continue
+
+    if mcp_servers:
+        mcp_clients = [MCPClient(name, cfg) for name, cfg in mcp_servers.items()]
+        register_mcp_tools(mcp_clients)
+
+        def _close_mcp():
+            for c in mcp_clients:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+
+        atexit.register(_close_mcp)
 
     system_prompt_additions = (
         ""
