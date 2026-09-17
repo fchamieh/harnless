@@ -790,6 +790,35 @@ class TestCsiSequences(unittest.TestCase):
             stdin_file.close()
             os.close(master)
 
+    @unittest.skipIf(os.name == "nt", "pty not available on Windows")
+    def test_bare_esc_via_pty(self):
+        import pty
+        import tty
+
+        master, slave = pty.openpty()
+        # Put the slave in raw mode before writing so the lone ESC byte is
+        # not held back by the canonical-mode line discipline.
+        tty.setraw(slave)
+        old = sys.stdin
+        stdin_file = os.fdopen(slave, "r")
+        try:
+            sys.stdin = stdin_file
+            os.write(master, b"\x1b")
+            gen = h._iter_keys_posix()
+            tokens = []
+            try:
+                for tok in gen:
+                    tokens.append(tok)
+                    if tok == "esc":
+                        break
+            finally:
+                gen.close()
+            self.assertEqual(tokens, ["esc"])
+        finally:
+            sys.stdin = old
+            stdin_file.close()
+            os.close(master)
+
 
 class TestEndToEndScenario(Base):
     def test_agent_workflow(self):
@@ -1117,6 +1146,99 @@ class TestToolsToggle(unittest.TestCase):
         tools_line = out.split("tools: ")[1].split("\n")[0]
         self.assertNotIn("read_file", tools_line)
         self.assertIn("grep", tools_line)
+
+
+class TestToolsMenu(unittest.TestCase):
+    def setUp(self):
+        self._old_disabled = h.DISABLED_TOOLS
+        h.DISABLED_TOOLS = set()
+        self.addCleanup(setattr, h, "DISABLED_TOOLS", self._old_disabled)
+
+    def menu(self, keys):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            applied = h.tools_menu(iter(keys))
+        return applied, buf.getvalue()
+
+    def test_enter_applies_no_changes(self):
+        applied, _ = self.menu(["enter"])
+        self.assertTrue(applied)
+        self.assertEqual(h.DISABLED_TOOLS, set())
+
+    def test_space_toggles_and_enter_applies(self):
+        first = h.OPENAI_TOOLS_INTERACTIVE[0]["function"]["name"]
+        applied, _ = self.menu([("char", " "), "enter"])
+        self.assertTrue(applied)
+        self.assertEqual(h.DISABLED_TOOLS, {first})
+
+    def test_down_moves_cursor(self):
+        second = h.OPENAI_TOOLS_INTERACTIVE[1]["function"]["name"]
+        applied, _ = self.menu(["down", ("char", " "), "enter"])
+        self.assertTrue(applied)
+        self.assertEqual(h.DISABLED_TOOLS, {second})
+
+    def test_up_at_top_stays(self):
+        first = h.OPENAI_TOOLS_INTERACTIVE[0]["function"]["name"]
+        applied, _ = self.menu(["up", "up", ("char", " "), "enter"])
+        self.assertTrue(applied)
+        self.assertEqual(h.DISABLED_TOOLS, {first})
+
+    def test_down_clamps_at_end(self):
+        n = len(h.OPENAI_TOOLS_INTERACTIVE)
+        last = h.OPENAI_TOOLS_INTERACTIVE[-1]["function"]["name"]
+        applied, _ = self.menu(["down"] * (n + 5) + [("char", " "), "enter"])
+        self.assertTrue(applied)
+        self.assertEqual(h.DISABLED_TOOLS, {last})
+
+    def test_toggle_twice_restores(self):
+        first = h.OPENAI_TOOLS_INTERACTIVE[0]["function"]["name"]
+        applied, _ = self.menu([("char", " "), ("char", " "), "enter"])
+        self.assertTrue(applied)
+        self.assertEqual(h.DISABLED_TOOLS, set())
+
+    def test_esc_cancels_changes(self):
+        applied, _ = self.menu([("char", " "), "esc"])
+        self.assertFalse(applied)
+        self.assertEqual(h.DISABLED_TOOLS, set())
+
+    def test_ctrl_c_cancels_changes(self):
+        applied, _ = self.menu([("char", " "), "ctrl_c"])
+        self.assertFalse(applied)
+        self.assertEqual(h.DISABLED_TOOLS, set())
+
+    def test_ctrl_d_cancels_changes(self):
+        applied, _ = self.menu([("char", " "), "ctrl_d"])
+        self.assertFalse(applied)
+        self.assertEqual(h.DISABLED_TOOLS, set())
+
+    def test_eof_cancels(self):
+        applied, _ = self.menu([("char", " ")])
+        self.assertFalse(applied)
+        self.assertEqual(h.DISABLED_TOOLS, set())
+
+    def test_menu_preserves_preexisting_disabled(self):
+        h.DISABLED_TOOLS.add("read_file")
+        first = h.OPENAI_TOOLS_INTERACTIVE[0]["function"]["name"]
+        applied, _ = self.menu([("char", " "), "enter"])
+        self.assertTrue(applied)
+        self.assertEqual(h.DISABLED_TOOLS, {"read_file", first})
+
+    def test_rendering(self):
+        applied, out = self.menu(["enter"])
+        self.assertTrue(applied)
+        first = h.OPENAI_TOOLS_INTERACTIVE[0]["function"]["name"]
+        second = h.OPENAI_TOOLS_INTERACTIVE[1]["function"]["name"]
+        self.assertIn("> [x] " + first, out)
+        self.assertIn("[x] " + second, out)
+        self.assertIn("space: toggle", out)
+
+    def test_rendering_shows_disabled_mark(self):
+        h.DISABLED_TOOLS.add("read_file")
+        applied, out = self.menu(["enter"])
+        self.assertTrue(applied)
+        self.assertIn("[ ] read_file", out)
 
 
 if __name__ == "__main__":

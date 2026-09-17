@@ -1214,6 +1214,8 @@ def _iter_keys_windows():
             yield "ctrl_d"
         elif ch == "\x15":
             yield "ctrl_u"
+        elif ch == "\x1b":
+            yield "esc"
         elif ch == "\t" or ord(ch) < 32:
             yield "ignore"
         else:
@@ -1247,6 +1249,7 @@ def _parse_csi_seq(read_char):
 
 def _iter_keys_posix():
     """Yield key tokens from a POSIX terminal in raw mode via termios/tty."""
+    import select
     import termios
     import tty
 
@@ -1281,6 +1284,12 @@ def _iter_keys_posix():
                 yield "ctrl_d"
                 return
             if ch == "\x1b":
+                # A bare ESC has no following bytes; an escape sequence does.
+                # Wait briefly to tell the two apart.
+                ready, _, _ = select.select([fd], [], [], 0.05)
+                if not ready:
+                    yield "esc"
+                    continue
                 seq = read_char()
                 if seq == "[":
                     yield _parse_csi_seq(read_char)
@@ -1616,6 +1625,82 @@ def toggle_tools(names: list) -> list:
     return results
 
 
+def tools_menu(keys=None) -> bool:
+    """Interactive tool toggle menu.
+
+    Up/down move the cursor, space toggles the highlighted tool, enter
+    applies the changes and quits, esc (or ctrl+c/ctrl+d) quits without
+    applying them. Returns True if changes were applied, False if cancelled.
+    """
+    specs = OPENAI_TOOLS_INTERACTIVE + MCP_TOOLS
+    names = [s["function"]["name"] for s in specs]
+    descs = [s["function"].get("description", "") for s in specs]
+    if not names:
+        return False
+    disabled = set(DISABLED_TOOLS)
+    cursor = 0
+    width = shutil.get_terminal_size((80, 24)).columns
+
+    def build_lines():
+        lines = [colorize("tools — space: toggle, enter: apply, esc: cancel", "dim")]
+        for i, name in enumerate(names):
+            mark = " " if name in disabled else "x"
+            if i == cursor:
+                lines.append(colorize(f"> [{mark}] {name}", "tool"))
+            else:
+                lines.append(f"  [{mark}] {name}")
+        desc = descs[cursor]
+        if len(desc) > width - 1:
+            desc = desc[: width - 4] + "..."
+        lines.append(colorize(desc, "dim"))
+        return lines
+
+    drawn = 0
+
+    def draw():
+        nonlocal drawn
+        lines = build_lines()
+        for line in lines:
+            sys.stdout.write("\r\x1b[2K" + line + "\n")
+        if lines:
+            sys.stdout.write(f"\x1b[{len(lines)}A")
+        sys.stdout.flush()
+        drawn = len(lines)
+
+    if keys is None:
+        keys = _iter_keys_windows() if os.name == "nt" else _iter_keys_posix()
+    draw()
+    try:
+        while True:
+            token = next(keys)
+            if token == "up":
+                cursor = max(0, cursor - 1)
+            elif token == "down":
+                cursor = min(len(names) - 1, cursor + 1)
+            elif token == "enter":
+                DISABLED_TOOLS.clear()
+                DISABLED_TOOLS.update(disabled)
+                return True
+            elif token in ("esc", "ctrl_c", "ctrl_d"):
+                return False
+            elif token == ("char", " "):
+                name = names[cursor]
+                if name in disabled:
+                    disabled.discard(name)
+                else:
+                    disabled.add(name)
+            draw()
+    except StopIteration:
+        return False
+    finally:
+        close = getattr(keys, "close", None)
+        if close is not None:
+            close()
+        if drawn:
+            sys.stdout.write(f"\x1b[{drawn}B")
+            sys.stdout.flush()
+
+
 def format_status(messages: list) -> str:
     """Build the /status report: context usage, API URL, tool names, MCP servers."""
     total_chars = 0
@@ -1645,7 +1730,8 @@ def format_help() -> str:
         "/new            clear session history and start over\n"
         "/clear-screen   clear the terminal screen\n"
         "/status         show context usage, api url, and tools\n"
-        "/tools          list tools; /tools <name> toggles a tool on/off\n"
+        "/tools          interactive tool menu: up/down move, space toggle, enter apply, esc cancel\n"
+        "/tools <name>   toggle a tool on/off\n"
         "/help           show this help\n"
         "/exit           quit (alias: /quit)"
     )
@@ -1917,7 +2003,13 @@ def main():
         if user_input == "/tools" or user_input.startswith("/tools "):
             rest = user_input[len("/tools"):].strip()
             if not rest:
-                print(colorize(format_tools(), "dim"))
+                if sys.stdin.isatty():
+                    if tools_menu():
+                        print(colorize("tools updated", "dim"))
+                    else:
+                        print(colorize("tools unchanged", "dim"))
+                else:
+                    print(colorize(format_tools(), "dim"))
             else:
                 for name, state in toggle_tools(rest.split()):
                     if state == "unknown":
