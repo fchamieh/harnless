@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""fadi's harness: a minimal agent harness for a local llama-server (OpenAI-compatible)."""
+"""harnless: a minimal agent harness for a local llama-server (OpenAI-compatible)."""
 
 import argparse
 import json
@@ -12,6 +12,7 @@ import urllib.request
 import urllib.error
 
 API_URL = "http://127.0.0.1:11434/v1/chat/completions"
+API_KEY = None
 CWD = os.getcwd()
 SHELL_NOTE = (
     " Commands run in cmd.exe; prefer cross-platform commands (e.g. dir, type, copy, del) over bash-specific syntax."
@@ -762,6 +763,13 @@ def load_agents_md() -> str:
 # ---------------------------------------------------------------- client
 
 
+def _headers() -> dict:
+    headers = {"Content-Type": "application/json"}
+    if API_KEY:
+        headers["Authorization"] = f"Bearer {API_KEY}"
+    return headers
+
+
 def chat(messages: list, model: str) -> dict:
     payload = json.dumps(
         {
@@ -772,11 +780,7 @@ def chat(messages: list, model: str) -> dict:
             "temperature": 0.2,
         }
     ).encode("utf-8")
-    req = urllib.request.Request(
-        API_URL,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-    )
+    req = urllib.request.Request(API_URL, data=payload, headers=_headers())
     with urllib.request.urlopen(req, timeout=600) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
@@ -792,11 +796,7 @@ def _build_request(messages: list, model: str, stream: bool) -> urllib.request.R
             "stream": stream,
         }
     ).encode("utf-8")
-    return urllib.request.Request(
-        API_URL,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-    )
+    return urllib.request.Request(API_URL, data=payload, headers=_headers())
 
 
 def parse_sse_line(line: str):
@@ -965,6 +965,7 @@ def run_agent(messages: list, model: str) -> int:
 
 
 def main():
+    global API_URL, API_KEY
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
@@ -972,7 +973,17 @@ def main():
             pass
 
     parser = argparse.ArgumentParser(
-        description="fadiz-harness: minimal LLM agent harness"
+        description="harnless: minimal LLM agent harness"
+    )
+    parser.add_argument(
+        "--api-url",
+        default=API_URL,
+        help=f"OpenAI-compatible chat completions endpoint (default: {API_URL})",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="API key sent as 'Authorization: Bearer <key>' (omit for local servers that need no auth)",
     )
     parser.add_argument(
         "--model",
@@ -1001,6 +1012,9 @@ def main():
     )
     args = parser.parse_args()
 
+    API_URL = args.api_url
+    API_KEY = args.api_key
+
     set_color_enabled(not args.no_color and color_enabled())
     set_emoji_enabled(not args.no_emoji)
 
@@ -1028,11 +1042,11 @@ def main():
     messages = [{"role": "system", "content": system_prompt}]
 
     if args.prompt is not None:
-        print(colorize(f"fadiz-harness one-shot in {CWD} (api: {API_URL})", "dim"))
+        print(colorize(f"harnless one-shot in {CWD} (api: {API_URL})", "dim"))
         messages.append({"role": "user", "content": args.prompt})
         sys.exit(run_agent(messages, args.model))
 
-    print(colorize(f"fadiz-harness ready in {CWD} (api: {API_URL})", "dim"))
+    print(colorize(f"harnless ready in {CWD} (api: {API_URL})", "dim"))
     print(colorize("type /new to start over, /clear-screen to clear the screen, /exit to quit\n", "dim"))
 
     while True:

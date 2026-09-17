@@ -5,7 +5,7 @@ import os
 import shutil
 import unittest
 
-import harness as h
+import harnless as h
 
 
 class Base(unittest.TestCase):
