@@ -1066,5 +1066,58 @@ class TestMcpHttpIntegration(Base):
             server.server_close()
 
 
+class TestToolsToggle(unittest.TestCase):
+    def setUp(self):
+        self._old_disabled = h.DISABLED_TOOLS
+        h.DISABLED_TOOLS = set()
+        self.addCleanup(setattr, h, "DISABLED_TOOLS", self._old_disabled)
+
+    def test_format_tools_all_on(self):
+        out = h.format_tools()
+        lines = out.split("\n")
+        self.assertTrue(lines)
+        self.assertTrue(all(l.startswith("[X] ") for l in lines))
+        self.assertIn("[X] read_file — ", out)
+
+    def test_format_tools_reflects_disabled(self):
+        h.DISABLED_TOOLS.add("read_file")
+        out = h.format_tools()
+        self.assertIn("[ ] read_file — ", out)
+        self.assertIn("[X] grep — ", out)
+
+    def test_toggle_off_and_on(self):
+        self.assertEqual(h.toggle_tools(["read_file"]), [("read_file", "off")])
+        self.assertIn("read_file", h.DISABLED_TOOLS)
+        self.assertEqual(h.toggle_tools(["read_file"]), [("read_file", "on")])
+        self.assertNotIn("read_file", h.DISABLED_TOOLS)
+
+    def test_toggle_unknown(self):
+        self.assertEqual(h.toggle_tools(["nope"]), [("nope", "unknown")])
+        self.assertEqual(h.DISABLED_TOOLS, set())
+
+    def test_toggle_multiple(self):
+        res = h.toggle_tools(["read_file", "grep", "nope"])
+        self.assertEqual(res, [("read_file", "off"), ("grep", "off"), ("nope", "unknown")])
+        self.assertEqual(h.DISABLED_TOOLS, {"read_file", "grep"})
+
+    def test_active_tools_excludes_disabled(self):
+        h.DISABLED_TOOLS.add("read_file")
+        names = [s["function"]["name"] for s in h._active_tools(True)]
+        self.assertNotIn("read_file", names)
+        self.assertIn("grep", names)
+
+    def test_execute_tool_rejects_disabled(self):
+        h.DISABLED_TOOLS.add("get_cwd")
+        out = h.execute_tool("get_cwd", "{}")
+        self.assertTrue(out.startswith("error: tool 'get_cwd' is disabled"))
+
+    def test_status_reflects_disabled(self):
+        h.DISABLED_TOOLS.add("read_file")
+        out = h.format_status([{"role": "system", "content": "x"}])
+        tools_line = out.split("tools: ")[1].split("\n")[0]
+        self.assertNotIn("read_file", tools_line)
+        self.assertIn("grep", tools_line)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -747,6 +747,8 @@ MCP_TOOLS = []      # OpenAI tool specs for MCP tools
 MCP_DISPATCH = {}   # tool name -> (MCPClient, tool name)
 MCP_CLIENTS = []    # all configured MCP clients (for /status)
 
+DISABLED_TOOLS = set()  # tool names toggled off via /tools
+
 
 class MCPError(Exception):
     pass
@@ -1405,9 +1407,7 @@ def chat(
         {
             "model": model,
             "messages": messages,
-            "tools": (OPENAI_TOOLS_INTERACTIVE + MCP_TOOLS)
-            if interactive
-            else (OPENAI_TOOLS + MCP_TOOLS),
+            "tools": _active_tools(interactive),
             "tool_choice": "auto",
             "temperature": temperature,
         }
@@ -1428,9 +1428,7 @@ def _build_request(
         {
             "model": model,
             "messages": messages,
-            "tools": (OPENAI_TOOLS_INTERACTIVE + MCP_TOOLS)
-            if interactive
-            else (OPENAI_TOOLS + MCP_TOOLS),
+            "tools": _active_tools(interactive),
             "tool_choice": "auto",
             "temperature": temperature,
             "stream": stream,
@@ -1559,6 +1557,8 @@ def execute_tool(name: str, raw_args: str) -> str:
         args = json.loads(raw_args) if raw_args else {}
     except json.JSONDecodeError:
         return f"error: invalid JSON arguments: {raw_args}"
+    if name in DISABLED_TOOLS:
+        return f"error: tool '{name}' is disabled (use /tools to re-enable)"
     fn = DISPATCH.get(name)
     if fn is None:
         mcp = MCP_DISPATCH.get(name)
@@ -1579,6 +1579,43 @@ def execute_tool(name: str, raw_args: str) -> str:
         return f"error: {type(e).__name__}: {e}"
 
 
+def _active_tools(interactive: bool) -> list:
+    """Tool specs to send to the API, excluding tools toggled off via /tools."""
+    base = OPENAI_TOOLS_INTERACTIVE if interactive else OPENAI_TOOLS
+    return [s for s in base + MCP_TOOLS if s["function"]["name"] not in DISABLED_TOOLS]
+
+
+def _all_tool_names() -> set:
+    return {s["function"]["name"] for s in OPENAI_TOOLS_INTERACTIVE + MCP_TOOLS}
+
+
+def format_tools() -> str:
+    """Build the /tools checklist: '[X] name — description' per tool."""
+    lines = []
+    for s in OPENAI_TOOLS_INTERACTIVE + MCP_TOOLS:
+        name = s["function"]["name"]
+        desc = s["function"].get("description", "")
+        mark = " " if name in DISABLED_TOOLS else "X"
+        lines.append(f"[{mark}] {name} — {desc}")
+    return "\n".join(lines)
+
+
+def toggle_tools(names: list) -> list:
+    """Toggle the given tool names on/off. Returns [(name, 'on'|'off'|'unknown')]."""
+    known = _all_tool_names()
+    results = []
+    for n in names:
+        if n not in known:
+            results.append((n, "unknown"))
+        elif n in DISABLED_TOOLS:
+            DISABLED_TOOLS.discard(n)
+            results.append((n, "on"))
+        else:
+            DISABLED_TOOLS.add(n)
+            results.append((n, "off"))
+    return results
+
+
 def format_status(messages: list) -> str:
     """Build the /status report: context usage, API URL, tool names, MCP servers."""
     total_chars = 0
@@ -1587,7 +1624,7 @@ def format_status(messages: list) -> str:
         for tc in m.get("tool_calls") or []:
             total_chars += len((tc.get("function") or {}).get("arguments") or "")
     approx_tokens = total_chars // 4
-    tool_names = ", ".join(s["function"]["name"] for s in OPENAI_TOOLS_INTERACTIVE)
+    tool_names = ", ".join(s["function"]["name"] for s in _active_tools(True))
     lines = [
         f"context: {approx_tokens} tokens (~{total_chars} chars) in {len(messages)} messages",
         f"api url: {API_URL}",
@@ -1608,6 +1645,7 @@ def format_help() -> str:
         "/new            clear session history and start over\n"
         "/clear-screen   clear the terminal screen\n"
         "/status         show context usage, api url, and tools\n"
+        "/tools          list tools; /tools <name> toggles a tool on/off\n"
         "/help           show this help\n"
         "/exit           quit (alias: /quit)"
     )
@@ -1850,7 +1888,7 @@ def main():
     print(colorize(f"harnless ready in {CWD} (api: {API_URL})", "dim"))
     print(
         colorize(
-            "type /new to start over, /clear-screen to clear the screen, /status for session info, /help for commands, /exit to quit\n"
+            "type /new to start over, /clear-screen to clear the screen, /status for session info, /tools to toggle tools, /help for commands, /exit to quit\n"
             "use up/down arrows to recall previous input\n",
             "dim",
         )
@@ -1875,6 +1913,17 @@ def main():
             continue
         if user_input == "/status":
             print(colorize(format_status(messages), "dim"))
+            continue
+        if user_input == "/tools" or user_input.startswith("/tools "):
+            rest = user_input[len("/tools"):].strip()
+            if not rest:
+                print(colorize(format_tools(), "dim"))
+            else:
+                for name, state in toggle_tools(rest.split()):
+                    if state == "unknown":
+                        print(colorize(f"{icon('error')} unknown tool: {name}", "error"))
+                    else:
+                        print(colorize(f"{name}: {state}", "dim"))
             continue
         if user_input == "/help":
             print(colorize(format_help(), "dim"))
