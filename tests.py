@@ -1,4 +1,4 @@
-"""Tests for harness.py. Run from the repo root: python tests.py"""
+"""Tests for harnless.py. Run from the repo root: python tests.py"""
 
 import json
 import os

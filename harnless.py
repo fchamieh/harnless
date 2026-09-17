@@ -20,7 +20,6 @@ SHELL_NOTE = (
     else " Commands run in bash."
 )
 
-
 ANSI = {
     "user": "\033[1;36m",
     "assistant": "\033[1;32m",
@@ -81,7 +80,9 @@ def color_enabled() -> bool:
 
             kernel32 = ctypes.windll.kernel32
             mode = ctypes.c_uint32()
-            if not kernel32.GetConsoleMode(kernel32.GetStdHandle(-11), ctypes.byref(mode)):
+            if not kernel32.GetConsoleMode(
+                kernel32.GetStdHandle(-11), ctypes.byref(mode)
+            ):
                 return False
             return bool(mode.value & 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
         except Exception:
@@ -740,7 +741,7 @@ def get_system_prompt(cwd, additional) -> str:
         "and use patch_file with exact matches for edits. "
         "If patch_file reports multiple matches, re-read the area with line numbers and retry using offset/lines. "
         "{additional}"
-    ).format(cwd=cwd, additional="")
+    ).format(cwd=cwd, additional=additional)
 
 
 def load_agents_md() -> str:
@@ -777,7 +778,7 @@ def chat(messages: list, model: str) -> dict:
             "messages": messages,
             "tools": OPENAI_TOOLS,
             "tool_choice": "auto",
-            "temperature": 0.2,
+            "temperature": 1.0,
         }
     ).encode("utf-8")
     req = urllib.request.Request(API_URL, data=payload, headers=_headers())
@@ -792,7 +793,7 @@ def _build_request(messages: list, model: str, stream: bool) -> urllib.request.R
             "messages": messages,
             "tools": OPENAI_TOOLS,
             "tool_choice": "auto",
-            "temperature": 0.2,
+            "temperature": 1.0,
             "stream": stream,
         }
     ).encode("utf-8")
@@ -846,7 +847,13 @@ def accumulate_delta(message: dict, delta: dict) -> dict:
         idx = int(tc.get("index", 0))
         calls = message.setdefault("tool_calls", [])
         while len(calls) <= idx:
-            calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+            calls.append(
+                {
+                    "id": "",
+                    "type": "function",
+                    "function": {"name": "", "arguments": ""},
+                }
+            )
         target = calls[idx]
         if tc.get("id"):
             target["id"] = tc["id"]
@@ -873,7 +880,11 @@ def stream_once(messages: list, model: str):
         reasoning = delta.get("reasoning_content")
         if reasoning:
             if not started_reasoning:
-                print(colorize(f"{icon('thinking')} thinking: ", "thinking"), end="", flush=True)
+                print(
+                    colorize(f"{icon('thinking')} thinking: ", "thinking"),
+                    end="",
+                    flush=True,
+                )
                 started_reasoning = True
             print(reasoning, end="", flush=True)
         content = delta.get("content")
@@ -881,7 +892,11 @@ def stream_once(messages: list, model: str):
             if not started_content:
                 if started_reasoning:
                     print()
-                print(colorize(f"{icon('assistant')} assistant> ", "assistant"), end="", flush=True)
+                print(
+                    colorize(f"{icon('assistant')} assistant> ", "assistant"),
+                    end="",
+                    flush=True,
+                )
                 started_content = True
             print(content, end="", flush=True)
         accumulate_delta(message, delta)
@@ -911,7 +926,7 @@ def execute_tool(name: str, raw_args: str) -> str:
 # ---------------------------------------------------------------- loop
 
 
-def run_agent(messages: list, model: str) -> int:
+def run_agent(messages: list, model: str, interactive: bool = False) -> int:
     while True:
         message = None
         streamed = False
@@ -920,7 +935,12 @@ def run_agent(messages: list, model: str) -> int:
             if not streamed:
                 message = None
         except (urllib.error.URLError, ConnectionError, OSError) as e:
-            print(colorize(f"{icon('error')} streaming failed ({e}); retrying non-streaming", "error"))
+            print(
+                colorize(
+                    f"{icon('error')} streaming failed ({e}); retrying non-streaming",
+                    "error",
+                )
+            )
         if message is None:
             try:
                 data = chat(messages, model)
@@ -932,7 +952,11 @@ def run_agent(messages: list, model: str) -> int:
 
         reasoning = message.get("reasoning_content")
         if reasoning and not streamed:
-            print(colorize(f"{icon('thinking')} thinking: {reasoning.strip()}", "thinking"))
+            print(
+                colorize(
+                    f"{icon('thinking')} thinking: {reasoning.strip()}", "thinking"
+                )
+            )
 
         tool_calls = message.get("tool_calls") or []
         if not tool_calls:
@@ -942,7 +966,11 @@ def run_agent(messages: list, model: str) -> int:
             return 0
 
         if message.get("content") and not streamed:
-            print(colorize(f"{icon('assistant')} {message['content'].strip()}", "assistant"))
+            print(
+                colorize(
+                    f"{icon('assistant')} {message['content'].strip()}", "assistant"
+                )
+            )
         for tc in tool_calls:
             name = tc["function"]["name"]
             raw_args = tc["function"].get("arguments", "")
@@ -953,8 +981,15 @@ def run_agent(messages: list, model: str) -> int:
             except ExitSignal as e:
                 if e.message:
                     print(colorize(f"{icon('exit')} {e.message}", "tool"))
+                if interactive:
+                    return e.code
                 sys.exit(e.code)
-            print(colorize(f"{icon('result')} {result[:500]}{'...' if len(result) > 500 else ''}", "result"))
+            print(
+                colorize(
+                    f"{icon('result')} {result[:500]}{'...' if len(result) > 500 else ''}",
+                    "result",
+                )
+            )
             messages.append(
                 {
                     "role": "tool",
@@ -972,9 +1007,7 @@ def main():
         except Exception:
             pass
 
-    parser = argparse.ArgumentParser(
-        description="harnless: minimal LLM agent harness"
-    )
+    parser = argparse.ArgumentParser(description="harnless: minimal LLM agent harness")
     parser.add_argument(
         "--api-url",
         default=API_URL,
@@ -1032,7 +1065,7 @@ def main():
         if args.system_prompt is not None
         else get_system_prompt(CWD, system_prompt_additions)
     )
-    
+
     agents_md = load_agents_md()
     if agents_md:
         system_prompt += (
@@ -1047,7 +1080,12 @@ def main():
         sys.exit(run_agent(messages, args.model))
 
     print(colorize(f"harnless ready in {CWD} (api: {API_URL})", "dim"))
-    print(colorize("type /new to start over, /clear-screen to clear the screen, /exit to quit\n", "dim"))
+    print(
+        colorize(
+            "type /new to start over, /clear-screen to clear the screen, /exit to quit\n",
+            "dim",
+        )
+    )
 
     while True:
         try:
@@ -1067,7 +1105,7 @@ def main():
             os.system("cls" if os.name == "nt" else "clear")
             continue
         messages.append({"role": "user", "content": user_input})
-        run_agent(messages, args.model)
+        run_agent(messages, args.model, interactive=True)
 
 
 if __name__ == "__main__":
