@@ -771,6 +771,31 @@ def load_agents_md() -> str:
 
 HISTORY = []
 HISTORY_MAX = 100
+HISTORY_FILE = os.environ.get("HARNLESS_HISTORY") or os.path.join(
+    os.path.expanduser("~"), ".harnless_history"
+)
+
+
+def _history_load():
+    """Load persisted history (last HISTORY_MAX entries) into HISTORY."""
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8", errors="replace") as f:
+            lines = [ln.rstrip("\n") for ln in f]
+    except OSError:
+        return
+    HISTORY.extend(ln for ln in lines if ln.strip())
+    if len(HISTORY) > HISTORY_MAX:
+        del HISTORY[: len(HISTORY) - HISTORY_MAX]
+
+
+def _history_save():
+    """Write the current HISTORY to HISTORY_FILE (best effort)."""
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            for entry in HISTORY:
+                f.write(entry + "\n")
+    except OSError:
+        pass
 
 
 def _history_add(entry: str):
@@ -782,6 +807,7 @@ def _history_add(entry: str):
     HISTORY.append(entry)
     if len(HISTORY) > HISTORY_MAX:
         HISTORY.pop(0)
+    _history_save()
 
 
 def _iter_keys_windows():
@@ -1310,6 +1336,8 @@ def main():
         print(colorize(f"harnless one-shot in {CWD} (api: {API_URL})", "dim"))
         messages.append({"role": "user", "content": args.prompt})
         sys.exit(run_agent(messages, args.model, temperature=args.temperature))
+
+    _history_load()
 
     print(colorize(f"harnless ready in {CWD} (api: {API_URL})", "dim"))
     print(

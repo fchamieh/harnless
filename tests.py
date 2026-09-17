@@ -563,11 +563,15 @@ class TestStreamAccumulation(unittest.TestCase):
         self.assertIs(result, msg)
 
 
-class TestLineEditor(unittest.TestCase):
+class TestLineEditor(Base):
     def setUp(self):
+        super().setUp()
         self._old_history = h.HISTORY
         h.HISTORY = []
         self.addCleanup(setattr, h, "HISTORY", self._old_history)
+        self._old_history_file = h.HISTORY_FILE
+        h.HISTORY_FILE = os.path.join(self.tmp, "history.txt")
+        self.addCleanup(setattr, h, "HISTORY_FILE", self._old_history_file)
 
     def edit(self, keys):
         import io
@@ -648,6 +652,34 @@ class TestLineEditor(unittest.TestCase):
             h._history_add(f"e{i}")
         self.assertEqual(len(h.HISTORY), 3)
         self.assertEqual(h.HISTORY, ["e7", "e8", "e9"])
+
+    def test_history_persisted_to_file(self):
+        h._history_add("one")
+        h._history_add("two")
+        with open(h.HISTORY_FILE, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "one\ntwo\n")
+
+    def test_history_load_from_file(self):
+        with open(h.HISTORY_FILE, "w", encoding="utf-8") as f:
+            f.write("old1\nold2\n\n")
+        h.HISTORY = []
+        h._history_load()
+        self.assertEqual(h.HISTORY, ["old1", "old2"])
+
+    def test_history_load_missing_file(self):
+        h.HISTORY = []
+        h._history_load()
+        self.assertEqual(h.HISTORY, [])
+
+    def test_history_load_caps_at_max(self):
+        old_max = h.HISTORY_MAX
+        h.HISTORY_MAX = 2
+        self.addCleanup(setattr, h, "HISTORY_MAX", old_max)
+        with open(h.HISTORY_FILE, "w", encoding="utf-8") as f:
+            f.write("a\nb\nc\n")
+        h.HISTORY = []
+        h._history_load()
+        self.assertEqual(h.HISTORY, ["b", "c"])
 
     def test_readline_prompt_falls_back_without_tty(self):
         import io

@@ -12,6 +12,7 @@ Single-file Python project: `harnless.py` — a minimal CLI agent harness that t
 - One-shot: `python harnless.py --prompt "task"` (exits with the agent's exit code)
 - Flags: `--api-url` (OpenAI-compatible endpoint; default `http://127.0.0.1:11434/v1/chat/completions`), `--api-key` (sent as `Authorization: Bearer <key>`; omit for unauthenticated local servers), `--model` (name sent in the request; llama-server ignores it), `--system-prompt` (replaces built-in), `--temperature` (sampling temperature; default `0.2`)
 - `AGENTS.md` in the working directory (case-insensitive) is auto-loaded and appended to the system prompt in all modes.
+- Interactive-mode input history is persisted to `~/.harnless_history` (last 100 entries, one per line); path overridable via the `HARNLESS_HISTORY` env var.
 - Tests: `python tests.py` — stdlib unittest, no pytest. Must run from repo root; uses a temp `./_test_tmp` dir (cleaned up); exit code 1 on failure.
 
 ## Notes
