@@ -1,5 +1,7 @@
 """Tests for harnless.py. Run from the repo root: python tests.py"""
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -414,6 +416,315 @@ class TestIcon(unittest.TestCase):
         h.set_emoji_enabled(True)
         self.addCleanup(h.set_emoji_enabled, True)
         self.assertEqual(h.icon("nope"), "")
+
+
+class TestMarkdownRenderer(unittest.TestCase):
+    def _render(self, text, chunks=None, colors=True, indent=0):
+        old = h.COLORS_ENABLED
+        h.set_color_enabled(colors)
+        self.addCleanup(h.set_color_enabled, old)
+        out = io.StringIO()
+        r = h.MarkdownRenderer(out=out, indent=indent)
+        if chunks is None:
+            r.write(text)
+        else:
+            for c in chunks:
+                r.write(c)
+        r.flush()
+        return out.getvalue()
+
+    def test_plain_text(self):
+        self.assertEqual(self._render("hello world\n"), "hello world\n")
+
+    def test_heading(self):
+        out = self._render("# Title\n")
+        self.assertNotIn("#", out)
+        self.assertIn(h.ANSI["heading"] + "Title" + h.ANSI["reset"], out)
+
+    def test_bold(self):
+        out = self._render("a **bold** b\n")
+        self.assertIn(h.ANSI["bold"] + "bold" + h.ANSI["reset"], out)
+        self.assertNotIn("**", out)
+
+    def test_italic(self):
+        out = self._render("a *it* b\n")
+        self.assertIn(h.ANSI["italic"] + "it" + h.ANSI["reset"], out)
+
+    def test_inline_code(self):
+        out = self._render("use `patch_file` now\n")
+        self.assertIn(h.ANSI["code"] + "patch_file" + h.ANSI["reset"], out)
+
+    def test_code_span_protects_markers(self):
+        out = self._render("`**not bold**`\n")
+        self.assertNotIn(h.ANSI["bold"], out)
+        self.assertIn(h.ANSI["code"] + "**not bold**" + h.ANSI["reset"], out)
+
+    def test_code_block(self):
+        out = self._render("```python\nx = 1\n```\n")
+        self.assertIn("```python", out)
+        self.assertIn(h.ANSI["codeblock"] + "x = 1" + h.ANSI["reset"], out)
+
+    def test_code_block_no_inline_styling(self):
+        out = self._render("```\n**not bold**\n```\n")
+        self.assertNotIn(h.ANSI["bold"], out)
+
+    def test_unordered_list(self):
+        out = self._render("- item\n")
+        self.assertIn(h.ANSI["bullet"] + "• " + h.ANSI["reset"], out)
+        self.assertIn("item", out)
+
+    def test_ordered_list(self):
+        out = self._render("1. first\n")
+        self.assertIn(h.ANSI["bullet"] + "1. " + h.ANSI["reset"], out)
+
+    def test_blockquote(self):
+        out = self._render("> quoted\n")
+        self.assertIn(h.ANSI["quote"], out)
+        self.assertIn("quoted", out)
+
+    def test_horizontal_rule(self):
+        out = self._render("---\n")
+        self.assertIn(h.ANSI["dim"], out)
+        self.assertNotIn("---", out)
+
+    def test_link(self):
+        out = self._render("see [docs](http://x.y) now\n")
+        self.assertIn(h.ANSI["underline"] + "docs" + h.ANSI["reset"], out)
+        self.assertIn(h.ANSI["dim"] + " (http://x.y)" + h.ANSI["reset"], out)
+
+    def test_link_destination_is_literal(self):
+        url = "https://example.com/a*b*c?q=**x**&file=a_b"
+        self.assertEqual(self._plain(f"[link]({url})"), f"link ({url})\n")
+        out = self._render(f"[**bold** `code`]({url})")
+        self.assertIn(h.ANSI["bold"] + "bold", out)
+        self.assertIn(h.ANSI["code"] + "code", out)
+        self.assertIn(url, out)
+
+    def test_escaped_inline_markers(self):
+        self.assertEqual(self._plain(r"\*literal\* \`code\` \[link](url)"),
+                         "*literal* `code` [link](url)\n")
+        self.assertEqual(self._plain(r"**bold \* literal**"), "bold * literal\n")
+        self.assertEqual(self._plain(r"a\qb \\"), "a\\qb \\\n")
+
+    def test_variable_length_code_span(self):
+        out = self._render("`` `x` **literal** ``")
+        self.assertIn(h.ANSI["code"] + "`x` **literal**" + h.ANSI["reset"], out)
+        self.assertNotIn(h.ANSI["bold"], out)
+
+    def test_fence_length_type_and_closing_suffix(self):
+        for opening, closing in (("````python", "````"), ("~~~~python", "~~~~~")):
+            with self.subTest(opening=opening):
+                doc = opening + "\n```\n~~~\n````suffix\n**literal**\n" + closing + "\n**bold**\n"
+                out = self._render(doc)
+                self.assertIn(h.ANSI["codeblock"] + "**literal**", out)
+                self.assertIn(h.ANSI["bold"] + "bold", out)
+                self.assertEqual(self._render(doc, chunks=list(doc)), out)
+
+    def test_code_fence_continuation_indent(self):
+        self.assertEqual(self._plain("Intro\n```py\nx\n```\n", indent=4),
+                         "Intro\n    ```py\n      x\n    ```\n")
+
+    def test_table_separator_count_mismatch(self):
+        for sep in ("|---|", "|---|---|---|"):
+            out = self._plain("| A | B |\n" + sep + "\n")
+            self.assertNotIn("┌", out)
+            self.assertIn("| A | B |", out)
+
+    def test_table_followed_by_fence_with_pipe(self):
+        out = self._render("| A |\n|---|\n```a|b\n**literal**\n```\n")
+        self.assertIn(h.ANSI["codeblock"] + "**literal**", out)
+        self.assertIn("└", out)
+
+    def test_combining_character_width(self):
+        self.assertEqual(h.display_width("e\u0301"), 1)
+        self.assertEqual(h.display_width("\u200d\ufe0f"), 0)
+        out = self._plain("| H |\n|---|\n| e\u0301 |\n| abc |\n")
+        self.assertEqual(len({h.display_width(line) for line in out.splitlines()}), 1)
+        self.assertEqual(h._truncate_visible("e\u0301abcd", 3), "e\u0301a…")
+
+    def test_colors_disabled_passthrough(self):
+        doc = "# T\n**b** `c` *i*\n- x\n> q\n---\n```py\ncode\n```\n[l](http://u)\n"
+        self.assertEqual(self._render(doc, colors=False), doc)
+
+    def test_flush_emits_partial_line(self):
+        self.assertEqual(self._render("no newline", chunks=["no newline"]), "no newline\n")
+
+    def test_open_fence_at_eof(self):
+        out = self._render("```python\ncode", chunks=["```python\ncode"])
+        self.assertIn(h.ANSI["codeblock"] + "code" + h.ANSI["reset"], out)
+
+    def test_continuation_indent(self):
+        self.assertEqual(self._render("line one\nline two\n", indent=4), "line one\n    line two\n")
+
+    # ------------------------------------------------------------ tables
+
+    def _plain(self, text, **kw):
+        return h._ANSI_RE.sub("", self._render(text, **kw))
+
+    def test_table_basic(self):
+        out = self._plain("| A | B |\n|---|---|\n| 1 | 2 |\n")
+        self.assertNotIn("| A | B |", out)  # raw row is gone
+        self.assertIn("┌", out)
+        self.assertIn("┴", out)
+        self.assertIn("A", out)
+        self.assertIn("2", out)
+        # header separator row present
+        self.assertIn("├", out)
+
+    def test_table_columns_aligned(self):
+        out = self._plain("| A | Longer |\n|---|---|\n| 1 | 2 |\n")
+        lines = [l for l in out.splitlines() if l.strip()]
+        # every line of the table must be the same display width
+        widths = {h.display_width(l) for l in lines}
+        self.assertEqual(len(widths), 1, out)
+
+    def test_table_alignment_markers(self):
+        out = self._plain("| L | C | R |\n|:--|:-:|--:|\n| 1 | 1 | 1 |\n")
+        body = [l for l in out.splitlines() if l.strip()][3]
+        # drop the one-space row padding around each cell
+        cells = [c[1:-1] for c in body.split("│") if c]
+        self.assertEqual(cells[0], "1  ")  # left: trailing pad only
+        self.assertEqual(cells[1], " 1 ")  # center: padded both sides
+        self.assertEqual(cells[2], "  1")  # right: leading pad only
+
+    def test_table_indent_applied(self):
+        out = self._render("Intro\n\n| A |\n|---|\n| 1 |\n", indent=4)
+        table = [l for l in out.splitlines() if l.strip()][1:]
+        for line in table:
+            self.assertTrue(line.startswith("    "), line)
+
+    def test_table_inline_styling(self):
+        out = self._render("| A |\n|---|\n| `code` **b** |\n")
+        self.assertIn(h.ANSI["code"] + "code" + h.ANSI["reset"], out)
+        self.assertIn(h.ANSI["bold"] + "b" + h.ANSI["reset"], out)
+        self.assertNotIn("**", out)
+        self.assertNotIn("`", out)
+
+    def test_table_wide_cells(self):
+        out = self._plain("| H |\n|---|\n| 🤖 |\n")
+        lines = [l for l in out.splitlines() if l.strip()]
+        widths = {h.display_width(l) for l in lines}
+        self.assertEqual(len(widths), 1, out)
+
+    def test_table_ragged_rows(self):
+        out = self._plain("| A | B | C |\n|---|---|---|\n| 1 |\n| 1 | 2 | 3 | 4 |\n")
+        self.assertIn("A", out)
+        self.assertIn("3", out)
+        self.assertNotIn("4", out)  # extra cell dropped
+
+    def test_table_escaped_pipe(self):
+        out = self._plain("| A | B |\n|---|---|\n| x \\| y | z |\n")
+        self.assertIn("x | y", out)
+        self.assertIn("z", out)
+
+    def test_table_pipe_prose_not_a_table(self):
+        out = self._plain("a | b\nnot a separator\n")
+        self.assertIn("a | b", out)
+        self.assertIn("not a separator", out)
+        self.assertNotIn("┌", out)
+
+    def test_table_in_code_block(self):
+        out = self._plain("```\n| a | b |\n|---|---|\n```\n")
+        self.assertIn("| a | b |", out)
+        self.assertNotIn("┌", out)
+
+    def test_table_at_eof_without_newline(self):
+        out = self._plain("| A | B |\n|---|---|\n| 1 | 2 |")
+        self.assertIn("┌", out)
+        self.assertIn("┴", out)
+
+    def test_table_then_text(self):
+        out = self._plain("| A | B |\n|---|---|\n| 1 | 2 |\nAfter\n")
+        self.assertIn("┴", out)
+        self.assertTrue(out.rstrip().endswith("After"))
+
+    def test_table_colors_disabled_passthrough(self):
+        doc = "| A | B |\n|---|---|\n| 1 | 2 |\n"
+        self.assertEqual(self._render(doc, colors=False), doc)
+
+    def test_table_chunking_invariance(self):
+        doc = (
+            "Intro\n\n| A | B |\n|---|:--:|\n| 1 | 2 |\n| x \\| y | z |\n\n"
+            "| C |\n|---|\n| 3 |\n\nAfter\n"
+        )
+        full = self._render(doc)
+        for i in range(len(doc) + 1):
+            out = self._render(doc, chunks=[doc[:i], doc[i:]])
+            self.assertEqual(out, full, f"split at {i}")
+
+    def test_table_width_clamp(self):
+        real = h.terminal_width
+        h.terminal_width = lambda: 30
+        self.addCleanup(setattr, h, "terminal_width", real)
+        out = self._plain(
+            "| Column one | Column two | Column three |\n|---|---|---|\n"
+            "| aaaaaaaaaa | bbbbbbbbbb | cccccccccc |\n"
+        )
+        for line in out.splitlines():
+            if line.strip():
+                self.assertLessEqual(h.display_width(line), 30, line)
+        self.assertIn("…", out)  # truncated
+
+    def test_table_narrow_terminal_preserves_all_cells(self):
+        real = h.terminal_width
+        h.terminal_width = lambda: 20
+        self.addCleanup(setattr, h, "terminal_width", real)
+        labels = list("ABCDEFG")
+        values = [f"value{i}" for i in range(7)]
+        doc = ("|" + "|".join(labels) + "|\n"
+               + "|---" * 7 + "|\n"
+               + "|" + "|".join(values) + "|\n")
+        out = self._plain(doc)
+        for label, value in zip(labels, values):
+            self.assertIn(f"{label}: {value}", out)
+        for line in out.splitlines():
+            self.assertLessEqual(h.display_width(line), 20)
+        self.assertEqual(self._plain(doc, chunks=list(doc)), out)
+
+    def test_table_first_line_reserves_label_width(self):
+        real = h.terminal_width
+        h.terminal_width = lambda: 24
+        self.addCleanup(setattr, h, "terminal_width", real)
+        out = self._plain("| Long heading |\n|---|\n| long value |\n", indent=8)
+        lines = out.splitlines()
+        self.assertLessEqual(h.display_width(lines[0]) + 8, 24)
+        for line in lines[1:]:
+            self.assertTrue(line.startswith(" " * 8))
+            self.assertLessEqual(h.display_width(line), 24)
+
+    def test_table_extremely_narrow_terminal(self):
+        real = h.terminal_width
+        self.addCleanup(setattr, h, "terminal_width", real)
+        for width in (1, 2, 5):
+            h.terminal_width = lambda: width
+            out = self._plain("| H |\n|---|\n| 界e\u0301long |\n", indent=10)
+            for line in out.splitlines():
+                self.assertLessEqual(h.display_width(line), width)
+
+    def test_chunking_invariance(self):
+        doc = (
+            "# Title\n\n**bold** and `code` and *it*\n\n- a\n- b\n\n"
+            "```python\nx = 1\n```\n\n> quote\n\n---\n\n[link](http://x)\n"
+        )
+        full = self._render(doc)
+        for i in range(len(doc) + 1):
+            out = self._render(doc, chunks=[doc[:i], doc[i:]])
+            self.assertEqual(out, full, f"split at {i}")
+
+    def test_display_width(self):
+        self.assertEqual(h.display_width("abc"), 3)
+        self.assertEqual(h.display_width("🤖"), 2)
+        self.assertEqual(h.display_width("🤖 ab"), 5)
+
+    def test_print_assistant(self):
+        h.set_color_enabled(False)
+        self.addCleanup(h.set_color_enabled, True)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            h.print_assistant("# Hi\n")
+        out = buf.getvalue()
+        self.assertIn("assistant> ", out)
+        self.assertIn("# Hi", out)
 
 
 class TestLoadAgentsMd(Base):

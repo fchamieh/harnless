@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import unicodedata
 import urllib.request
 import urllib.error
 
@@ -32,6 +33,15 @@ ANSI = {
     "error": "\033[1;31m",
     "dim": "\033[2m",
     "reset": "\033[0m",
+    # markdown
+    "heading": "\033[1;36m",
+    "code": "\033[35m",
+    "codeblock": "\033[48;5;236m",
+    "bullet": "\033[1;32m",
+    "quote": "\033[2m",
+    "bold": "\033[1m",
+    "italic": "\033[3m",
+    "underline": "\033[4m",
 }
 
 COLORS_ENABLED = True
@@ -1122,6 +1132,7 @@ def get_system_prompt(cwd, additional) -> str:
         "Before taking any action that modifies the file system (writing, patching, moving, copying, or deleting files), "
         "plan the change when required and present the plan to the user for approval before acting; "
         "only proceed once the user has agreed. Read-only exploration does not require a plan. "
+        "Format responses in Markdown (headings, lists, tables, fenced code blocks); the terminal renders it. "
         "{additional}"
     ).format(cwd=cwd, additional=additional)
 
@@ -1528,6 +1539,375 @@ def accumulate_delta(message: dict, delta: dict) -> dict:
     return message
 
 
+def display_width(text: str) -> int:
+    """Approximate terminal display width (East Asian wide/fullwidth chars count as 2)."""
+    width = 0
+    for ch in text:
+        if unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return width
+
+
+_MD_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})([^\r\n]*)$")
+_MD_HEADING = re.compile(r"^\s{0,3}(#{1,6})\s+(.*)$")
+_MD_HR = re.compile(r"^\s{0,3}(-{3,}|\*{3,}|_{3,})\s*$")
+_MD_LIST = re.compile(r"^(\s*)([-*+]|\d+[.)])\s+(.*)$")
+_MD_QUOTE = re.compile(r"^\s{0,3}>\s?(.*)$")
+_MD_ESCAPABLE = frozenset(r"!\"#$%&'()*+,-./:;<=>?@[\]^_`{|}~" + "\\")
+_MD_BOLD = re.compile(r"\*\*(.+?)\*\*")
+_MD_ITALIC = re.compile(r"(?<!\*)\*([^*\s](?:[^*]*[^*\s])?)\*(?!\*)")
+_MD_LINK = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
+# Delimiter row of a pipe table. The trailing group is optional so a
+# single-column table (| A | / |---|) is recognized; callers must also
+# require a '|' so a bare "---" horizontal rule is never mistaken for one.
+_MD_TABLE_SEP = re.compile(r"^\s{0,3}\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?\s*$")
+_MD_PIPE_SPLIT = re.compile(r"(?<!\\)\|")
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+_TABLE_MIN_COL = 3
+
+
+def terminal_width() -> int:
+    """Current terminal column count (falls back to 80)."""
+    return shutil.get_terminal_size((80, 24)).columns
+
+
+def _is_table_sep(line: str) -> bool:
+    """True if line is a table delimiter row (must contain a pipe)."""
+    return "|" in line and bool(_MD_TABLE_SEP.match(line))
+
+
+def _split_table_row(line: str) -> list:
+    """Split a pipe-table row into stripped cell strings.
+
+    Leading/trailing pipes are removed; \\| stays inside its cell.
+    """
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|") and not s.endswith("\\|"):
+        s = s[:-1]
+    return [c.strip().replace("\\|", "|") for c in _MD_PIPE_SPLIT.split(s)]
+
+
+def _table_alignments(sep: str, ncols: int) -> list:
+    """Per-column alignment ('left'/'center'/'right') from a delimiter row."""
+    aligns = []
+    for cell in _split_table_row(sep)[:ncols]:
+        left = cell.startswith(":")
+        right = cell.endswith(":")
+        if left and right:
+            aligns.append("center")
+        elif right:
+            aligns.append("right")
+        else:
+            aligns.append("left")
+    return aligns + ["left"] * (ncols - len(aligns))
+
+
+def _truncate_visible(text: str, width: int) -> str:
+    """Truncate plain text to a display width, appending an ellipsis if cut."""
+    if display_width(text) <= width:
+        return text
+    if width <= 0:
+        return ""
+    if width == 1:
+        return "…"
+    out = ""
+    used = 0
+    for ch in text:
+        w = display_width(ch)
+        if used + w > width - 1:
+            break
+        out += ch
+        used += w
+    return out + "…"
+
+
+class MarkdownRenderer:
+    """Incremental Markdown-to-ANSI renderer for streaming assistant output.
+
+    Feed arbitrary chunks via write(); complete lines are styled as they
+    arrive, so markers split across chunks are handled. flush() emits any
+    trailing partial line and clears open code-fence state. With colors
+    disabled, output is the raw input unchanged (safe for pipes).
+
+    Pipe tables are buffered whole (a line containing '|' is held for one
+    line to see whether a delimiter row follows) so columns can be aligned
+    to the widest cell before anything is printed. When a box cannot fit,
+    cells are rendered as wrapped, plain-text header/value records.
+    This is a lightweight Markdown subset, not a full CommonMark parser.
+    """
+
+    def __init__(self, out=None, indent: int = 0):
+        self._out = out if out is not None else sys.stdout
+        self._indent = " " * max(indent, 0)
+        self._buf = ""
+        self._in_code = False
+        self._fence = ""
+        self._first = True
+        self._pending = None  # possible table row awaiting a delimiter row
+        self._table = None  # rows of the table currently being buffered
+
+    def write(self, chunk: str):
+        if not COLORS_ENABLED:
+            self._out.write(chunk)
+            self._out.flush()
+            return
+        self._buf += chunk
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            self._emit(line)
+
+    def flush(self):
+        if not COLORS_ENABLED:
+            return
+        if self._buf:
+            self._emit(self._buf)
+            self._buf = ""
+        # Drain any deferred table state (force-emit so nothing re-defers).
+        while self._pending is not None or self._table is not None:
+            if self._pending is not None:
+                pending, self._pending = self._pending, None
+                self._emit(pending, defer=False)
+            if self._table is not None:
+                table, self._table = self._table, None
+                self._render_table(table)
+        self._in_code = False
+        self._fence = ""
+
+    def _emit(self, line: str, defer: bool = True):
+        # write() splits on LF; normalize CRLF only in styled output.
+        line = line.removesuffix("\r")
+        if self._in_code:
+            prefix = "" if self._first else self._indent
+            self._first = False
+            fence = _MD_FENCE.match(line)
+            if (fence and fence.group(1)[0] == self._fence[0]
+                    and len(fence.group(1)) >= len(self._fence)
+                    and not fence.group(2).strip()):
+                self._in_code = False
+                self._line(prefix + colorize(fence.group(1), "codeblock"))
+            else:
+                self._line(prefix + "  " + colorize(line, "codeblock"))
+            return
+        if self._pending is not None:
+            pending, self._pending = self._pending, None
+            if (_is_table_sep(line)
+                    and len(_split_table_row(pending)) == len(_split_table_row(line))):
+                self._table = [pending, line]
+                return
+            self._emit(pending, defer=False)
+        fence = _MD_FENCE.match(line)
+        if fence and fence.group(1)[0] == "`" and "`" in fence.group(2):
+            fence = None
+        if self._table is not None:
+            if (line.strip() and "|" in line and not fence
+                    and not _MD_HEADING.match(line) and not _MD_QUOTE.match(line)
+                    and not _MD_LIST.match(line)):
+                self._table.append(line)
+                return
+            table, self._table = self._table, None
+            self._render_table(table)
+        if fence:
+            prefix = "" if self._first else self._indent
+            self._first = False
+            self._in_code = True
+            self._fence = fence.group(1)
+            lang = fence.group(2).strip()
+            self._line(prefix + colorize(self._fence + lang, "codeblock"))
+            return
+        if defer and line.strip() and "|" in line and not _is_table_sep(line):
+            # Might be a table header; wait for the next line to decide.
+            self._pending = line
+            return
+        prefix = "" if self._first else self._indent
+        self._first = False
+        m = _MD_HEADING.match(line)
+        if m:
+            self._line(prefix + colorize(self._inline(m.group(2).strip()), "heading"))
+            return
+        if _MD_HR.match(line):
+            self._line(prefix + colorize("─" * 20, "dim"))
+            return
+        m = _MD_LIST.match(line)
+        if m:
+            pad, marker, rest = m.groups()
+            bullet = "• " if marker in ("-", "*", "+") else f"{marker} "
+            self._line(prefix + pad + colorize(bullet, "bullet") + self._inline(rest))
+            return
+        m = _MD_QUOTE.match(line)
+        if m:
+            self._line(prefix + colorize("> " + self._inline(m.group(1)), "quote"))
+            return
+        self._line(prefix + self._inline(line))
+
+    def _render_table(self, rows: list):
+        """Render buffered table rows as an aligned box-drawing table."""
+        header = _split_table_row(rows[0])
+        aligns = _table_alignments(rows[1], len(header))
+        body = [_split_table_row(r) for r in rows[2:]]
+        ncols = len(header)
+        if not ncols:
+            return
+        body = [(r + [""] * ncols)[:ncols] for r in body]
+        plain = [header] + body
+
+        widths = []
+        for i in range(ncols):
+            w = max(
+                display_width(_ANSI_RE.sub("", self._inline(row[i])))
+                for row in plain
+            )
+            widths.append(max(w, _TABLE_MIN_COL))
+
+        columns = max(1, terminal_width())
+        # Reserve the label width even when the first line has no prefix.
+        # On exceptionally narrow terminals, start below the label and reduce
+        # indentation to leave room for at least one wide character.
+        indent = self._indent[:max(0, columns - 2)]
+        if self._first and indent != self._indent:
+            self._line("")
+            self._first = False
+        available = columns - len(indent)
+
+        def table_line(text):
+            prefix = "" if self._first else indent
+            self._line(prefix + text)
+            self._first = False
+
+        budget = available - (3 * ncols + 1)
+        if budget < ncols * _TABLE_MIN_COL:
+            # A box cannot fit: preserve cells as wrapped header/value records.
+            # Plain text avoids splitting ANSI escapes when wrapping.
+            def wrapped(text):
+                chunk, used = "", 0
+                for ch in text:
+                    w = display_width(ch)
+                    if w > available:
+                        ch, w = "�", 1
+                    if used + w > available:
+                        table_line(chunk)
+                        chunk, used = "", 0
+                    chunk += ch
+                    used += w
+                table_line(chunk)
+
+            labels = [_ANSI_RE.sub("", self._inline(c)) for c in header]
+            for index, record in enumerate(body or [None]):
+                if index:
+                    table_line("")
+                for i, label in enumerate(labels):
+                    value = (_ANSI_RE.sub("", self._inline(record[i]))
+                             if record is not None else None)
+                    wrapped(label if value is None else f"{label}: {value}")
+            return
+        while sum(widths) > budget and max(widths) > _TABLE_MIN_COL:
+            i = widths.index(max(widths))
+            widths[i] -= 1
+
+        def rule(left, mid, right):
+            return left + mid.join("─" * (w + 2) for w in widths) + right
+
+        def cell(text, i, align):
+            width = widths[i]
+            w = display_width(_ANSI_RE.sub("", text))
+            pad = max(width - w, 0)
+            if align == "right":
+                left, right = pad, 0
+            elif align == "center":
+                left, right = pad // 2, pad - pad // 2
+            else:
+                left, right = 0, pad
+            return " " * left + text + " " * right
+
+        def row(cells):
+            parts = [colorize(c, k) for c, k in cells]
+            inner = colorize("│", "dim").join(
+                " " + cell(parts[i], i, aligns[i]) + " " for i in range(ncols)
+            )
+            return colorize("│", "dim") + inner + colorize("│", "dim")
+
+        def styled(r):
+            # Style first so code markers do not affect widths. Truncated
+            # cells use plain visible text to avoid cutting an ANSI escape.
+            out = []
+            for i in range(ncols):
+                visible = self._inline(r[i])
+                if display_width(_ANSI_RE.sub("", visible)) > widths[i]:
+                    visible = _truncate_visible(_ANSI_RE.sub("", visible), widths[i])
+                out.append(visible)
+            return out
+
+        table_line(colorize(rule("┌", "┬", "┐"), "dim"))
+        table_line(row([(t, "heading") for t in styled(header)]))
+        table_line(colorize(rule("├", "┼", "┤"), "dim"))
+        for r in body:
+            table_line(row([(t, None) for t in styled(r)]))
+        table_line(colorize(rule("└", "┴", "┘"), "dim"))
+
+    def _line(self, text: str):
+        self._out.write(text + "\n")
+        self._out.flush()
+
+    def _inline(self, text: str) -> str:
+        # Tokenize literal spans before emphasis, so neither escape sequences,
+        # code contents nor link destinations can become formatting markers.
+        marker = "\x00"
+        while marker in text:
+            marker += "\x00"
+        protected = []
+        parts = []
+
+        def protect(value):
+            parts.append(f"{marker}{len(protected)}{marker}")
+            protected.append(value)
+
+        i = 0
+        while i < len(text):
+            if (text[i] == "\\" and i + 1 < len(text)
+                    and text[i + 1] in _MD_ESCAPABLE):
+                protect(text[i + 1])
+                i += 2
+                continue
+            if text[i] == "`":
+                end = i + 1
+                while end < len(text) and text[end] == "`":
+                    end += 1
+                ticks = text[i:end]
+                closing = re.search(r"(?<!`)" + ticks + r"(?!`)", text[end:])
+                if closing:
+                    stop = end + closing.start()
+                    code = text[end:stop]
+                    if code.startswith(" ") and code.endswith(" ") and code.strip():
+                        code = code[1:-1]
+                    protect(colorize(code, "code"))
+                    i = stop + len(ticks)
+                    continue
+                parts.append(ticks)
+                i = end
+                continue
+            if text[i] == "[":
+                link = _MD_LINK.match(text, i)
+                if link:
+                    protect(colorize(self._inline(link.group(1)), "underline")
+                            + colorize(f" ({link.group(2)})", "dim"))
+                    i = link.end()
+                    continue
+            parts.append(text[i])
+            i += 1
+        rendered = self._emphasis("".join(parts))
+        # A single substitution avoids interpreting placeholders in restored text.
+        return re.sub(re.escape(marker) + r"(\d+)" + re.escape(marker),
+                      lambda m: protected[int(m.group(1))], rendered)
+
+    @staticmethod
+    def _emphasis(text: str) -> str:
+        text = _MD_BOLD.sub(lambda m: colorize(m.group(1), "bold"), text)
+        return _MD_ITALIC.sub(lambda m: colorize(m.group(1), "italic"), text)
+
+
 def stream_once(
     messages: list, model: str, interactive: bool = False, temperature: float = 0.2
 ):
@@ -1538,7 +1918,7 @@ def stream_once(
     """
     message = {"role": "assistant"}
     started_reasoning = False
-    started_content = False
+    renderer = None
     streamed = False
     for delta in stream_chat(
         messages, model, interactive=interactive, temperature=temperature
@@ -1556,22 +1936,31 @@ def stream_once(
             print(reasoning, end="", flush=True)
         content = delta.get("content")
         if content:
-            if not started_content:
+            if renderer is None:
                 if started_reasoning:
                     print()
-                print(
-                    colorize(f"{icon('assistant')} assistant> ", "assistant"),
-                    end="",
-                    flush=True,
-                )
-                started_content = True
-            print(content, end="", flush=True)
+                label = f"{icon('assistant')} assistant> "
+                print(colorize(label, "assistant"), end="", flush=True)
+                renderer = MarkdownRenderer(indent=display_width(label))
+            renderer.write(content)
         accumulate_delta(message, delta)
     if started_reasoning:
         print()
-    if started_content:
+    if renderer is not None:
+        renderer.flush()
         print()
     return message, streamed
+
+
+def print_assistant(content: str):
+    """Print a complete (non-streamed) assistant message with Markdown styling."""
+    label = f"{icon('assistant')} assistant> "
+    print()
+    print(colorize(label, "assistant"), end="", flush=True)
+    renderer = MarkdownRenderer(indent=display_width(label))
+    renderer.write(content or "")
+    renderer.flush()
+    print()
 
 
 def execute_tool(name: str, raw_args: str) -> str:
@@ -1794,16 +2183,11 @@ def run_agent(
         tool_calls = message.get("tool_calls") or []
         if not tool_calls:
             if not streamed:
-                label = colorize(f"{icon('assistant')} assistant> ", "assistant")
-                print(f"\n{label}{message.get('content', '')}\n")
+                print_assistant(message.get("content", ""))
             return 0
 
         if message.get("content") and not streamed:
-            print(
-                colorize(
-                    f"{icon('assistant')} {message['content'].strip()}", "assistant"
-                )
-            )
+            print_assistant(message["content"])
         for tc in tool_calls:
             name = tc["function"]["name"]
             raw_args = tc["function"].get("arguments", "")
