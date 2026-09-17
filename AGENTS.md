@@ -17,6 +17,6 @@ Single-file Python project: `harnless.py` — a minimal CLI agent harness that t
 ## Notes
 
 - `tests.py` imports the module directly (`import harnless`).
-- Tools are defined once in the `TOOLS` dict (`harnless.py:399`): each entry is `(OpenAI schema, handler)`. `OPENAI_TOOLS`/`DISPATCH` are derived from it — add new tools there.
+- Tools are defined once in the `TOOLS` dict (`harnless.py:399`): each entry is `(OpenAI schema, handler)`. `OPENAI_TOOLS`/`DISPATCH` are derived from it — add new tools there. `OPENAI_TOOLS_INTERACTIVE` (same minus `exit`) is sent to the API in interactive mode; `exit` stays one-shot only.
 - All tool file paths are relative to CWD and must stay inside it (`safe_resolve`, `harnless.py:105`); never weaken this.
 - `patch_file` supports an optional `offset`/`lines` region to disambiguate duplicate `old_string` matches; `write_file` with `offset` does line-range replace/insert (semantics covered by `tests.py` — run it after touching those functions).

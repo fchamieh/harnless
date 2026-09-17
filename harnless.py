@@ -729,6 +729,9 @@ TOOLS = {
 }
 
 OPENAI_TOOLS = [spec for spec, _ in TOOLS.values()]
+OPENAI_TOOLS_INTERACTIVE = [
+    spec for name, (spec, _) in TOOLS.items() if name != "exit"
+]
 DISPATCH = {name: fn for name, (_, fn) in TOOLS.items()}
 
 
@@ -740,6 +743,9 @@ def get_system_prompt(cwd, additional) -> str:
         "Explore with list_dir, glob, and grep; read files (the trailer shows total line count) before editing them, "
         "and use patch_file with exact matches for edits. "
         "If patch_file reports multiple matches, re-read the area with line numbers and retry using offset/lines. "
+        "Before taking any action that modifies the file system (writing, patching, moving, copying, or deleting files), "
+        "plan the change when required and present the plan to the user for approval before acting; "
+        "only proceed once the user has agreed. Read-only exploration does not require a plan. "
         "{additional}"
     ).format(cwd=cwd, additional=additional)
 
@@ -771,12 +777,12 @@ def _headers() -> dict:
     return headers
 
 
-def chat(messages: list, model: str) -> dict:
+def chat(messages: list, model: str, interactive: bool = False) -> dict:
     payload = json.dumps(
         {
             "model": model,
             "messages": messages,
-            "tools": OPENAI_TOOLS,
+            "tools": OPENAI_TOOLS_INTERACTIVE if interactive else OPENAI_TOOLS,
             "tool_choice": "auto",
             "temperature": 1.0,
         }
@@ -786,12 +792,14 @@ def chat(messages: list, model: str) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _build_request(messages: list, model: str, stream: bool) -> urllib.request.Request:
+def _build_request(
+    messages: list, model: str, stream: bool, interactive: bool = False
+) -> urllib.request.Request:
     payload = json.dumps(
         {
             "model": model,
             "messages": messages,
-            "tools": OPENAI_TOOLS,
+            "tools": OPENAI_TOOLS_INTERACTIVE if interactive else OPENAI_TOOLS,
             "tool_choice": "auto",
             "temperature": 1.0,
             "stream": stream,
@@ -820,9 +828,9 @@ def parse_sse_line(line: str):
     return choice.get("delta") or {}
 
 
-def stream_chat(messages: list, model: str):
+def stream_chat(messages: list, model: str, interactive: bool = False):
     """Yield deltas from a streaming chat response until [DONE]."""
-    req = _build_request(messages, model, stream=True)
+    req = _build_request(messages, model, stream=True, interactive=interactive)
     with urllib.request.urlopen(req, timeout=600) as resp:
         for raw in resp:
             parsed = parse_sse_line(raw.decode("utf-8"))
@@ -865,7 +873,7 @@ def accumulate_delta(message: dict, delta: dict) -> dict:
     return message
 
 
-def stream_once(messages: list, model: str):
+def stream_once(messages: list, model: str, interactive: bool = False):
     """Stream one chat turn, printing reasoning and content live.
 
     Returns (message, streamed) where streamed is False if no deltas
@@ -875,7 +883,7 @@ def stream_once(messages: list, model: str):
     started_reasoning = False
     started_content = False
     streamed = False
-    for delta in stream_chat(messages, model):
+    for delta in stream_chat(messages, model, interactive=interactive):
         streamed = True
         reasoning = delta.get("reasoning_content")
         if reasoning:
@@ -931,7 +939,7 @@ def run_agent(messages: list, model: str, interactive: bool = False) -> int:
         message = None
         streamed = False
         try:
-            message, streamed = stream_once(messages, model)
+            message, streamed = stream_once(messages, model, interactive=interactive)
             if not streamed:
                 message = None
         except (urllib.error.URLError, ConnectionError, OSError) as e:
@@ -943,7 +951,7 @@ def run_agent(messages: list, model: str, interactive: bool = False) -> int:
             )
         if message is None:
             try:
-                data = chat(messages, model)
+                data = chat(messages, model, interactive=interactive)
             except urllib.error.URLError as e:
                 print(colorize(f"{icon('error')} connection error: {e}", "error"))
                 return 1

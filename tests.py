@@ -462,6 +462,14 @@ class TestDispatch(Base):
         self.assertEqual(ctx.exception.code, 5)
         self.assertEqual(ctx.exception.message, "done")
 
+    def test_interactive_tools_exclude_exit(self):
+        interactive_names = [s["function"]["name"] for s in h.OPENAI_TOOLS_INTERACTIVE]
+        all_names = [s["function"]["name"] for s in h.OPENAI_TOOLS]
+        self.assertNotIn("exit", interactive_names)
+        self.assertEqual(
+            interactive_names, [n for n in all_names if n != "exit"]
+        )
+
     def test_tool_exception_caught(self):
         self.assertTrue(h.execute_tool("read_file", '{"path": "nope.txt"}').startswith("error:"))
 
