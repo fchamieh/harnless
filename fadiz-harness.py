@@ -23,6 +23,7 @@ SHELL_NOTE = (
 ANSI = {
     "user": "\033[1;36m",
     "assistant": "\033[1;32m",
+    "thinking": "\033[1;35m",
     "tool": "\033[1;33m",
     "result": "\033[2m",
     "error": "\033[1;31m",
@@ -778,6 +779,10 @@ def run_agent(messages: list, model: str) -> int:
             return 1
         choice = data["choices"][0]["message"]
         messages.append(choice)
+
+        reasoning = choice.get("reasoning_content")
+        if reasoning:
+            print(colorize(f"[thinking] {reasoning.strip()}", "thinking"))
 
         tool_calls = choice.get("tool_calls") or []
         if not tool_calls:
