@@ -1,15 +1,11 @@
-"""Tests for fadiz-harness.py. Run from the repo root: python tests.py"""
+"""Tests for harness.py. Run from the repo root: python tests.py"""
 
-import importlib.util
 import json
 import os
 import shutil
 import unittest
 
-_spec = importlib.util.spec_from_file_location("harness", os.path.join(os.getcwd(), "fadiz-harness.py"))
-assert _spec is not None
-h = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(h)
+import harness as h
 
 
 class Base(unittest.TestCase):
