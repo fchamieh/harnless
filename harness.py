@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""fadiz-harness: a minimal agent harness for a local llama-server (OpenAI-compatible)."""
+"""fadi's harness: a minimal agent harness for a local llama-server (OpenAI-compatible)."""
 
 import argparse
 import json
