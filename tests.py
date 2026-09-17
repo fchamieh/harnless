@@ -399,6 +399,25 @@ class TestColorize(unittest.TestCase):
                 os.environ["NO_COLOR"] = old
 
 
+class TestIcon(unittest.TestCase):
+    def test_emoji_default(self):
+        h.set_emoji_enabled(True)
+        self.addCleanup(h.set_emoji_enabled, True)
+        self.assertEqual(h.icon("thinking"), h.ICONS["thinking"])
+        self.assertEqual(h.icon("tool"), h.ICONS["tool"])
+
+    def test_ascii_fallback(self):
+        h.set_emoji_enabled(False)
+        self.addCleanup(h.set_emoji_enabled, True)
+        self.assertEqual(h.icon("thinking"), h.ASCII_ICONS["thinking"])
+        self.assertEqual(h.icon("assistant"), h.ASCII_ICONS["assistant"])
+
+    def test_unknown_key(self):
+        h.set_emoji_enabled(True)
+        self.addCleanup(h.set_emoji_enabled, True)
+        self.assertEqual(h.icon("nope"), "")
+
+
 class TestLoadAgentsMd(Base):
     def setUp(self):
         super().setUp()

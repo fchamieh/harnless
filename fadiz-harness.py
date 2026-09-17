@@ -33,10 +33,40 @@ ANSI = {
 
 COLORS_ENABLED = True
 
+ICONS = {
+    "user": "🧑",
+    "assistant": "🤖",
+    "thinking": "🤔",
+    "tool": "🔧",
+    "result": "↳",
+    "exit": "🏁",
+    "error": "⚠️",
+}
+ASCII_ICONS = {
+    "user": "you",
+    "assistant": "bot",
+    "thinking": "think",
+    "tool": "tool",
+    "result": "out",
+    "exit": "exit",
+    "error": "err",
+}
+EMOJI_ENABLED = True
+
 
 def set_color_enabled(enabled: bool):
     global COLORS_ENABLED
     COLORS_ENABLED = enabled
+
+
+def set_emoji_enabled(enabled: bool):
+    global EMOJI_ENABLED
+    EMOJI_ENABLED = enabled
+
+
+def icon(key: str) -> str:
+    table = ICONS if EMOJI_ENABLED else ASCII_ICONS
+    return table.get(key, "")
 
 
 def color_enabled() -> bool:
@@ -775,34 +805,35 @@ def run_agent(messages: list, model: str) -> int:
         try:
             data = chat(messages, model)
         except urllib.error.URLError as e:
-            print(colorize(f"[connection error] {e}", "error"))
+            print(colorize(f"{icon('error')} connection error: {e}", "error"))
             return 1
         choice = data["choices"][0]["message"]
         messages.append(choice)
 
         reasoning = choice.get("reasoning_content")
         if reasoning:
-            print(colorize(f"[thinking] {reasoning.strip()}", "thinking"))
+            print(colorize(f"{icon('thinking')} thinking: {reasoning.strip()}", "thinking"))
 
         tool_calls = choice.get("tool_calls") or []
         if not tool_calls:
-            print(f"\n{colorize('assistant> ', 'assistant')}{choice.get('content', '')}\n")
+            label = colorize(f"{icon('assistant')} assistant> ", "assistant")
+            print(f"\n{label}{choice.get('content', '')}\n")
             return 0
 
         if choice.get("content"):
-            print(colorize(choice["content"].strip(), "assistant"))
+            print(colorize(f"{icon('assistant')} {choice['content'].strip()}", "assistant"))
         for tc in tool_calls:
             name = tc["function"]["name"]
             raw_args = tc["function"].get("arguments", "")
             arg_preview = raw_args[:200]
-            print(colorize(f"[tool] {name}({arg_preview})", "tool"))
+            print(colorize(f"{icon('tool')} {name}({arg_preview})", "tool"))
             try:
                 result = execute_tool(name, raw_args)
             except ExitSignal as e:
                 if e.message:
-                    print(colorize(f"[exit] {e.message}", "tool"))
+                    print(colorize(f"{icon('exit')} {e.message}", "tool"))
                 sys.exit(e.code)
-            print(colorize(f"[result] {result[:500]}{'...' if len(result) > 500 else ''}", "result"))
+            print(colorize(f"{icon('result')} {result[:500]}{'...' if len(result) > 500 else ''}", "result"))
             messages.append(
                 {
                     "role": "tool",
@@ -836,9 +867,15 @@ def main():
         action="store_true",
         help="disable ANSI color output (also auto-disabled for piped output and NO_COLOR)",
     )
+    parser.add_argument(
+        "--no-emoji",
+        action="store_true",
+        help="use plain ASCII labels instead of emoji icons",
+    )
     args = parser.parse_args()
 
     set_color_enabled(not args.no_color and color_enabled())
+    set_emoji_enabled(not args.no_emoji)
 
     system_prompt_additions = (
         ""
@@ -873,7 +910,7 @@ def main():
 
     while True:
         try:
-            user_input = input(colorize("you> ", "user")).strip()
+            user_input = input(colorize(f"{icon('user')} you> ", "user")).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
