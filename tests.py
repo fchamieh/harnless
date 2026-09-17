@@ -374,6 +374,31 @@ class TestRunShell(Base):
         self.assertEqual(out, "error: command timed out after 1s")
 
 
+class TestColorize(unittest.TestCase):
+    def test_disabled_returns_plain(self):
+        h.set_color_enabled(False)
+        self.addCleanup(h.set_color_enabled, True)
+        self.assertEqual(h.colorize("hello", "tool"), "hello")
+        self.assertEqual(h.colorize("hello", None), "hello")
+
+    def test_enabled_wraps_ansi(self):
+        h.set_color_enabled(True)
+        self.addCleanup(h.set_color_enabled, True)
+        self.assertEqual(h.colorize("hello", "tool"), f"{h.ANSI['tool']}hello{h.ANSI['reset']}")
+        self.assertEqual(h.colorize("hello"), "hello")
+
+    def test_no_color_env_disables(self):
+        old = os.environ.get("NO_COLOR")
+        os.environ["NO_COLOR"] = "1"
+        try:
+            self.assertFalse(h.color_enabled())
+        finally:
+            if old is None:
+                os.environ.pop("NO_COLOR", None)
+            else:
+                os.environ["NO_COLOR"] = old
+
+
 class TestLoadAgentsMd(Base):
     def setUp(self):
         super().setUp()

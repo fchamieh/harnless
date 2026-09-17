@@ -20,6 +20,49 @@ SHELL_NOTE = (
 )
 
 
+ANSI = {
+    "user": "\033[1;36m",
+    "assistant": "\033[1;32m",
+    "tool": "\033[1;33m",
+    "result": "\033[2m",
+    "error": "\033[1;31m",
+    "dim": "\033[2m",
+    "reset": "\033[0m",
+}
+
+COLORS_ENABLED = True
+
+
+def set_color_enabled(enabled: bool):
+    global COLORS_ENABLED
+    COLORS_ENABLED = enabled
+
+
+def color_enabled() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    if not sys.stdout.isatty():
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            mode = ctypes.c_uint32()
+            if not kernel32.GetConsoleMode(kernel32.GetStdHandle(-11), ctypes.byref(mode)):
+                return False
+            return bool(mode.value & 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        except Exception:
+            return False
+    return True
+
+
+def colorize(text: str, key=None) -> str:
+    if not COLORS_ENABLED or key is None:
+        return text
+    return f"{ANSI[key]}{text}{ANSI['reset']}"
+
+
 class ExitSignal(Exception):
     def __init__(self, code: int, message: str = ""):
         super().__init__(message)
@@ -731,30 +774,30 @@ def run_agent(messages: list, model: str) -> int:
         try:
             data = chat(messages, model)
         except urllib.error.URLError as e:
-            print(f"[connection error] {e}")
+            print(colorize(f"[connection error] {e}", "error"))
             return 1
         choice = data["choices"][0]["message"]
         messages.append(choice)
 
         tool_calls = choice.get("tool_calls") or []
         if not tool_calls:
-            print(f"\nassistant> {choice.get('content', '')}\n")
+            print(f"\n{colorize('assistant> ', 'assistant')}{choice.get('content', '')}\n")
             return 0
 
         if choice.get("content"):
-            print(choice["content"].strip())
+            print(colorize(choice["content"].strip(), "assistant"))
         for tc in tool_calls:
             name = tc["function"]["name"]
             raw_args = tc["function"].get("arguments", "")
             arg_preview = raw_args[:200]
-            print(f"[tool] {name}({arg_preview})")
+            print(colorize(f"[tool] {name}({arg_preview})", "tool"))
             try:
                 result = execute_tool(name, raw_args)
             except ExitSignal as e:
                 if e.message:
-                    print(f"[exit] {e.message}")
+                    print(colorize(f"[exit] {e.message}", "tool"))
                 sys.exit(e.code)
-            print(f"[result] {result[:500]}{'...' if len(result) > 500 else ''}")
+            print(colorize(f"[result] {result[:500]}{'...' if len(result) > 500 else ''}", "result"))
             messages.append(
                 {
                     "role": "tool",
@@ -783,7 +826,14 @@ def main():
         default=None,
         help="one-shot mode: send this as the only user message, then exit",
     )
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="disable ANSI color output (also auto-disabled for piped output and NO_COLOR)",
+    )
     args = parser.parse_args()
+
+    set_color_enabled(not args.no_color and color_enabled())
 
     system_prompt_additions = (
         ""
@@ -809,16 +859,16 @@ def main():
     messages = [{"role": "system", "content": system_prompt}]
 
     if args.prompt is not None:
-        print(f"fadiz-harness one-shot in {CWD} (api: {API_URL})")
+        print(colorize(f"fadiz-harness one-shot in {CWD} (api: {API_URL})", "dim"))
         messages.append({"role": "user", "content": args.prompt})
         sys.exit(run_agent(messages, args.model))
 
-    print(f"fadiz-harness ready in {CWD} (api: {API_URL})")
-    print("type /new to start over, /clear-screen to clear the screen, /exit to quit\n")
+    print(colorize(f"fadiz-harness ready in {CWD} (api: {API_URL})", "dim"))
+    print(colorize("type /new to start over, /clear-screen to clear the screen, /exit to quit\n", "dim"))
 
     while True:
         try:
-            user_input = input("you> ").strip()
+            user_input = input(colorize("you> ", "user")).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
@@ -828,7 +878,7 @@ def main():
             break
         if user_input == "/new":
             messages = [{"role": "system", "content": system_prompt}]
-            print("session cleared — starting over\n")
+            print(colorize("session cleared — starting over\n", "dim"))
             continue
         if user_input == "/clear-screen":
             os.system("cls" if os.name == "nt" else "clear")
