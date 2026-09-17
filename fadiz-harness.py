@@ -358,7 +358,7 @@ def main():
         sys.exit(run_agent(messages, args.model))
 
     print(f"fadiz-harness ready in {CWD} (api: {API_URL})")
-    print("type /exit to quit\n")
+    print("type /clear-screen to clear the screen, /exit to quit\n")
 
     while True:
         try:
@@ -370,6 +370,9 @@ def main():
             continue
         if user_input in ("/exit", "/quit"):
             break
+        if user_input == "/clear-screen":
+            os.system("cls" if os.name == "nt" else "clear")
+            continue
         messages.append({"role": "user", "content": user_input})
         run_agent(messages, args.model)
 
