@@ -1,6 +1,7 @@
 """Tests for fadiz-harness.py. Run from the repo root: python tests.py"""
 
 import importlib.util
+import json
 import os
 import shutil
 import unittest
@@ -467,6 +468,94 @@ class TestDispatch(Base):
 
     def test_tool_exception_caught(self):
         self.assertTrue(h.execute_tool("read_file", '{"path": "nope.txt"}').startswith("error:"))
+
+
+class TestParseSseLine(unittest.TestCase):
+    def _line(self, delta):
+        return "data: " + json.dumps({"choices": [{"delta": delta}]})
+
+    def test_valid_delta(self):
+        self.assertEqual(h.parse_sse_line(self._line({"content": "hi"})), {"content": "hi"})
+
+    def test_done_terminator(self):
+        self.assertEqual(h.parse_sse_line("data: [DONE]"), "[DONE]")
+
+    def test_comment_ignored(self):
+        self.assertIsNone(h.parse_sse_line(": keepalive"))
+
+    def test_blank_ignored(self):
+        self.assertIsNone(h.parse_sse_line(""))
+
+    def test_non_data_line_ignored(self):
+        self.assertIsNone(h.parse_sse_line("event: message"))
+
+    def test_malformed_json_ignored(self):
+        self.assertIsNone(h.parse_sse_line("data: {not json"))
+
+    def test_missing_delta(self):
+        self.assertEqual(h.parse_sse_line("data: " + json.dumps({"choices": [{"index": 0}]})), {})
+
+    def test_whitespace_tolerance(self):
+        self.assertEqual(h.parse_sse_line("  data:   [DONE]  "), "[DONE]")
+
+
+class TestStreamAccumulation(unittest.TestCase):
+    def accumulate(self, chunks):
+        msg = {}
+        for c in chunks:
+            h.accumulate_delta(msg, c)
+        return msg
+
+    def test_content_only(self):
+        self.assertEqual(self.accumulate([{"content": "He"}, {"content": "llo"}]), {"content": "Hello"})
+
+    def test_empty_delta_ignored(self):
+        self.assertEqual(self.accumulate([{}, {"content": "a"}, {}]), {"content": "a"})
+
+    def test_reasoning_and_content(self):
+        msg = self.accumulate([
+            {"reasoning_content": "let me "},
+            {"reasoning_content": "think"},
+            {"content": "answer"},
+        ])
+        self.assertEqual(msg["reasoning_content"], "let me think")
+        self.assertEqual(msg["content"], "answer")
+
+    def test_tool_call_split_across_chunks(self):
+        msg = self.accumulate([
+            {"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "read_file"}}]},
+            {"tool_calls": [{"index": 0, "function": {"arguments": '{"path": '}}]},
+            {"tool_calls": [{"index": 0, "function": {"arguments": '"a.txt"}'}}]},
+        ])
+        self.assertEqual(msg["tool_calls"], [
+            {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "a.txt"}'}}
+        ])
+
+    def test_parallel_tool_calls(self):
+        msg = self.accumulate([
+            {"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "read_file"}},
+                            {"index": 1, "id": "c2", "function": {"name": "write_file"}}]},
+            {"tool_calls": [{"index": 1, "function": {"arguments": '{"path": "x"}'}}]},
+            {"tool_calls": [{"index": 0, "function": {"arguments": '{"path": "y"}'}}]},
+        ])
+        self.assertEqual(len(msg["tool_calls"]), 2)
+        self.assertEqual(msg["tool_calls"][0]["id"], "c1")
+        self.assertEqual(msg["tool_calls"][0]["function"]["arguments"], '{"path": "y"}')
+        self.assertEqual(msg["tool_calls"][1]["id"], "c2")
+        self.assertEqual(msg["tool_calls"][1]["function"]["arguments"], '{"path": "x"}')
+
+    def test_tool_call_with_content(self):
+        msg = self.accumulate([
+            {"content": "let me check "},
+            {"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "get_cwd", "arguments": "{}"}}]},
+        ])
+        self.assertEqual(msg["content"], "let me check ")
+        self.assertEqual(msg["tool_calls"][0]["function"]["name"], "get_cwd")
+
+    def test_mutation_is_in_place(self):
+        msg = {"role": "assistant"}
+        result = h.accumulate_delta(msg, {"content": "x"})
+        self.assertIs(result, msg)
 
 
 class TestEndToEndScenario(Base):

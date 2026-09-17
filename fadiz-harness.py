@@ -781,6 +781,117 @@ def chat(messages: list, model: str) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _build_request(messages: list, model: str, stream: bool) -> urllib.request.Request:
+    payload = json.dumps(
+        {
+            "model": model,
+            "messages": messages,
+            "tools": OPENAI_TOOLS,
+            "tool_choice": "auto",
+            "temperature": 0.2,
+            "stream": stream,
+        }
+    ).encode("utf-8")
+    return urllib.request.Request(
+        API_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+
+
+def parse_sse_line(line: str):
+    """Parse one SSE line from a streaming chat response.
+
+    Returns the delta dict for data lines, the string "[DONE]" for the
+    terminator, or None for comments/blank/malformed lines.
+    """
+    line = line.strip()
+    if not line.startswith("data:"):
+        return None
+    data = line[5:].strip()
+    if data == "[DONE]":
+        return "[DONE]"
+    try:
+        chunk = json.loads(data)
+    except json.JSONDecodeError:
+        return None
+    choice = chunk["choices"][0]
+    return choice.get("delta") or {}
+
+
+def stream_chat(messages: list, model: str):
+    """Yield deltas from a streaming chat response until [DONE]."""
+    req = _build_request(messages, model, stream=True)
+    with urllib.request.urlopen(req, timeout=600) as resp:
+        for raw in resp:
+            parsed = parse_sse_line(raw.decode("utf-8"))
+            if parsed is None:
+                continue
+            if parsed == "[DONE]":
+                break
+            yield parsed
+
+
+def accumulate_delta(message: dict, delta: dict) -> dict:
+    """Merge a streaming delta into an assistant message in place."""
+    if not delta:
+        return message
+    content = delta.get("content")
+    if content:
+        message["content"] = message.get("content", "") + content
+    reasoning = delta.get("reasoning_content")
+    if reasoning:
+        message["reasoning_content"] = message.get("reasoning_content", "") + reasoning
+    for tc in delta.get("tool_calls") or []:
+        idx = int(tc.get("index", 0))
+        calls = message.setdefault("tool_calls", [])
+        while len(calls) <= idx:
+            calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+        target = calls[idx]
+        if tc.get("id"):
+            target["id"] = tc["id"]
+        fn = tc.get("function") or {}
+        if fn.get("name"):
+            target["function"]["name"] += fn["name"]
+        if fn.get("arguments"):
+            target["function"]["arguments"] += fn["arguments"]
+    return message
+
+
+def stream_once(messages: list, model: str):
+    """Stream one chat turn, printing reasoning and content live.
+
+    Returns (message, streamed) where streamed is False if no deltas
+    arrived (e.g. server ignored stream mode) — caller should fall back.
+    """
+    message = {"role": "assistant"}
+    started_reasoning = False
+    started_content = False
+    streamed = False
+    for delta in stream_chat(messages, model):
+        streamed = True
+        reasoning = delta.get("reasoning_content")
+        if reasoning:
+            if not started_reasoning:
+                print(colorize(f"{icon('thinking')} thinking: ", "thinking"), end="", flush=True)
+                started_reasoning = True
+            print(reasoning, end="", flush=True)
+        content = delta.get("content")
+        if content:
+            if not started_content:
+                if started_reasoning:
+                    print()
+                print(colorize(f"{icon('assistant')} assistant> ", "assistant"), end="", flush=True)
+                started_content = True
+            print(content, end="", flush=True)
+        accumulate_delta(message, delta)
+    if started_reasoning:
+        print()
+    if started_content:
+        print()
+    return message, streamed
+
+
 def execute_tool(name: str, raw_args: str) -> str:
     try:
         args = json.loads(raw_args) if raw_args else {}
@@ -802,26 +913,36 @@ def execute_tool(name: str, raw_args: str) -> str:
 
 def run_agent(messages: list, model: str) -> int:
     while True:
+        message = None
+        streamed = False
         try:
-            data = chat(messages, model)
-        except urllib.error.URLError as e:
-            print(colorize(f"{icon('error')} connection error: {e}", "error"))
-            return 1
-        choice = data["choices"][0]["message"]
-        messages.append(choice)
+            message, streamed = stream_once(messages, model)
+            if not streamed:
+                message = None
+        except (urllib.error.URLError, ConnectionError, OSError) as e:
+            print(colorize(f"{icon('error')} streaming failed ({e}); retrying non-streaming", "error"))
+        if message is None:
+            try:
+                data = chat(messages, model)
+            except urllib.error.URLError as e:
+                print(colorize(f"{icon('error')} connection error: {e}", "error"))
+                return 1
+            message = data["choices"][0]["message"]
+        messages.append(message)
 
-        reasoning = choice.get("reasoning_content")
-        if reasoning:
+        reasoning = message.get("reasoning_content")
+        if reasoning and not streamed:
             print(colorize(f"{icon('thinking')} thinking: {reasoning.strip()}", "thinking"))
 
-        tool_calls = choice.get("tool_calls") or []
+        tool_calls = message.get("tool_calls") or []
         if not tool_calls:
-            label = colorize(f"{icon('assistant')} assistant> ", "assistant")
-            print(f"\n{label}{choice.get('content', '')}\n")
+            if not streamed:
+                label = colorize(f"{icon('assistant')} assistant> ", "assistant")
+                print(f"\n{label}{message.get('content', '')}\n")
             return 0
 
-        if choice.get("content"):
-            print(colorize(f"{icon('assistant')} {choice['content'].strip()}", "assistant"))
+        if message.get("content") and not streamed:
+            print(colorize(f"{icon('assistant')} {message['content'].strip()}", "assistant"))
         for tc in tool_calls:
             name = tc["function"]["name"]
             raw_args = tc["function"].get("arguments", "")
@@ -844,6 +965,12 @@ def run_agent(messages: list, model: str) -> int:
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     parser = argparse.ArgumentParser(
         description="fadiz-harness: minimal LLM agent harness"
     )
