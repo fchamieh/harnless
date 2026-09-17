@@ -786,6 +786,103 @@ class TestDispatch(Base):
         self.assertTrue(h.execute_tool("read_file", '{"path": "nope.txt"}').startswith("error:"))
 
 
+class TestSubagents(unittest.TestCase):
+    def setUp(self):
+        self._old_depth = h._AGENT_DEPTH
+        self._old_max = h.MAX_SUBAGENT_DEPTH
+        self._old_indent = h.OUTPUT_INDENT
+        self._old_model = h.MODEL
+        self._old_temp = h.TEMPERATURE
+        h._AGENT_DEPTH = 0
+        h.MAX_SUBAGENT_DEPTH = 3
+        h.OUTPUT_INDENT = ""
+        h.MODEL = "test-model"
+        h.TEMPERATURE = 0.2
+        self.addCleanup(setattr, h, "_AGENT_DEPTH", self._old_depth)
+        self.addCleanup(setattr, h, "MAX_SUBAGENT_DEPTH", self._old_max)
+        self.addCleanup(setattr, h, "OUTPUT_INDENT", self._old_indent)
+        self.addCleanup(setattr, h, "MODEL", self._old_model)
+        self.addCleanup(setattr, h, "TEMPERATURE", self._old_temp)
+
+    def test_task_registered_in_both_tool_lists(self):
+        all_names = [s["function"]["name"] for s in h.OPENAI_TOOLS]
+        interactive_names = [s["function"]["name"] for s in h.OPENAI_TOOLS_INTERACTIVE]
+        self.assertIn("task", all_names)
+        self.assertIn("task", interactive_names)
+        self.assertIn("task", h.DISPATCH)
+
+    def test_task_empty(self):
+        self.assertEqual(h.tool_task({"task": "   "}), "error: empty task")
+        self.assertEqual(h.tool_task({}), "error: empty task")
+
+    def test_task_depth_limit(self):
+        h._AGENT_DEPTH = h.MAX_SUBAGENT_DEPTH
+        out = h.tool_task({"task": "do something"})
+        self.assertTrue(out.startswith("error: sub-agent depth limit reached"))
+
+    def test_task_runs_nested_agent(self):
+        calls = []
+
+        def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0):
+            calls.append({
+                "messages": list(messages), "model": model,
+                "interactive": interactive, "temperature": temperature, "depth": depth,
+            })
+            messages.append({"role": "assistant", "content": "sub summary"})
+            return 0
+
+        old = h.run_agent
+        h.run_agent = fake_run_agent
+        self.addCleanup(setattr, h, "run_agent", old)
+        out = h.tool_task({"task": "do X"})
+        self.assertEqual(out, "exit code: 0\nsub summary")
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertEqual(call["model"], "test-model")
+        self.assertEqual(call["temperature"], 0.2)
+        self.assertFalse(call["interactive"])
+        self.assertEqual(call["depth"], 1)
+        self.assertEqual(call["messages"][1], {"role": "user", "content": "do X"})
+        self.assertIn("sub-agent", call["messages"][0]["content"])
+        self.assertEqual(h.OUTPUT_INDENT, "")
+
+    def test_task_indent_restored_on_error(self):
+        def boom(messages, model, interactive=False, temperature=0.2, depth=0):
+            raise RuntimeError("nope")
+
+        old = h.run_agent
+        h.run_agent = boom
+        self.addCleanup(setattr, h, "run_agent", old)
+        with self.assertRaises(RuntimeError):
+            h.tool_task({"task": "do X"})
+        self.assertEqual(h.OUTPUT_INDENT, "")
+
+    def test_task_no_final_content(self):
+        def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0):
+            messages.append({"role": "assistant", "content": ""})
+            return 2
+
+        old = h.run_agent
+        h.run_agent = fake_run_agent
+        self.addCleanup(setattr, h, "run_agent", old)
+        self.assertEqual(h.tool_task({"task": "do X"}), "exit code: 2")
+
+    def test_run_agent_exit_returns_code(self):
+        def fake_stream_once(messages, model, interactive=False, temperature=0.2):
+            return ({"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "exit", "arguments": '{"code": 7, "message": "done"}'}}]}, True)
+
+        old = h.stream_once
+        h.stream_once = fake_stream_once
+        self.addCleanup(setattr, h, "stream_once", old)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = h.run_agent([{"role": "user", "content": "go"}], "m")
+        self.assertEqual(code, 7)
+        self.assertIn("done", buf.getvalue())
+
+
 class TestStatus(unittest.TestCase):
     def test_context_usage_counts_content_and_tool_args(self):
         messages = [

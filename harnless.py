@@ -17,6 +17,11 @@ import urllib.error
 
 API_URL = "http://127.0.0.1:11434/v1/chat/completions"
 API_KEY = None
+MODEL = "local-model"
+TEMPERATURE = 0.2
+MAX_SUBAGENT_DEPTH = 3
+_AGENT_DEPTH = 0
+OUTPUT_INDENT = ""
 CWD = os.getcwd()
 SHELL_NOTE = (
     " Commands run in cmd.exe; prefer cross-platform commands (e.g. dir, type, copy, del) over bash-specific syntax."
@@ -410,6 +415,61 @@ def tool_copy_file(args: dict) -> str:
     return f"copied {src} -> {dst}"
 
 
+SUBAGENT_NOTE = (
+    "You are a sub-agent delegated a specific task. Work autonomously using the tools. "
+    "When the task is complete, write a concise final summary of what you did and the result, "
+    "then call the exit tool with code 0. If the task cannot be completed, explain why in your "
+    "final message and call the exit tool with a non-zero code."
+)
+
+
+def tool_task(args: dict) -> str:
+    """Delegate a task to a sub-agent: a nested run_agent with a fresh context.
+
+    Returns the sub-agent's exit code and final summary as the tool result.
+    """
+    task = (args.get("task") or "").strip()
+    if not task:
+        return "error: empty task"
+    if _AGENT_DEPTH >= MAX_SUBAGENT_DEPTH:
+        return (
+            f"error: sub-agent depth limit reached ({MAX_SUBAGENT_DEPTH}); "
+            "do the work yourself"
+        )
+    system = get_system_prompt(CWD, SUBAGENT_NOTE)
+    agents_md = load_agents_md()
+    if agents_md:
+        system += (
+            "\n\nProject instructions (AGENTS.md in the working directory):\n"
+            + agents_md
+        )
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": task},
+    ]
+    global OUTPUT_INDENT
+    old_indent = OUTPUT_INDENT
+    OUTPUT_INDENT = old_indent + "  "
+    try:
+        code = run_agent(
+            messages,
+            MODEL,
+            interactive=False,
+            temperature=TEMPERATURE,
+            depth=_AGENT_DEPTH + 1,
+        )
+    finally:
+        OUTPUT_INDENT = old_indent
+    final = ""
+    for m in reversed(messages):
+        if m.get("role") == "assistant" and (m.get("content") or "").strip():
+            final = m["content"].strip()
+            break
+    if final:
+        return f"exit code: {code}\n{final}"
+    return f"exit code: {code}"
+
+
 TOOLS = {
     "get_cwd": (
         {
@@ -714,6 +774,32 @@ TOOLS = {
             },
         },
         tool_copy_file,
+    ),
+    "task": (
+        {
+            "type": "function",
+            "function": {
+                "name": "task",
+                "description": (
+                    "Delegate a self-contained task to a sub-agent. The sub-agent runs in a "
+                    "fresh context with the same tools (it can delegate further, up to the "
+                    "depth limit) and returns its final summary as the result. Use it for work "
+                    "that would flood your context with intermediate output, e.g. exploring a "
+                    "large codebase, running many commands, or verifying a change."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task": {
+                            "type": "string",
+                            "description": "The complete, self-contained task for the sub-agent",
+                        },
+                    },
+                    "required": ["task"],
+                },
+            },
+        },
+        tool_task,
     ),
     "exit": (
         {
@@ -1928,7 +2014,8 @@ def stream_once(
         if reasoning:
             if not started_reasoning:
                 print(
-                    colorize(f"{icon('thinking')} thinking: ", "thinking"),
+                    OUTPUT_INDENT
+                    + colorize(f"{icon('thinking')} thinking: ", "thinking"),
                     end="",
                     flush=True,
                 )
@@ -1940,8 +2027,12 @@ def stream_once(
                 if started_reasoning:
                     print()
                 label = f"{icon('assistant')} assistant> "
-                print(colorize(label, "assistant"), end="", flush=True)
-                renderer = MarkdownRenderer(indent=display_width(label))
+                print(
+                    OUTPUT_INDENT + colorize(label, "assistant"),
+                    end="",
+                    flush=True,
+                )
+                renderer = MarkdownRenderer(indent=display_width(OUTPUT_INDENT + label))
             renderer.write(content)
         accumulate_delta(message, delta)
     if started_reasoning:
@@ -1956,8 +2047,8 @@ def print_assistant(content: str):
     """Print a complete (non-streamed) assistant message with Markdown styling."""
     label = f"{icon('assistant')} assistant> "
     print()
-    print(colorize(label, "assistant"), end="", flush=True)
-    renderer = MarkdownRenderer(indent=display_width(label))
+    print(OUTPUT_INDENT + colorize(label, "assistant"), end="", flush=True)
+    renderer = MarkdownRenderer(indent=display_width(OUTPUT_INDENT + label))
     renderer.write(content or "")
     renderer.flush()
     print()
@@ -2143,8 +2234,14 @@ def format_help() -> str:
 
 
 def run_agent(
-    messages: list, model: str, interactive: bool = False, temperature: float = 0.2
+    messages: list,
+    model: str,
+    interactive: bool = False,
+    temperature: float = 0.2,
+    depth: int = 0,
 ) -> int:
+    global _AGENT_DEPTH
+    _AGENT_DEPTH = depth
     while True:
         message = None
         streamed = False
@@ -2156,7 +2253,8 @@ def run_agent(
                 message = None
         except (urllib.error.URLError, ConnectionError, OSError) as e:
             print(
-                colorize(
+                OUTPUT_INDENT
+                + colorize(
                     f"{icon('error')} streaming failed ({e}); retrying non-streaming",
                     "error",
                 )
@@ -2167,7 +2265,10 @@ def run_agent(
                     messages, model, interactive=interactive, temperature=temperature
                 )
             except urllib.error.URLError as e:
-                print(colorize(f"{icon('error')} connection error: {e}", "error"))
+                print(
+                    OUTPUT_INDENT
+                    + colorize(f"{icon('error')} connection error: {e}", "error")
+                )
                 return 1
             message = data["choices"][0]["message"]
         messages.append(message)
@@ -2175,7 +2276,8 @@ def run_agent(
         reasoning = message.get("reasoning_content")
         if reasoning and not streamed:
             print(
-                colorize(
+                OUTPUT_INDENT
+                + colorize(
                     f"{icon('thinking')} thinking: {reasoning.strip()}", "thinking"
                 )
             )
@@ -2192,17 +2294,21 @@ def run_agent(
             name = tc["function"]["name"]
             raw_args = tc["function"].get("arguments", "")
             arg_preview = raw_args[:200]
-            print(colorize(f"{icon('tool')} {name}({arg_preview})", "tool"))
+            print(
+                OUTPUT_INDENT
+                + colorize(f"{icon('tool')} {name}({arg_preview})", "tool")
+            )
             try:
                 result = execute_tool(name, raw_args)
             except ExitSignal as e:
                 if e.message:
-                    print(colorize(f"{icon('exit')} {e.message}", "tool"))
-                if interactive:
-                    return e.code
-                sys.exit(e.code)
+                    print(
+                        OUTPUT_INDENT + colorize(f"{icon('exit')} {e.message}", "tool")
+                    )
+                return e.code
             print(
-                colorize(
+                OUTPUT_INDENT
+                + colorize(
                     f"{icon('result')} {result[:500]}{'...' if len(result) > 500 else ''}",
                     "result",
                 )
@@ -2217,7 +2323,7 @@ def run_agent(
 
 
 def main():
-    global API_URL, API_KEY
+    global API_URL, API_KEY, MODEL, TEMPERATURE, MAX_SUBAGENT_DEPTH
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
@@ -2261,6 +2367,12 @@ def main():
         help="sampling temperature (default: 0.2; lower = more deterministic tool calls)",
     )
     parser.add_argument(
+        "--max-subagents",
+        type=int,
+        default=3,
+        help="maximum sub-agent nesting depth for the task tool (default: 3)",
+    )
+    parser.add_argument(
         "--no-color",
         action="store_true",
         help="disable ANSI color output (also auto-disabled for piped output and NO_COLOR)",
@@ -2295,6 +2407,9 @@ def main():
 
     API_URL = normalize_api_url(args.api_url)
     API_KEY = args.api_key
+    MODEL = args.model
+    TEMPERATURE = args.temperature
+    MAX_SUBAGENT_DEPTH = args.max_subagents
 
     set_color_enabled(not args.no_color and color_enabled())
     set_emoji_enabled(not args.no_emoji)
