@@ -7,6 +7,8 @@ import os
 import shutil
 import sys
 import unittest
+import urllib.error
+from unittest import mock
 
 import harnless as h
 
@@ -902,12 +904,127 @@ class TestStatus(unittest.TestCase):
             {"role": "tool", "tool_call_id": "1", "content": "e" * 20},
         ]
         out = h.format_status(messages)
-        # 100 + 50 + 10 + 40 + 20 = 220 chars -> 55 approx tokens
-        self.assertTrue(out.startswith("context: 55 tokens (~220 chars) in 4 messages"))
+        # 100 + 50 + 10 + 40 + 20 = 220 chars of conversation, plus the tool
+        # schemas that are sent with every request
+        total = 220 + len(json.dumps(h._active_tools(True)))
+        self.assertTrue(
+            out.startswith(f"context: {total // 4} tokens (~{total} chars) in 4 messages")
+        )
 
     def test_empty_history(self):
         out = h.format_status([])
-        self.assertTrue(out.startswith("context: 0 tokens (~0 chars) in 0 messages"))
+        total = len(json.dumps(h._active_tools(True)))
+        self.assertTrue(
+            out.startswith(f"context: {total // 4} tokens (~{total} chars) in 0 messages")
+        )
+
+    def test_counts_reasoning_content(self):
+        messages = [
+            {"role": "assistant", "content": "c" * 10, "reasoning_content": "r" * 30},
+        ]
+        out = h.format_status(messages)
+        total = 40 + len(json.dumps(h._active_tools(True)))
+        self.assertTrue(
+            out.startswith(f"context: {total // 4} tokens (~{total} chars) in 1 messages")
+        )
+
+    def test_context_window_percentage(self):
+        messages = [{"role": "system", "content": "x" * 400}]
+        out = h.format_status(messages, context_window=10000)
+        total = 400 + len(json.dumps(h._active_tools(True)))
+        pct = (total // 4) * 100 // 10000
+        self.assertIn(f"~{pct}% of 10000 window", out)
+
+    def test_no_context_window_omits_percentage(self):
+        out = h.format_status([{"role": "system", "content": "x"}])
+        self.assertNotIn("% of", out)
+
+    def test_tiny_percentage_shows_lt_1(self):
+        out = h.format_status([{"role": "system", "content": "x" * 400}], context_window=222208)
+        self.assertIn("<1% of 222208 window", out)
+
+
+class TestProbeContextWindow(unittest.TestCase):
+    def setUp(self):
+        self.old_api_url = h.API_URL
+        self.old_model = h.MODEL
+        h.API_URL = "http://127.0.0.1:11434/v1/chat/completions"
+        h.MODEL = "local-model"
+        self.addCleanup(setattr, h, "API_URL", self.old_api_url)
+        self.addCleanup(setattr, h, "MODEL", self.old_model)
+
+    def _fake_response(self, payload):
+        return io.BytesIO(json.dumps(payload).encode("utf-8"))
+
+    def test_context_length_field_and_models_url(self):
+        payload = {"data": [{"id": "m1", "context_length": 8192}]}
+        with mock.patch(
+            "urllib.request.urlopen", return_value=self._fake_response(payload)
+        ) as m:
+            self.assertEqual(h.probe_context_window(), 8192)
+        req = m.call_args[0][0]
+        self.assertEqual(req.full_url, "http://127.0.0.1:11434/v1/models")
+
+    def test_llamacpp_meta_n_ctx(self):
+        payload = {"data": [{"id": "m1", "meta": {"n_ctx": 222208}}]}
+        with mock.patch(
+            "urllib.request.urlopen", return_value=self._fake_response(payload)
+        ):
+            self.assertEqual(h.probe_context_window(), 222208)
+
+    def test_context_length_wins_over_n_ctx(self):
+        payload = {"data": [{"id": "m1", "context_length": 4096, "meta": {"n_ctx": 8192}}]}
+        with mock.patch(
+            "urllib.request.urlopen", return_value=self._fake_response(payload)
+        ):
+            self.assertEqual(h.probe_context_window(), 4096)
+
+    def test_multi_model_matches_by_id(self):
+        payload = {
+            "data": [
+                {"id": "other", "context_length": 1000},
+                {"id": "local-model", "context_length": 4096},
+            ]
+        }
+        with mock.patch(
+            "urllib.request.urlopen", return_value=self._fake_response(payload)
+        ):
+            self.assertEqual(h.probe_context_window(), 4096)
+
+    def test_multi_model_no_match_uses_first(self):
+        payload = {
+            "data": [
+                {"id": "a", "context_length": 1000},
+                {"id": "b", "context_length": 2000},
+            ]
+        }
+        with mock.patch(
+            "urllib.request.urlopen", return_value=self._fake_response(payload)
+        ):
+            self.assertEqual(h.probe_context_window(), 1000)
+
+    def test_network_error_returns_zero(self):
+        with mock.patch(
+            "urllib.request.urlopen", side_effect=urllib.error.URLError("down")
+        ):
+            self.assertEqual(h.probe_context_window(), 0)
+
+    def test_malformed_json_returns_zero(self):
+        with mock.patch("urllib.request.urlopen", return_value=io.BytesIO(b"not json")):
+            self.assertEqual(h.probe_context_window(), 0)
+
+    def test_missing_field_returns_zero(self):
+        payload = {"data": [{"id": "m1"}]}
+        with mock.patch(
+            "urllib.request.urlopen", return_value=self._fake_response(payload)
+        ):
+            self.assertEqual(h.probe_context_window(), 0)
+
+    def test_empty_data_returns_zero(self):
+        with mock.patch(
+            "urllib.request.urlopen", return_value=self._fake_response({"data": []})
+        ):
+            self.assertEqual(h.probe_context_window(), 0)
 
     def test_api_url_line(self):
         old = h.API_URL

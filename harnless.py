@@ -1519,6 +1519,40 @@ def _headers() -> dict:
     return headers
 
 
+def probe_context_window() -> int:
+    """Best-effort: query the API's /models endpoint for the context window size.
+
+    Returns the model's context window in tokens, or 0 if it cannot be
+    determined (server unreachable, no /models endpoint, field missing).
+    """
+    if not API_URL.endswith("/chat/completions"):
+        return 0
+    models_url = API_URL[: -len("/chat/completions")] + "/models"
+    try:
+        req = urllib.request.Request(models_url, headers=_headers())
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return 0
+    models = data.get("data") or []
+    if not models:
+        return 0
+    model = models[0]
+    if len(models) > 1:
+        for m in models:
+            if m.get("id") == MODEL:
+                model = m
+                break
+
+    def _as_int(v):
+        return int(v) if isinstance(v, (int, float)) and v > 0 else 0
+
+    # OpenAI/OpenRouter use context_length; llama.cpp exposes meta.n_ctx.
+    return _as_int(model.get("context_length")) or _as_int(
+        (model.get("meta") or {}).get("n_ctx")
+    )
+
+
 def chat(
     messages: list, model: str, interactive: bool = False, temperature: float = 0.2
 ) -> dict:
@@ -2194,17 +2228,25 @@ def tools_menu(keys=None) -> bool:
             sys.stdout.flush()
 
 
-def format_status(messages: list) -> str:
+def format_status(messages: list, context_window: int = 0) -> str:
     """Build the /status report: context usage, API URL, tool names, MCP servers."""
-    total_chars = 0
+    tools = _active_tools(True)
+    # Tool schemas are sent with every request — a fixed per-request cost.
+    total_chars = len(json.dumps(tools))
     for m in messages:
         total_chars += len(m.get("content") or "")
+        total_chars += len(m.get("reasoning_content") or "")
         for tc in m.get("tool_calls") or []:
             total_chars += len((tc.get("function") or {}).get("arguments") or "")
     approx_tokens = total_chars // 4
-    tool_names = ", ".join(s["function"]["name"] for s in _active_tools(True))
+    tool_names = ", ".join(s["function"]["name"] for s in tools)
+    ctx = f"context: {approx_tokens} tokens (~{total_chars} chars) in {len(messages)} messages"
+    if context_window > 0:
+        pct = approx_tokens * 100 // context_window
+        pct_str = "<1%" if pct == 0 and approx_tokens > 0 else f"~{pct}%"
+        ctx += f" ({pct_str} of {context_window} window)"
     lines = [
-        f"context: {approx_tokens} tokens (~{total_chars} chars) in {len(messages)} messages",
+        ctx,
         f"api url: {API_URL}",
         f"tools: {tool_names}",
     ]
@@ -2373,6 +2415,12 @@ def main():
         help="maximum sub-agent nesting depth for the task tool (default: 3)",
     )
     parser.add_argument(
+        "--context-window",
+        type=int,
+        default=0,
+        help="model context window size in tokens, shown as a percentage in /status (0 = not shown)",
+    )
+    parser.add_argument(
         "--no-color",
         action="store_true",
         help="disable ANSI color output (also auto-disabled for piped output and NO_COLOR)",
@@ -2410,6 +2458,10 @@ def main():
     MODEL = args.model
     TEMPERATURE = args.temperature
     MAX_SUBAGENT_DEPTH = args.max_subagents
+
+    context_window = args.context_window
+    if context_window == 0 and args.prompt is None:
+        context_window = probe_context_window()
 
     set_color_enabled(not args.no_color and color_enabled())
     set_emoji_enabled(not args.no_emoji)
@@ -2514,7 +2566,7 @@ def main():
             os.system("cls" if os.name == "nt" else "clear")
             continue
         if user_input == "/status":
-            print(colorize(format_status(messages), "dim"))
+            print(colorize(format_status(messages, context_window), "dim"))
             continue
         if user_input == "/tools" or user_input.startswith("/tools "):
             rest = user_input[len("/tools"):].strip()
