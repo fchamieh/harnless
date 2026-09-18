@@ -443,12 +443,16 @@ def tool_task(args: dict) -> str:
             "\n\nProject instructions (AGENTS.md in the working directory):\n"
             + agents_md
         )
+    additions = _context_additions()
+    if additions:
+        system += "\n\n" + additions
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": task},
     ]
-    global OUTPUT_INDENT
+    global OUTPUT_INDENT, TODO_LAST_INJECTED
     old_indent = OUTPUT_INDENT
+    old_todo_state = TODO_LAST_INJECTED
     OUTPUT_INDENT = old_indent + "  "
     try:
         code = run_agent(
@@ -460,6 +464,7 @@ def tool_task(args: dict) -> str:
         )
     finally:
         OUTPUT_INDENT = old_indent
+        TODO_LAST_INJECTED = old_todo_state
     final = ""
     for m in reversed(messages):
         if m.get("role") == "assistant" and (m.get("content") or "").strip():
@@ -468,6 +473,224 @@ def tool_task(args: dict) -> str:
     if final:
         return f"exit code: {code}\n{final}"
     return f"exit code: {code}"
+
+
+# ---------------------------------------------------------------- state tools
+
+TODO_ITEMS = []  # [{"id": int, "text": str, "status": "pending"|"in_progress"|"done"}]
+TODO_NEXT_ID = 1
+TODO_FILE = os.path.join(CWD, ".harnless", "todo.md")
+TODO_LAST_INJECTED = None  # serialized list state last injected as a reminder
+
+MEMORY_PROJECT_FILE = os.path.join(CWD, ".harnless", "memory.md")
+MEMORY_GLOBAL_FILE = os.path.join(os.path.expanduser("~"), ".harnless", "memory.md")
+
+GOTCHAS_FILE = os.path.join(CWD, "GOTCHAS.md")
+
+
+def _todo_render() -> str:
+    if not TODO_ITEMS:
+        return "(empty)"
+    marks = {"pending": " ", "in_progress": "~", "done": "x"}
+    return "\n".join(
+        f"- [{marks.get(i['status'], ' ')}] {i['id']}. {i['text']}" for i in TODO_ITEMS
+    )
+
+
+def _todo_save():
+    try:
+        os.makedirs(os.path.dirname(TODO_FILE), exist_ok=True)
+        with open(TODO_FILE, "w", encoding="utf-8") as f:
+            f.write(_todo_render() + "\n" if TODO_ITEMS else "")
+    except OSError:
+        pass
+
+
+def _todo_load():
+    """Load the todo list from TODO_FILE (best effort)."""
+    global TODO_ITEMS, TODO_NEXT_ID, TODO_LAST_INJECTED
+    try:
+        with open(TODO_FILE, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return
+    items = []
+    for line in lines:
+        m = re.match(r"^\s*-\s*\[( |~|x)\]\s*(\d+)\.\s+(.*)$", line)
+        if not m:
+            continue
+        mark, num, text = m.groups()
+        items.append(
+            {
+                "id": int(num),
+                "text": text,
+                "status": {" ": "pending", "~": "in_progress", "x": "done"}[mark],
+            }
+        )
+    if items:
+        TODO_ITEMS = items
+        TODO_NEXT_ID = max(i["id"] for i in items) + 1
+        TODO_LAST_INJECTED = None
+
+
+def tool_todo(args: dict) -> str:
+    global TODO_NEXT_ID
+    action = (args.get("action") or "list").strip().lower()
+    if action == "add":
+        text = (args.get("text") or "").strip()
+        if not text:
+            return "error: 'add' requires text"
+        TODO_ITEMS.append({"id": TODO_NEXT_ID, "text": text, "status": "pending"})
+        TODO_NEXT_ID += 1
+    elif action == "update":
+        if args.get("id") is None:
+            return "error: 'update' requires id"
+        try:
+            tid = int(args["id"])
+        except (TypeError, ValueError):
+            return "error: id must be an integer"
+        item = next((i for i in TODO_ITEMS if i["id"] == tid), None)
+        if item is None:
+            return f"error: no todo with id {tid}"
+        if args.get("text"):
+            item["text"] = args["text"].strip()
+        if args.get("status"):
+            status = args["status"].strip().lower()
+            if status not in ("pending", "in_progress", "done"):
+                return "error: status must be pending, in_progress, or done"
+            item["status"] = status
+    elif action == "clear":
+        TODO_ITEMS.clear()
+    elif action != "list":
+        return f"error: unknown action '{action}' (use add, update, list, or clear)"
+    _todo_save()
+    return "todo list:\n" + _todo_render()
+
+
+def _todo_reminder(messages: list):
+    """Append a system reminder with the current todo list if it changed since the last injection."""
+    global TODO_LAST_INJECTED
+    if not TODO_ITEMS:
+        TODO_LAST_INJECTED = None
+        return
+    state = json.dumps(TODO_ITEMS, sort_keys=True)
+    if state == TODO_LAST_INJECTED:
+        return
+    messages.append({"role": "system", "content": "Current todo list:\n" + _todo_render()})
+    TODO_LAST_INJECTED = state
+
+
+def _memory_read(path: str) -> list:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return [ln[2:].strip() for ln in f.read().splitlines() if ln.startswith("- ")]
+    except OSError:
+        return []
+
+
+def _memory_write(path: str, notes: list):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(f"- {n}" for n in notes) + ("\n" if notes else ""))
+    except OSError:
+        pass
+
+
+def _memory_path(scope: str) -> str:
+    return MEMORY_PROJECT_FILE if scope == "project" else MEMORY_GLOBAL_FILE
+
+
+def tool_memory(args: dict) -> str:
+    action = (args.get("action") or "list").strip().lower()
+    scope = (args.get("scope") or "").strip().lower()
+    if scope not in ("", "project", "global", "all"):
+        return "error: scope must be 'project' or 'global'"
+    if action == "add":
+        text = (args.get("text") or "").strip()
+        if not text:
+            return "error: 'add' requires text"
+        target = scope or "project"
+        notes = _memory_read(_memory_path(target))
+        if text in notes:
+            return f"already in {target} memory"
+        notes.append(text)
+        _memory_write(_memory_path(target), notes)
+        return f"added to {target} memory ({len(notes)} notes)"
+    if action == "remove":
+        text = (args.get("text") or "").strip()
+        if not text:
+            return "error: 'remove' requires text"
+        target = scope or "project"
+        notes = _memory_read(_memory_path(target))
+        kept = [n for n in notes if text not in n]
+        if len(kept) == len(notes):
+            return f"no {target} memory note contains '{text}'"
+        _memory_write(_memory_path(target), kept)
+        return f"removed {len(notes) - len(kept)} note(s) from {target} memory"
+    if action == "list":
+        scopes = ("project", "global") if scope in ("", "all") else (scope,)
+        parts = []
+        for s in scopes:
+            notes = _memory_read(_memory_path(s))
+            body = "\n".join(f"- {n}" for n in notes) if notes else "(empty)"
+            parts.append(f"{s} memory:\n{body}")
+        return "\n\n".join(parts)
+    return f"error: unknown action '{action}' (use add, list, or remove)"
+
+
+def load_memory() -> str:
+    """Read project and global memory notes. Returns a formatted block, '' if none."""
+    parts = []
+    for label, path in (("project", MEMORY_PROJECT_FILE), ("global", MEMORY_GLOBAL_FILE)):
+        notes = _memory_read(path)
+        if notes:
+            parts.append(f"{label}:\n" + "\n".join(f"- {n}" for n in notes))
+    return "\n\n".join(parts)
+
+
+def _gotchas_read() -> list:
+    try:
+        with open(GOTCHAS_FILE, "r", encoding="utf-8", errors="replace") as f:
+            return [ln[2:].strip() for ln in f.read().splitlines() if ln.startswith("- ")]
+    except OSError:
+        return []
+
+
+def tool_gotcha(args: dict) -> str:
+    action = (args.get("action") or "list").strip().lower()
+    if action == "add":
+        text = (args.get("text") or "").strip()
+        if not text:
+            return "error: 'add' requires text"
+        notes = _gotchas_read()
+        if any(text in n for n in notes):
+            return "already recorded in GOTCHAS.md"
+        notes.append(text)
+        with open(GOTCHAS_FILE, "w", encoding="utf-8") as f:
+            f.write("\n".join(f"- {n}" for n in notes) + "\n")
+        return f"recorded in GOTCHAS.md ({len(notes)} total)"
+    if action != "list":
+        return f"error: unknown action '{action}' (use add or list)"
+    notes = _gotchas_read()
+    return "gotchas:\n" + ("\n".join(f"- {n}" for n in notes) if notes else "(none recorded)")
+
+
+def load_gotchas() -> str:
+    """Read GOTCHAS.md from CWD. Returns the note lines joined, '' if absent/empty."""
+    return "\n".join(f"- {n}" for n in _gotchas_read())
+
+
+def _context_additions() -> str:
+    """Memory and gotchas blocks to append to a system prompt ('' if none)."""
+    parts = []
+    memory = load_memory()
+    if memory:
+        parts.append("Memory (persistent notes from previous sessions):\n" + memory)
+    gotchas = load_gotchas()
+    if gotchas:
+        parts.append("Known gotchas (pitfalls discovered in previous sessions):\n" + gotchas)
+    return "\n\n".join(parts)
 
 
 TOOLS = {
@@ -774,6 +997,106 @@ TOOLS = {
             },
         },
         tool_copy_file,
+    ),
+    "todo": (
+        {
+            "type": "function",
+            "function": {
+                "name": "todo",
+                "description": (
+                    "Manage a todo list for tracking multi-step work. Actions: 'add' (text) to add an "
+                    "item, 'update' (id, plus status and/or text) to change an item, 'list' to show all "
+                    "items, 'clear' to remove all items. The current list is re-shown to you automatically "
+                    "after changes. Use it for multi-step tasks: add the steps up front, mark each "
+                    "in_progress then done as you go."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "description": "One of: add, update, list, clear (default: list)",
+                        },
+                        "text": {
+                            "type": "string",
+                            "description": "Item text (for add), or replacement text (for update)",
+                        },
+                        "id": {
+                            "type": "integer",
+                            "description": "Item id (for update)",
+                        },
+                        "status": {
+                            "type": "string",
+                            "description": "New status (for update): pending, in_progress, or done",
+                        },
+                    },
+                    "required": ["action"],
+                },
+            },
+        },
+        tool_todo,
+    ),
+    "memory": (
+        {
+            "type": "function",
+            "function": {
+                "name": "memory",
+                "description": (
+                    "Persistent notes that survive across sessions and are loaded into your context at "
+                    "startup. Actions: 'add' (text, scope) to store a note, 'list' (scope) to show notes, "
+                    "'remove' (text, scope) to delete notes containing the text. Scope: 'project' (this "
+                    "working directory, default) or 'global' (all projects); omit scope for list to see "
+                    "both. Use it for durable facts about the user, their preferences, or the project."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "description": "One of: add, list, remove (default: list)",
+                        },
+                        "text": {
+                            "type": "string",
+                            "description": "Note text (for add), or substring to match (for remove)",
+                        },
+                        "scope": {
+                            "type": "string",
+                            "description": "'project' (default) or 'global'; omit for list to see both",
+                        },
+                    },
+                    "required": ["action"],
+                },
+            },
+        },
+        tool_memory,
+    ),
+    "gotcha": (
+        {
+            "type": "function",
+            "function": {
+                "name": "gotcha",
+                "description": (
+                    "Record or list gotchas: one-line notes about pitfalls discovered while working "
+                    "(e.g. 'tests must run from repo root'). Loaded into your context at startup. "
+                    "Actions: 'add' (text) to record a gotcha, 'list' to show all."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "description": "One of: add, list (default: list)",
+                        },
+                        "text": {
+                            "type": "string",
+                            "description": "One-line gotcha (for add)",
+                        },
+                    },
+                    "required": ["action"],
+                },
+            },
+        },
+        tool_gotcha,
     ),
     "task": (
         {
@@ -1218,6 +1541,9 @@ def get_system_prompt(cwd, additional) -> str:
         "Before taking any action that modifies the file system (writing, patching, moving, copying, or deleting files), "
         "plan the change when required and present the plan to the user for approval before acting; "
         "only proceed once the user has agreed. Read-only exploration does not require a plan. "
+        "For multi-step work, track progress with the todo tool: add the steps up front, mark each in_progress then done as you go. "
+        "When you hit an error and determine the root cause, record a one-line note with the gotcha tool so you don't repeat it. "
+        "Use the memory tool to store durable facts (user preferences, project conventions) that should survive across sessions. "
         "Format responses in Markdown (headings, lists, tables, fenced code blocks); the terminal renders it. "
         "{additional}"
     ).format(cwd=cwd, additional=additional)
@@ -2362,6 +2688,7 @@ def run_agent(
                     "content": result,
                 }
             )
+        _todo_reminder(messages)
 
 
 def main():
@@ -2530,6 +2857,10 @@ def main():
             "\n\nProject instructions (AGENTS.md in the working directory):\n"
             + agents_md
         )
+    additions = _context_additions()
+    if additions:
+        system_prompt += "\n\n" + additions
+    _todo_load()
     messages = [{"role": "system", "content": system_prompt}]
 
     if args.prompt is not None:

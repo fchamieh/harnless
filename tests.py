@@ -940,8 +940,8 @@ class TestStatus(unittest.TestCase):
         self.assertNotIn("% of", out)
 
     def test_tiny_percentage_shows_lt_1(self):
-        out = h.format_status([{"role": "system", "content": "x" * 400}], context_window=222208)
-        self.assertIn("<1% of 222208 window", out)
+        out = h.format_status([{"role": "system", "content": "x" * 400}], context_window=2222080)
+        self.assertIn("<1% of 2222080 window", out)
 
 
 class TestProbeContextWindow(unittest.TestCase):
@@ -1798,6 +1798,270 @@ class TestToolsMenu(unittest.TestCase):
         applied, out = self.menu(["enter"])
         self.assertTrue(applied)
         self.assertIn("[ ] read_file", out)
+
+
+class TestTodo(Base):
+    def setUp(self):
+        super().setUp()
+        self._old_items = h.TODO_ITEMS
+        self._old_next = h.TODO_NEXT_ID
+        self._old_injected = h.TODO_LAST_INJECTED
+        self._old_file = h.TODO_FILE
+        h.TODO_ITEMS = []
+        h.TODO_NEXT_ID = 1
+        h.TODO_LAST_INJECTED = None
+        h.TODO_FILE = os.path.join(self.tmp, ".harnless", "todo.md")
+        self.addCleanup(setattr, h, "TODO_ITEMS", self._old_items)
+        self.addCleanup(setattr, h, "TODO_NEXT_ID", self._old_next)
+        self.addCleanup(setattr, h, "TODO_LAST_INJECTED", self._old_injected)
+        self.addCleanup(setattr, h, "TODO_FILE", self._old_file)
+
+    def todo(self, **kw):
+        return h.tool_todo(kw)
+
+    def test_add_and_list(self):
+        self.assertEqual(self.todo(action="add", text="step one"), "todo list:\n- [ ] 1. step one")
+        self.assertEqual(self.todo(action="list"), "todo list:\n- [ ] 1. step one")
+
+    def test_add_requires_text(self):
+        self.assertEqual(self.todo(action="add"), "error: 'add' requires text")
+
+    def test_update_status(self):
+        self.todo(action="add", text="a")
+        self.todo(action="add", text="b")
+        self.assertEqual(self.todo(action="update", id=2, status="in_progress"),
+                         "todo list:\n- [ ] 1. a\n- [~] 2. b")
+        self.assertEqual(self.todo(action="update", id=2, status="done"),
+                         "todo list:\n- [ ] 1. a\n- [x] 2. b")
+
+    def test_update_text(self):
+        self.todo(action="add", text="a")
+        self.assertEqual(self.todo(action="update", id=1, text="renamed"), "todo list:\n- [ ] 1. renamed")
+
+    def test_update_bad_id(self):
+        self.assertEqual(self.todo(action="update", id=9, status="done"), "error: no todo with id 9")
+
+    def test_update_bad_status(self):
+        self.todo(action="add", text="a")
+        self.assertEqual(self.todo(action="update", id=1, status="nope"),
+                         "error: status must be pending, in_progress, or done")
+
+    def test_update_requires_id(self):
+        self.todo(action="add", text="a")
+        self.assertEqual(self.todo(action="update", status="done"), "error: 'update' requires id")
+
+    def test_clear(self):
+        self.todo(action="add", text="a")
+        self.assertEqual(self.todo(action="clear"), "todo list:\n(empty)")
+        self.assertEqual(h.TODO_ITEMS, [])
+
+    def test_unknown_action(self):
+        self.assertEqual(self.todo(action="fly"), "error: unknown action 'fly' (use add, update, list, or clear)")
+
+    def test_default_action_is_list(self):
+        self.todo(action="add", text="a")
+        self.assertEqual(self.todo(), "todo list:\n- [ ] 1. a")
+
+    def test_persisted_to_file(self):
+        self.todo(action="add", text="a")
+        self.todo(action="update", id=1, status="done")
+        with open(h.TODO_FILE, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "- [x] 1. a\n")
+
+    def test_load_from_file(self):
+        os.makedirs(os.path.dirname(h.TODO_FILE), exist_ok=True)
+        with open(h.TODO_FILE, "w", encoding="utf-8") as f:
+            f.write("- [ ] 1. a\n- [~] 2. b\n- [x] 3. c\n")
+        h._todo_load()
+        self.assertEqual(h.TODO_ITEMS, [
+            {"id": 1, "text": "a", "status": "pending"},
+            {"id": 2, "text": "b", "status": "in_progress"},
+            {"id": 3, "text": "c", "status": "done"},
+        ])
+        self.assertEqual(h.TODO_NEXT_ID, 4)
+
+    def test_load_missing_file(self):
+        h._todo_load()
+        self.assertEqual(h.TODO_ITEMS, [])
+
+    def test_reminder_injected_on_change(self):
+        messages = []
+        h._todo_reminder(messages)
+        self.assertEqual(messages, [])  # empty list: nothing injected
+        self.todo(action="add", text="a")
+        h._todo_reminder(messages)
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertIn("1. a", messages[0]["content"])
+        h._todo_reminder(messages)  # unchanged list: no duplicate reminder
+        self.assertEqual(len(messages), 1)
+        self.todo(action="update", id=1, status="done")
+        h._todo_reminder(messages)
+        self.assertEqual(len(messages), 2)
+        self.assertIn("[x]", messages[1]["content"])
+
+    def test_reminder_reset_after_clear(self):
+        self.todo(action="add", text="a")
+        messages = []
+        h._todo_reminder(messages)
+        self.todo(action="clear")
+        h._todo_reminder(messages)
+        self.assertEqual(len(messages), 1)  # clearing does not inject
+        self.todo(action="add", text="b")
+        h._todo_reminder(messages)
+        self.assertEqual(len(messages), 2)  # re-added list injects again
+
+    def test_run_agent_injects_reminder(self):
+        def fake_stream_once(messages, model, interactive=False, temperature=0.2):
+            if len(messages) == 1:
+                return ({"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "c1", "type": "function",
+                     "function": {"name": "todo", "arguments": '{"action": "add", "text": "step"}'}}]}, True)
+            return ({"role": "assistant", "content": "done"}, True)
+
+        old = h.stream_once
+        h.stream_once = fake_stream_once
+        self.addCleanup(setattr, h, "stream_once", old)
+        messages = [{"role": "user", "content": "go"}]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = h.run_agent(messages, "m")
+        self.assertEqual(code, 0)
+        reminders = [m for m in messages if m.get("role") == "system" and "todo list" in (m.get("content") or "")]
+        self.assertEqual(len(reminders), 1)
+        self.assertIn("1. step", reminders[0]["content"])
+
+
+class TestMemory(Base):
+    def setUp(self):
+        super().setUp()
+        self._old_proj = h.MEMORY_PROJECT_FILE
+        self._old_glob = h.MEMORY_GLOBAL_FILE
+        h.MEMORY_PROJECT_FILE = os.path.join(self.tmp, ".harnless", "memory.md")
+        h.MEMORY_GLOBAL_FILE = os.path.join(self.tmp, "global_memory.md")
+        self.addCleanup(setattr, h, "MEMORY_PROJECT_FILE", self._old_proj)
+        self.addCleanup(setattr, h, "MEMORY_GLOBAL_FILE", self._old_glob)
+
+    def mem(self, **kw):
+        return h.tool_memory(kw)
+
+    def test_add_and_list(self):
+        self.assertEqual(self.mem(action="add", text="user prefers tabs"), "added to project memory (1 notes)")
+        out = self.mem(action="list")
+        self.assertIn("project memory:", out)
+        self.assertIn("- user prefers tabs", out)
+        self.assertIn("global memory:", out)
+        self.assertIn("(empty)", out)
+
+    def test_add_requires_text(self):
+        self.assertEqual(self.mem(action="add"), "error: 'add' requires text")
+
+    def test_add_duplicate(self):
+        self.mem(action="add", text="note")
+        self.assertEqual(self.mem(action="add", text="note"), "already in project memory")
+
+    def test_add_global_scope(self):
+        self.mem(action="add", text="global note", scope="global")
+        self.assertTrue(os.path.exists(h.MEMORY_GLOBAL_FILE))
+        self.assertFalse(os.path.exists(h.MEMORY_PROJECT_FILE))
+
+    def test_bad_scope(self):
+        self.assertEqual(self.mem(action="add", text="x", scope="nope"),
+                         "error: scope must be 'project' or 'global'")
+
+    def test_remove(self):
+        self.mem(action="add", text="alpha one")
+        self.mem(action="add", text="beta two")
+        self.assertEqual(self.mem(action="remove", text="alpha"), "removed 1 note(s) from project memory")
+        out = self.mem(action="list", scope="project")
+        self.assertIn("- beta two", out)
+        self.assertNotIn("alpha", out)
+
+    def test_remove_no_match(self):
+        self.mem(action="add", text="alpha")
+        self.assertEqual(self.mem(action="remove", text="zzz"), "no project memory note contains 'zzz'")
+
+    def test_remove_requires_text(self):
+        self.assertEqual(self.mem(action="remove"), "error: 'remove' requires text")
+
+    def test_list_single_scope(self):
+        self.mem(action="add", text="x")
+        self.assertEqual(self.mem(action="list", scope="global"), "global memory:\n(empty)")
+
+    def test_unknown_action(self):
+        self.assertEqual(self.mem(action="fly"), "error: unknown action 'fly' (use add, list, or remove)")
+
+    def test_load_memory(self):
+        self.mem(action="add", text="p1")
+        self.mem(action="add", text="g1", scope="global")
+        self.assertEqual(h.load_memory(), "project:\n- p1\n\nglobal:\n- g1")
+
+    def test_load_memory_empty(self):
+        self.assertEqual(h.load_memory(), "")
+
+
+class TestGotcha(Base):
+    def setUp(self):
+        super().setUp()
+        self._old_file = h.GOTCHAS_FILE
+        h.GOTCHAS_FILE = os.path.join(self.tmp, "GOTCHAS.md")
+        self.addCleanup(setattr, h, "GOTCHAS_FILE", self._old_file)
+
+    def gotcha(self, **kw):
+        return h.tool_gotcha(kw)
+
+    def test_add_and_list(self):
+        self.assertEqual(self.gotcha(action="add", text="tests must run from repo root"),
+                         "recorded in GOTCHAS.md (1 total)")
+        self.assertEqual(self.gotcha(action="list"), "gotchas:\n- tests must run from repo root")
+
+    def test_add_requires_text(self):
+        self.assertEqual(self.gotcha(action="add"), "error: 'add' requires text")
+
+    def test_add_duplicate(self):
+        self.gotcha(action="add", text="note one")
+        self.assertEqual(self.gotcha(action="add", text="note one"), "already recorded in GOTCHAS.md")
+        # a more specific note is not a duplicate
+        self.assertEqual(self.gotcha(action="add", text="note one variant"), "recorded in GOTCHAS.md (2 total)")
+
+    def test_list_empty(self):
+        self.assertEqual(self.gotcha(action="list"), "gotchas:\n(none recorded)")
+
+    def test_unknown_action(self):
+        self.assertEqual(self.gotcha(action="fly"), "error: unknown action 'fly' (use add or list)")
+
+    def test_load_gotchas(self):
+        self.gotcha(action="add", text="a")
+        self.gotcha(action="add", text="b")
+        self.assertEqual(h.load_gotchas(), "- a\n- b")
+
+    def test_load_gotchas_absent(self):
+        self.assertEqual(h.load_gotchas(), "")
+
+
+class TestStateToolsRegistered(unittest.TestCase):
+    def test_new_tools_in_both_lists(self):
+        all_names = [s["function"]["name"] for s in h.OPENAI_TOOLS]
+        interactive_names = [s["function"]["name"] for s in h.OPENAI_TOOLS_INTERACTIVE]
+        for name in ("todo", "memory", "gotcha"):
+            self.assertIn(name, all_names)
+            self.assertIn(name, interactive_names)
+            self.assertIn(name, h.DISPATCH)
+
+    def test_system_prompt_mentions_state_tools(self):
+        prompt = h.get_system_prompt("/x", "")
+        for name in ("todo", "memory", "gotcha"):
+            self.assertIn(name, prompt)
+
+    def test_context_additions(self):
+        old_proj, old_glob, old_got = h.MEMORY_PROJECT_FILE, h.MEMORY_GLOBAL_FILE, h.GOTCHAS_FILE
+        h.MEMORY_PROJECT_FILE = "/nonexistent/proj.md"
+        h.MEMORY_GLOBAL_FILE = "/nonexistent/glob.md"
+        h.GOTCHAS_FILE = "/nonexistent/gotchas.md"
+        self.addCleanup(setattr, h, "MEMORY_PROJECT_FILE", old_proj)
+        self.addCleanup(setattr, h, "MEMORY_GLOBAL_FILE", old_glob)
+        self.addCleanup(setattr, h, "GOTCHAS_FILE", old_got)
+        self.assertEqual(h._context_additions(), "")
 
 
 if __name__ == "__main__":
