@@ -1,0 +1,1 @@
+- Nuitka 4.x requires `--option=value` syntax for options taking arguments (e.g. `--output-dir=dist`); space-separated form errors out.
