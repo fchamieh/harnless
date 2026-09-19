@@ -3105,6 +3105,7 @@ def main():
         except MCPError as e:
             print(colorize(f"{icon('error')} {e}", "error"))
             continue
+        mcp_servers[name] = cfg
 
     if mcp_servers:
         mcp_clients = [MCPClient(name, cfg) for name, cfg in mcp_servers.items()]

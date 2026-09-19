@@ -1803,6 +1803,63 @@ class TestMcpHttpIntegration(Base):
             server.shutdown()
             server.server_close()
 
+    def test_cli_mcp_http_flag_registers_tools(self):
+        """Regression: --mcp-http specs must be added to mcp_servers in main()."""
+        import subprocess
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                msg = json.loads(self.rfile.read(length))
+                method = msg.get("method")
+                rid = msg.get("id")
+                if method == "initialize":
+                    result = {"protocolVersion": "2025-06-18", "capabilities": {}, "serverInfo": {"name": "fake", "version": "0"}}
+                elif method == "tools/list":
+                    result = {"tools": [{"name": "add", "description": "adds", "inputSchema": {"type": "object", "properties": {}}}]}
+                elif rid is None:
+                    self.send_response(202)
+                    self.end_headers()
+                    return
+                else:
+                    result = {}
+                payload = json.dumps({"jsonrpc": "2.0", "id": rid, "result": result}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *a):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        port = server.server_address[1]
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        try:
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "harnless.py",
+                    "--no-color",
+                    "--context-window", "1000",
+                    "--mcp-http", f"fake=http://127.0.0.1:{port}/mcp",
+                ],
+                input="/tools\n",
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=60,
+            )
+            self.assertEqual(proc.returncode, 0)
+            self.assertIn("[X] add", proc.stdout)
+        finally:
+            server.shutdown()
+            server.server_close()
+
 
 class TestToolsToggle(unittest.TestCase):
     def setUp(self):
