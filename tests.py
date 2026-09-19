@@ -376,6 +376,96 @@ class TestRunShell(Base):
         self.assertEqual(out, "error: command timed out after 1s")
 
 
+class TestFetchUrl(unittest.TestCase):
+    class _Resp:
+        def __init__(self, body, charset="utf-8"):
+            self._data = body if isinstance(body, bytes) else body.encode("utf-8")
+            self._charset = charset
+
+            class _Headers:
+                def get_content_charset(_self):
+                    return charset
+
+            self.headers = _Headers()
+
+        def read(self, n=-1):
+            return self._data if n is None or n < 0 else self._data[:n]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _fetch(self, body, charset="utf-8", **args):
+        a = {"url": "https://example.com/page"}
+        a.update(args)
+        with mock.patch("urllib.request.urlopen", return_value=self._Resp(body, charset)):
+            return h.tool_fetch_url(a)
+
+    def test_basic_fetch(self):
+        self.assertEqual(self._fetch("hello world"), "hello world")
+
+    def test_raw_html_kept_by_default(self):
+        self.assertEqual(self._fetch("<p>hi</p>"), "<p>hi</p>")
+
+    def test_strip_html(self):
+        out = self._fetch("<h1>Title</h1><p>Some <b>bold</b> text</p>", strip_html=True)
+        self.assertEqual(out, "Title\n\nSome bold text")
+
+    def test_strip_html_skips_script_and_style(self):
+        out = self._fetch(
+            "<style>x{}</style><script>evil()</script><p>ok</p>", strip_html=True
+        )
+        self.assertEqual(out, "ok")
+
+    def test_entities_decoded_when_stripping(self):
+        self.assertEqual(self._fetch("<p>a &amp; b</p>", strip_html=True), "a & b")
+
+    def test_invalid_scheme(self):
+        self.assertEqual(
+            h.tool_fetch_url({"url": "ftp://x"}), "error: url must be an http:// or https:// URL"
+        )
+        self.assertEqual(
+            h.tool_fetch_url({"url": "example.com"}), "error: url must be an http:// or https:// URL"
+        )
+
+    def test_http_error(self):
+        err = urllib.error.HTTPError("https://x", 404, "Not Found", {}, None)
+        with mock.patch("urllib.request.urlopen", side_effect=err):
+            out = h.tool_fetch_url({"url": "https://x"})
+        self.assertEqual(out, "error: HTTP 404 Not Found for https://x")
+
+    def test_url_error(self):
+        with mock.patch(
+            "urllib.request.urlopen", side_effect=urllib.error.URLError("down")
+        ):
+            out = h.tool_fetch_url({"url": "https://x"})
+        self.assertTrue(out.startswith("error: could not fetch https://x:"))
+
+    def test_bad_timeout(self):
+        self.assertEqual(h.tool_fetch_url({"url": "https://x", "timeout": 0}), "error: timeout must be > 0")
+        self.assertTrue(h.tool_fetch_url({"url": "https://x", "timeout": "abc"}).startswith("error:"))
+
+    def test_unknown_charset_falls_back_to_utf8(self):
+        self.assertEqual(self._fetch("hi", charset="no-such-codec"), "hi")
+
+    def test_truncation(self):
+        out = self._fetch("x" * 60_000)
+        self.assertTrue(out.endswith("\n... [truncated]"))
+        self.assertEqual(len(out), 50_000 + len("\n... [truncated]"))
+
+    def test_empty(self):
+        self.assertEqual(self._fetch(""), "(empty)")
+
+    def test_registered(self):
+        all_names = [s["function"]["name"] for s in h.OPENAI_TOOLS]
+        interactive_names = [s["function"]["name"] for s in h.OPENAI_TOOLS_INTERACTIVE]
+        self.assertIn("fetch_url", all_names)
+        self.assertIn("fetch_url", interactive_names)
+        self.assertIn("fetch_url", h.DISPATCH)
+
+
 class TestColorize(unittest.TestCase):
     def test_disabled_returns_plain(self):
         h.set_color_enabled(False)
@@ -403,21 +493,51 @@ class TestColorize(unittest.TestCase):
 
 class TestIcon(unittest.TestCase):
     def test_emoji_default(self):
+        old = h.EMOJI_ENABLED
         h.set_emoji_enabled(True)
-        self.addCleanup(h.set_emoji_enabled, True)
+        self.addCleanup(h.set_emoji_enabled, old)
         self.assertEqual(h.icon("thinking"), h.ICONS["thinking"])
         self.assertEqual(h.icon("tool"), h.ICONS["tool"])
 
     def test_ascii_fallback(self):
+        old = h.EMOJI_ENABLED
         h.set_emoji_enabled(False)
-        self.addCleanup(h.set_emoji_enabled, True)
+        self.addCleanup(h.set_emoji_enabled, old)
         self.assertEqual(h.icon("thinking"), h.ASCII_ICONS["thinking"])
         self.assertEqual(h.icon("assistant"), h.ASCII_ICONS["assistant"])
 
     def test_unknown_key(self):
+        old = h.EMOJI_ENABLED
         h.set_emoji_enabled(True)
-        self.addCleanup(h.set_emoji_enabled, True)
+        self.addCleanup(h.set_emoji_enabled, old)
         self.assertEqual(h.icon("nope"), "")
+
+
+class TestEmojiAutoDisable(unittest.TestCase):
+    class _FakeStdout:
+        def __init__(self, enc):
+            self.encoding = enc
+
+    def _check(self, enc, expected):
+        old = sys.stdout
+        sys.stdout = self._FakeStdout(enc)
+        self.addCleanup(setattr, sys, "stdout", old)
+        self.assertEqual(h._stdout_can_encode_emoji(), expected)
+
+    def test_utf8_allows_emoji(self):
+        self._check("utf-8", True)
+
+    def test_cp1256_disables_emoji(self):
+        self._check("cp1256", False)
+
+    def test_ascii_disables_emoji(self):
+        self._check("ascii", False)
+
+    def test_missing_encoding_disables_emoji(self):
+        self._check(None, False)
+
+    def test_unknown_encoding_disables_emoji(self):
+        self._check("not-a-real-codec", False)
 
 
 class TestMarkdownRenderer(unittest.TestCase):
@@ -1035,7 +1155,7 @@ class TestProbeContextWindow(unittest.TestCase):
 
     def test_tool_names(self):
         out = h.format_status([{"role": "system", "content": "x"}])
-        names = [s["function"]["name"] for s in h.OPENAI_TOOLS_INTERACTIVE]
+        names = sorted(s["function"]["name"] for s in h.OPENAI_TOOLS_INTERACTIVE)
         self.assertIn("tools: " + ", ".join(names), out)
         self.assertNotIn("exit", out.split("tools: ")[1])
 
@@ -1298,6 +1418,36 @@ class TestLineEditor(Base):
             self.assertEqual(h.readline_prompt("you> "), "piped line")
         finally:
             sys.stdin = old
+
+
+class TestWindowsKeyMap(unittest.TestCase):
+    def first(self, chars):
+        class FakeMsvcrt:
+            def __init__(self, seq):
+                self._it = iter(seq)
+
+            def getwch(self):
+                return next(self._it)
+
+        with mock.patch.dict(sys.modules, {"msvcrt": FakeMsvcrt(list(chars))}):
+            return next(h._iter_keys_windows())
+
+    def test_extended_keys(self):
+        for code, token in (
+            ("H", "up"),
+            ("P", "down"),
+            ("K", "left"),
+            ("M", "right"),
+            ("G", "home"),
+            ("O", "end"),
+            ("S", "delete"),
+        ):
+            self.assertEqual(self.first(["\xe0", code]), token, code)
+
+    def test_plain_keys(self):
+        self.assertEqual(self.first(["\r"]), "enter")
+        self.assertEqual(self.first(["a"]), ("char", "a"))
+        self.assertEqual(self.first(["\x1b"]), "esc")
 
 
 class TestCsiSequences(unittest.TestCase):
@@ -1721,38 +1871,46 @@ class TestToolsMenu(unittest.TestCase):
             applied = h.tools_menu(iter(keys))
         return applied, buf.getvalue()
 
+    def sorted_names(self):
+        specs = sorted(
+            h.OPENAI_TOOLS_INTERACTIVE + h.MCP_TOOLS,
+            key=lambda s: s["function"]["name"],
+        )
+        return [s["function"]["name"] for s in specs]
+
     def test_enter_applies_no_changes(self):
         applied, _ = self.menu(["enter"])
         self.assertTrue(applied)
         self.assertEqual(h.DISABLED_TOOLS, set())
 
     def test_space_toggles_and_enter_applies(self):
-        first = h.OPENAI_TOOLS_INTERACTIVE[0]["function"]["name"]
+        first = self.sorted_names()[0]
         applied, _ = self.menu([("char", " "), "enter"])
         self.assertTrue(applied)
         self.assertEqual(h.DISABLED_TOOLS, {first})
 
     def test_down_moves_cursor(self):
-        second = h.OPENAI_TOOLS_INTERACTIVE[1]["function"]["name"]
+        second = self.sorted_names()[1]
         applied, _ = self.menu(["down", ("char", " "), "enter"])
         self.assertTrue(applied)
         self.assertEqual(h.DISABLED_TOOLS, {second})
 
     def test_up_at_top_stays(self):
-        first = h.OPENAI_TOOLS_INTERACTIVE[0]["function"]["name"]
+        first = self.sorted_names()[0]
         applied, _ = self.menu(["up", "up", ("char", " "), "enter"])
         self.assertTrue(applied)
         self.assertEqual(h.DISABLED_TOOLS, {first})
 
     def test_down_clamps_at_end(self):
-        n = len(h.OPENAI_TOOLS_INTERACTIVE)
-        last = h.OPENAI_TOOLS_INTERACTIVE[-1]["function"]["name"]
+        names = self.sorted_names()
+        n = len(names)
+        last = names[-1]
         applied, _ = self.menu(["down"] * (n + 5) + [("char", " "), "enter"])
         self.assertTrue(applied)
         self.assertEqual(h.DISABLED_TOOLS, {last})
 
     def test_toggle_twice_restores(self):
-        first = h.OPENAI_TOOLS_INTERACTIVE[0]["function"]["name"]
+        first = self.sorted_names()[0]
         applied, _ = self.menu([("char", " "), ("char", " "), "enter"])
         self.assertTrue(applied)
         self.assertEqual(h.DISABLED_TOOLS, set())
@@ -1779,7 +1937,7 @@ class TestToolsMenu(unittest.TestCase):
 
     def test_menu_preserves_preexisting_disabled(self):
         h.DISABLED_TOOLS.add("read_file")
-        first = h.OPENAI_TOOLS_INTERACTIVE[0]["function"]["name"]
+        first = self.sorted_names()[0]
         applied, _ = self.menu([("char", " "), "enter"])
         self.assertTrue(applied)
         self.assertEqual(h.DISABLED_TOOLS, {"read_file", first})
@@ -1787,8 +1945,8 @@ class TestToolsMenu(unittest.TestCase):
     def test_rendering(self):
         applied, out = self.menu(["enter"])
         self.assertTrue(applied)
-        first = h.OPENAI_TOOLS_INTERACTIVE[0]["function"]["name"]
-        second = h.OPENAI_TOOLS_INTERACTIVE[1]["function"]["name"]
+        names = self.sorted_names()
+        first, second = names[0], names[1]
         self.assertIn("> [x] " + first, out)
         self.assertIn("[x] " + second, out)
         self.assertIn("space: toggle", out)
@@ -2062,6 +2220,118 @@ class TestStateToolsRegistered(unittest.TestCase):
         self.addCleanup(setattr, h, "MEMORY_GLOBAL_FILE", old_glob)
         self.addCleanup(setattr, h, "GOTCHAS_FILE", old_got)
         self.assertEqual(h._context_additions(), "")
+
+
+class TestAskUser(Base):
+    def _respond(self, *answers):
+        it = iter(answers)
+        old = h.readline_prompt
+
+        def fake(prompt):
+            try:
+                return next(it)
+            except StopIteration:
+                raise EOFError
+
+        h.readline_prompt = fake
+        self.addCleanup(setattr, h, "readline_prompt", old)
+
+    def _raise(self, exc):
+        old = h.readline_prompt
+
+        def fake(prompt):
+            raise exc
+
+        h.readline_prompt = fake
+        self.addCleanup(setattr, h, "readline_prompt", old)
+
+    def _call(self, fn, args):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return fn(args)
+
+    def test_registered_in_both_lists(self):
+        all_names = [s["function"]["name"] for s in h.OPENAI_TOOLS]
+        interactive_names = [s["function"]["name"] for s in h.OPENAI_TOOLS_INTERACTIVE]
+        for name in ("ask_user", "confirm"):
+            self.assertIn(name, all_names)
+            self.assertIn(name, interactive_names)
+            self.assertIn(name, h.DISPATCH)
+
+    def test_system_prompt_mentions_interaction_tools(self):
+        prompt = h.get_system_prompt("/x", "")
+        self.assertIn("ask_user", prompt)
+        self.assertIn("confirm", prompt)
+
+    def test_empty_question(self):
+        self.assertEqual(h.tool_ask_user({}), "error: empty question")
+        self.assertEqual(h.tool_ask_user({"question": "  "}), "error: empty question")
+
+    def test_options_must_be_list(self):
+        out = self._call(h.tool_ask_user, {"question": "q", "options": "a"})
+        self.assertEqual(out, "error: options must be a list of strings")
+
+    def test_freeform_answer(self):
+        self._respond("blue")
+        out = self._call(h.tool_ask_user, {"question": "favorite color?"})
+        self.assertEqual(out, "user answered: blue")
+
+    def test_select_option_by_number(self):
+        self._respond("2")
+        out = self._call(
+            h.tool_ask_user, {"question": "pick", "options": ["a", "b", "c"]}
+        )
+        self.assertEqual(out, "user selected: b")
+
+    def test_options_allow_custom_answer(self):
+        self._respond("something else")
+        out = self._call(h.tool_ask_user, {"question": "pick", "options": ["a", "b"]})
+        self.assertEqual(out, "user answered: something else")
+
+    def test_out_of_range_option_is_answer(self):
+        self._respond("9")
+        out = self._call(h.tool_ask_user, {"question": "pick", "options": ["a", "b"]})
+        self.assertEqual(out, "user answered: 9")
+
+    def test_empty_answer(self):
+        self._respond("")
+        self.assertEqual(h.tool_ask_user({"question": "q"}), "user answered: (empty)")
+
+    def test_cancel(self):
+        self._raise(EOFError)
+        self.assertEqual(
+            h.tool_ask_user({"question": "q"}), "user cancelled (no answer)"
+        )
+
+    def test_confirm_yes(self):
+        self._respond("y")
+        self.assertEqual(h.tool_confirm({"question": "ok?"}), "user confirmed: yes")
+
+    def test_confirm_no(self):
+        self._respond("no")
+        self.assertEqual(h.tool_confirm({"question": "ok?"}), "user confirmed: no")
+
+    def test_confirm_default_on_empty(self):
+        self._respond("")
+        self.assertEqual(
+            h.tool_confirm({"question": "ok?", "default": True}),
+            "user confirmed: yes",
+        )
+
+    def test_confirm_empty_without_default(self):
+        self._respond("")
+        self.assertEqual(
+            h.tool_confirm({"question": "ok?"}), "user did not confirm"
+        )
+
+    def test_confirm_reprompts_on_invalid(self):
+        self._respond("maybe", "yes")
+        self.assertEqual(h.tool_confirm({"question": "ok?"}), "user confirmed: yes")
+
+    def test_confirm_cancel(self):
+        self._raise(KeyboardInterrupt)
+        self.assertEqual(
+            h.tool_confirm({"question": "ok?"}), "user cancelled (no confirmation)"
+        )
 
 
 if __name__ == "__main__":

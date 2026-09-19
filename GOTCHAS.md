@@ -1,1 +1,2 @@
 - Nuitka 4.x requires `--option=value` syntax for options taking arguments (e.g. `--output-dir=dist`); space-separated form errors out.
+- Emoji icons auto-disable when stdout's encoding can't encode them (`EMOJI_ENABLED` set at import and in `main()`); in tests, cleanups must restore the original `EMOJI_ENABLED`, not hardcode True, or later tests printing icons crash on non-UTF-8 consoles

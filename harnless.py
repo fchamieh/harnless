@@ -3,6 +3,7 @@
 
 import argparse
 import atexit
+import html.parser
 import json
 import os
 import queue
@@ -69,7 +70,22 @@ ASCII_ICONS = {
     "exit": "exit",
     "error": "err",
 }
-EMOJI_ENABLED = True
+
+
+def _stdout_can_encode_emoji() -> bool:
+    """True if sys.stdout's encoding can encode every emoji icon."""
+    enc = getattr(sys.stdout, "encoding", None)
+    if not enc:
+        return False
+    try:
+        for ch in ICONS.values():
+            ch.encode(enc)
+    except (LookupError, UnicodeEncodeError):
+        return False
+    return True
+
+
+EMOJI_ENABLED = _stdout_can_encode_emoji()
 
 
 def set_color_enabled(enabled: bool):
@@ -146,6 +162,78 @@ def tool_exit(args: dict):
     code = int(args.get("code", 0))
     message = args.get("message", "")
     raise ExitSignal(code, message)
+
+
+def _prompt_line(prompt: str):
+    """Read a line from the user, returning None on EOF/cancel."""
+    try:
+        line = readline_prompt(prompt)
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    return line.strip()
+
+
+def _print_question(text: str):
+    print(OUTPUT_INDENT + colorize(f"{icon('thinking')} {text}", "assistant"), flush=True)
+
+
+def tool_ask_user(args: dict) -> str:
+    question = (args.get("question") or "").strip()
+    if not question:
+        return "error: empty question"
+    raw_options = args.get("options")
+    if raw_options is not None and not isinstance(raw_options, list):
+        return "error: options must be a list of strings"
+    options = [str(o) for o in (raw_options or [])]
+    print()
+    _print_question(question)
+    for i, opt in enumerate(options, 1):
+        print(OUTPUT_INDENT + colorize(f"  {i}) {opt}", "dim"))
+    prompt = OUTPUT_INDENT + colorize(f"{icon('user')} answer> ", "user")
+    answer = _prompt_line(prompt)
+    if answer is None:
+        return "user cancelled (no answer)"
+    if not answer:
+        return "user answered: (empty)"
+    if options:
+        try:
+            idx = int(answer)
+        except ValueError:
+            idx = 0
+        if 1 <= idx <= len(options):
+            return f"user selected: {options[idx - 1]}"
+    return f"user answered: {answer}"
+
+
+def tool_confirm(args: dict) -> str:
+    question = (args.get("question") or "Proceed?").strip()
+    default = args.get("default")
+    if default is not None:
+        default = bool(default)
+    print()
+    _print_question(question)
+    if default is True:
+        suffix = " [Y/n]"
+    elif default is False:
+        suffix = " [y/N]"
+    else:
+        suffix = " [y/n]"
+    while True:
+        prompt = OUTPUT_INDENT + colorize(f"{icon('user')} confirm{suffix}> ", "user")
+        answer = _prompt_line(prompt)
+        if answer is None:
+            return "user cancelled (no confirmation)"
+        low = answer.lower()
+        if not low:
+            if default is None:
+                return "user did not confirm"
+            return "user confirmed: yes" if default else "user confirmed: no"
+        if low in ("y", "yes", "true", "1"):
+            return "user confirmed: yes"
+        if low in ("n", "no", "false", "0"):
+            return "user confirmed: no"
+        print(OUTPUT_INDENT + colorize("  please answer yes or no", "error"))
 
 
 def tool_run_shell(args: dict) -> str:
@@ -413,6 +501,107 @@ def tool_copy_file(args: dict) -> str:
     os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
     shutil.copy2(src, dst)
     return f"copied {src} -> {dst}"
+
+
+_HTML_BLOCK_TAGS = {
+    "address", "article", "aside", "blockquote", "br", "dd", "div", "dl", "dt",
+    "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4",
+    "h5", "h6", "header", "hr", "li", "main", "nav", "ol", "p", "pre", "section",
+    "table", "tbody", "td", "tfoot", "th", "thead", "tr", "ul",
+}
+_HTML_SKIP_TAGS = {"script", "style", "head", "noscript", "template", "svg"}
+
+
+class _HTMLTextExtractor(html.parser.HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self._skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in _HTML_SKIP_TAGS:
+            self._skip += 1
+        elif tag in _HTML_BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_startendtag(self, tag, attrs):
+        if tag in _HTML_BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in _HTML_SKIP_TAGS:
+            self._skip = max(0, self._skip - 1)
+        elif tag in _HTML_BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if not self._skip:
+            self.parts.append(data)
+
+
+def _html_to_text(markup: str) -> str:
+    parser = _HTMLTextExtractor()
+    try:
+        parser.feed(markup)
+        parser.close()
+    except Exception:
+        pass
+    lines = [
+        re.sub(r"[ \t\r\f\v]+", " ", line).strip()
+        for line in "".join(parser.parts).split("\n")
+    ]
+    out = []
+    for line in lines:
+        if line:
+            out.append(line)
+        elif out and out[-1] != "":
+            out.append("")
+    return "\n".join(out).strip()
+
+
+def tool_fetch_url(args: dict) -> str:
+    url = (args.get("url") or "").strip()
+    if not re.match(r"^https?://", url, re.IGNORECASE):
+        return "error: url must be an http:// or https:// URL"
+    try:
+        timeout = float(args.get("timeout", 30))
+    except (TypeError, ValueError):
+        return "error: timeout must be a number"
+    if timeout <= 0:
+        return "error: timeout must be > 0"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "harnless/1.0",
+            "Accept": "text/html,application/xhtml+xml,application/json,text/plain,*/*",
+        },
+    )
+    max_bytes = 2_000_000
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read(max_bytes + 1)
+            charset = resp.headers.get_content_charset() or "utf-8"
+    except urllib.error.HTTPError as e:
+        return f"error: HTTP {e.code} {e.reason} for {url}"
+    except urllib.error.URLError as e:
+        return f"error: could not fetch {url}: {e.reason}"
+    except (OSError, ValueError) as e:
+        return f"error: could not fetch {url}: {e}"
+    truncated = len(data) > max_bytes
+    if truncated:
+        data = data[:max_bytes]
+    try:
+        text = data.decode(charset, errors="replace")
+    except LookupError:
+        text = data.decode("utf-8", errors="replace")
+    if args.get("strip_html"):
+        text = _html_to_text(text)
+    if len(text) > 50_000:
+        text = text[:50_000]
+        truncated = True
+    if truncated:
+        text += "\n... [truncated]"
+    return text if text else "(empty)"
 
 
 SUBAGENT_NOTE = (
@@ -998,6 +1187,34 @@ TOOLS = {
         },
         tool_copy_file,
     ),
+    "fetch_url": (
+        {
+            "type": "function",
+            "function": {
+                "name": "fetch_url",
+                "description": "Fetch the content of an http:// or https:// URL with a GET request. Optionally strip HTML tags to plain text.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "The http:// or https:// URL to fetch",
+                        },
+                        "strip_html": {
+                            "type": "boolean",
+                            "description": "Convert an HTML response to plain text (default false)",
+                        },
+                        "timeout": {
+                            "type": "integer",
+                            "description": "Timeout in seconds (default 30)",
+                        },
+                    },
+                    "required": ["url"],
+                },
+            },
+        },
+        tool_fetch_url,
+    ),
     "todo": (
         {
             "type": "function",
@@ -1123,6 +1340,65 @@ TOOLS = {
             },
         },
         tool_task,
+    ),
+    "ask_user": (
+        {
+            "type": "function",
+            "function": {
+                "name": "ask_user",
+                "description": (
+                    "Ask the user a question and block until they answer. Use it whenever you need "
+                    "feedback, a decision, clarification, or missing information. Optionally provide "
+                    "a list of suggested options the user can pick from; they may still type a custom "
+                    "answer. Returns the user's answer (or 'user cancelled')."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": "The question to ask the user",
+                        },
+                        "options": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional suggested choices; the user can pick one by number or type their own answer",
+                        },
+                    },
+                    "required": ["question"],
+                },
+            },
+        },
+        tool_ask_user,
+    ),
+    "confirm": (
+        {
+            "type": "function",
+            "function": {
+                "name": "confirm",
+                "description": (
+                    "Ask the user for a yes/no confirmation and block until they answer. Use it to get "
+                    "explicit approval before a consequential or file-system-modifying action (writing, "
+                    "patching, moving, copying, deleting), as required. Returns 'user confirmed: yes' or "
+                    "'user confirmed: no' (or 'user cancelled')."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": "What to confirm, e.g. 'Apply this plan?' (default: 'Proceed?')",
+                        },
+                        "default": {
+                            "type": "boolean",
+                            "description": "Answer used when the user just presses enter (omit to require an explicit yes/no)",
+                        },
+                    },
+                    "required": ["question"],
+                },
+            },
+        },
+        tool_confirm,
     ),
     "exit": (
         {
@@ -1539,8 +1815,10 @@ def get_system_prompt(cwd, additional) -> str:
         "and use patch_file with exact matches for edits. "
         "If patch_file reports multiple matches, re-read the area with line numbers and retry using offset/lines. "
         "Before taking any action that modifies the file system (writing, patching, moving, copying, or deleting files), "
-        "plan the change when required and present the plan to the user for approval before acting; "
-        "only proceed once the user has agreed. Read-only exploration does not require a plan. "
+        "plan the change when required and use the confirm tool to get the user's explicit approval before acting; "
+        "only proceed once the user has confirmed. Read-only exploration does not require approval. "
+        "Use the ask_user tool whenever you need feedback, a decision, clarification, or missing information, "
+        "and the confirm tool for yes/no approval; both block until the user responds. "
         "For multi-step work, track progress with the todo tool: add the steps up front, mark each in_progress then done as you go. "
         "When you hit an error and determine the root cause, record a one-line note with the gotcha tool so you don't repeat it. "
         "Use the memory tool to store durable facts (user preferences, project conventions) that should survive across sessions. "
@@ -1615,12 +1893,15 @@ def _iter_keys_windows():
 
     ext_map = {
         "H": "up",
-        "J": "down",
+        "P": "down",
         "K": "left",
-        "L": "right",
+        "M": "right",
         "G": "home",
-        "M": "end",
-        "P": "delete",
+        "O": "end",
+        "R": "ignore",
+        "S": "delete",
+        "I": "ignore",
+        "Q": "ignore",
     }
     while True:
         ch = msvcrt.getwch()
@@ -2454,7 +2735,7 @@ def _all_tool_names() -> set:
 def format_tools() -> str:
     """Build the /tools checklist: '[X] name — description' per tool."""
     lines = []
-    for s in OPENAI_TOOLS_INTERACTIVE + MCP_TOOLS:
+    for s in sorted(OPENAI_TOOLS_INTERACTIVE + MCP_TOOLS, key=lambda s: s["function"]["name"]):
         name = s["function"]["name"]
         desc = s["function"].get("description", "")
         mark = " " if name in DISABLED_TOOLS else "X"
@@ -2485,7 +2766,9 @@ def tools_menu(keys=None) -> bool:
     applies the changes and quits, esc (or ctrl+c/ctrl+d) quits without
     applying them. Returns True if changes were applied, False if cancelled.
     """
-    specs = OPENAI_TOOLS_INTERACTIVE + MCP_TOOLS
+    specs = sorted(
+        OPENAI_TOOLS_INTERACTIVE + MCP_TOOLS, key=lambda s: s["function"]["name"]
+    )
     names = [s["function"]["name"] for s in specs]
     descs = [s["function"].get("description", "") for s in specs]
     if not names:
@@ -2565,7 +2848,7 @@ def format_status(messages: list, context_window: int = 0) -> str:
         for tc in m.get("tool_calls") or []:
             total_chars += len((tc.get("function") or {}).get("arguments") or "")
     approx_tokens = total_chars // 4
-    tool_names = ", ".join(s["function"]["name"] for s in tools)
+    tool_names = ", ".join(sorted(s["function"]["name"] for s in tools))
     ctx = f"context: {approx_tokens} tokens (~{total_chars} chars) in {len(messages)} messages"
     if context_window > 0:
         pct = approx_tokens * 100 // context_window
@@ -2791,7 +3074,7 @@ def main():
         context_window = probe_context_window()
 
     set_color_enabled(not args.no_color and color_enabled())
-    set_emoji_enabled(not args.no_emoji)
+    set_emoji_enabled(not args.no_emoji and _stdout_can_encode_emoji())
 
     mcp_servers = {}
     for path in args.mcp_config or []:
