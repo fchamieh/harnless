@@ -1031,14 +1031,14 @@ class TestStatus(unittest.TestCase):
         # schemas that are sent with every request
         total = 220 + len(json.dumps(h._active_tools(True)))
         self.assertTrue(
-            out.startswith(f"context: {total // 4} tokens (~{total} chars) in 4 messages")
+            out.startswith(f"context: ~{total // 4} tokens (estimated, ~{total} chars) in 4 messages")
         )
 
     def test_empty_history(self):
         out = h.format_status([])
         total = len(json.dumps(h._active_tools(True)))
         self.assertTrue(
-            out.startswith(f"context: {total // 4} tokens (~{total} chars) in 0 messages")
+            out.startswith(f"context: ~{total // 4} tokens (estimated, ~{total} chars) in 0 messages")
         )
 
     def test_counts_reasoning_content(self):
@@ -1048,7 +1048,7 @@ class TestStatus(unittest.TestCase):
         out = h.format_status(messages)
         total = 40 + len(json.dumps(h._active_tools(True)))
         self.assertTrue(
-            out.startswith(f"context: {total // 4} tokens (~{total} chars) in 1 messages")
+            out.startswith(f"context: ~{total // 4} tokens (estimated, ~{total} chars) in 1 messages")
         )
 
     def test_context_window_percentage(self):
@@ -1319,6 +1319,72 @@ class TestLineEditor(Base):
         self.assertEqual(line, "hello")
         self.assertTrue(out.endswith("you> hello\r\n"))
 
+    def test_newline_token_inserts_newline(self):
+        keys = [("char", "a"), "newline", ("char", "b"), "enter"]
+        line, out = self.edit(keys)
+        self.assertEqual(line, "a\nb")
+        self.assertIn("you> a\nb", out)
+
+    def test_multiline_render_does_not_reprint_lines(self):
+        keys = [("char", "a"), "newline", ("char", "b"), "enter"]
+        line, out = self.edit(keys)
+        self.assertEqual(line, "a\nb")
+        # The final render must draw the text once and leave the cursor at the
+        # end; the cursor is positioned with ANSI moves, not by re-printing the
+        # text (which would re-draw the lines after the newline on every key).
+        self.assertTrue(out.endswith("you> a\nb\r\n"))
+        self.assertNotIn("you> a\nb\ryou> a", out)
+
+    def _narrow_edit(self, keys, width=10):
+        real = h.terminal_width
+        h.terminal_width = lambda: width
+        self.addCleanup(setattr, h, "terminal_width", real)
+        return self.edit(keys)
+
+    def test_soft_wrap_clears_all_physical_lines(self):
+        # Width 10, prompt "you> " (5 cols): 12 chars wrap to 2 physical lines.
+        keys = [("char", c) for c in "0123456789ab"] + ["enter"]
+        line, out = self._narrow_edit(keys)
+        self.assertEqual(line, "0123456789ab")
+        # The last render must move up one physical line and clear both of
+        # them before re-printing (clearing only the logical lines would leave
+        # the wrapped first line re-printed on every key).
+        self.assertIn("\x1b[1A\r\x1b[2K\x1b[B\x1b[2K\x1b[1Ayou> 0123456789ab", out)
+        self.assertTrue(out.endswith("you> 0123456789ab\r\n"))
+
+    def test_soft_wrap_cursor_move_across_wrap(self):
+        keys = [("char", c) for c in "0123456789ab"] + ["left"] * 8 + ["enter"]
+        line, out = self._narrow_edit(keys)
+        self.assertEqual(line, "0123456789ab")
+        # Moving from char 5 to char 4 crosses the wrap: the cursor goes from
+        # row 1 col 7 to row 0 col 9 (one line down-to-up, two cols right).
+        self.assertIn("\x1b[1B\x1b[2C", out)
+
+    def test_soft_wrap_boundary_cursor(self):
+        # Prompt (5) + 6 chars: the end sits at row 1 col 1; one left puts the
+        # cursor exactly on the wrap boundary (total col 10), i.e. row 1 col 0.
+        keys = [("char", c) for c in "012345"] + ["left"] + ["enter"]
+        line, out = self._narrow_edit(keys)
+        self.assertEqual(line, "012345")
+        self.assertTrue(out.endswith("\x1b[1D\r\n"))
+
+    def test_soft_wrap_exact_boundary_no_premature_wrap(self):
+        # Prompt (5) + 5 chars fills the row exactly: the terminal has not
+        # wrapped yet, so the cursor stays at row 0 col 9 and a left-arrow
+        # needs no row move.
+        keys = [("char", c) for c in "01234"] + ["left"] + ["enter"]
+        line, out = self._narrow_edit(keys)
+        self.assertEqual(line, "01234")
+        self.assertTrue(out.endswith("\x1b[2Kyou> 01234\r\n"))
+
+    def test_newline_in_middle_of_line(self):
+        keys = [("char", "a"), ("char", "b"), "left", "newline", "enter"]
+        self.assertEqual(self.edit(keys)[0], "a\nb")
+
+    def test_backspace_across_newline(self):
+        keys = [("char", "a"), "newline", ("char", "b"), "backspace", "backspace", "enter"]
+        self.assertEqual(self.edit(keys)[0], "a")
+
     def test_backspace_and_delete(self):
         keys = [("char", c) for c in "abc"] + ["left", "left", "delete", "enter"]
         self.assertEqual(self.edit(keys)[0], "ac")
@@ -1449,6 +1515,7 @@ class TestWindowsKeyMap(unittest.TestCase):
 
     def test_plain_keys(self):
         self.assertEqual(self.first(["\r"]), "enter")
+        self.assertEqual(self.first(["\n"]), "newline")
         self.assertEqual(self.first(["a"]), ("char", "a"))
         self.assertEqual(self.first(["\x1b"]), "esc")
 
@@ -1481,8 +1548,12 @@ class TestCsiSequences(unittest.TestCase):
     @unittest.skipIf(os.name == "nt", "pty not available on Windows")
     def test_delete_key_via_pty(self):
         import pty
+        import tty
 
         master, slave = pty.openpty()  # type: ignore[reportAttributeAccessIssue]
+        # Raw mode before writing so the line discipline does not convert
+        # \r to \n (ICRNL) and hold back input (canonical mode).
+        tty.setraw(slave)  # type: ignore[reportAttributeAccessIssue]
         old = sys.stdin
         stdin_file = os.fdopen(slave, "r")
         try:
@@ -1496,6 +1567,33 @@ class TestCsiSequences(unittest.TestCase):
             self.assertEqual(
                 tokens,
                 [("char", "a"), ("char", "b"), ("char", "c"), "delete", "enter"],
+            )
+        finally:
+            sys.stdin = old
+            stdin_file.close()
+            os.close(master)
+
+    @unittest.skipIf(os.name == "nt", "pty not available on Windows")
+    def test_ctrl_j_via_pty(self):
+        import pty
+        import tty
+
+        master, slave = pty.openpty()  # type: ignore[reportAttributeAccessIssue]
+        # Raw mode before writing so \n (Ctrl+J) and \r (Enter) pass through
+        # unconverted.
+        tty.setraw(slave)  # type: ignore[reportAttributeAccessIssue]
+        old = sys.stdin
+        stdin_file = os.fdopen(slave, "r")
+        try:
+            sys.stdin = stdin_file
+            os.write(master, b"a\nb\r")
+            tokens = []
+            for tok in h._iter_keys_posix():
+                tokens.append(tok)
+                if tok == "enter":
+                    break
+            self.assertEqual(
+                tokens, [("char", "a"), "newline", ("char", "b"), "enter"]
             )
         finally:
             sys.stdin = old
@@ -2042,7 +2140,24 @@ class TestTodo(Base):
         self.assertEqual(self.todo(action="list"), "todo list:\n- [ ] 1. step one")
 
     def test_add_requires_text(self):
-        self.assertEqual(self.todo(action="add"), "error: 'add' requires text")
+        self.assertEqual(self.todo(action="add"), "error: 'add' requires text or a non-empty items array")
+
+    def test_add_multiple_items(self):
+        self.assertEqual(
+            self.todo(action="add", items=["a", "b", "c"]),
+            "todo list:\n- [ ] 1. a\n- [ ] 2. b\n- [ ] 3. c")
+        self.assertEqual(h.TODO_NEXT_ID, 4)
+
+    def test_add_items_skips_blank(self):
+        self.assertEqual(
+            self.todo(action="add", items=["a", "  ", "b"]),
+            "todo list:\n- [ ] 1. a\n- [ ] 2. b")
+
+    def test_add_empty_items_errors(self):
+        self.assertEqual(self.todo(action="add", items=[]),
+                         "error: 'add' requires text or a non-empty items array")
+        self.assertEqual(self.todo(action="add", items=["  "]),
+                         "error: 'add' requires text or a non-empty items array")
 
     def test_update_status(self):
         self.todo(action="add", text="a")
@@ -2547,6 +2662,108 @@ class TestContentChars(unittest.TestCase):
             ),
             6,
         )
+
+
+class TestUsageTracking(unittest.TestCase):
+    def setUp(self):
+        self.saved = dict(h.USAGE_BY_CONV)
+        h.USAGE_BY_CONV.clear()
+
+    def tearDown(self):
+        h.USAGE_BY_CONV.clear()
+        h.USAGE_BY_CONV.update(self.saved)
+
+    def test_record_usage_stores_by_messages_id(self):
+        msgs = [{"role": "user", "content": "hi"}]
+        h._record_usage(msgs, {"prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105})
+        self.assertEqual(h.USAGE_BY_CONV[id(msgs)]["prompt_tokens"], 100)
+
+    def test_record_usage_ignores_bad(self):
+        msgs = [{"role": "user", "content": "hi"}]
+        h._record_usage(msgs, None)
+        h._record_usage(msgs, {})
+        h._record_usage(msgs, {"prompt_tokens": 0})
+        self.assertNotIn(id(msgs), h.USAGE_BY_CONV)
+
+    def test_parse_sse_line_usage_chunk_empty_choices(self):
+        line = 'data: {"id":"x","choices":[],"usage":{"prompt_tokens":170000,"completion_tokens":10,"total_tokens":170010}}'
+        self.assertEqual(
+            h.parse_sse_line(line),
+            {"usage": {"prompt_tokens": 170000, "completion_tokens": 10, "total_tokens": 170010}},
+        )
+
+    def test_parse_sse_line_usage_chunk_no_choices(self):
+        self.assertEqual(h.parse_sse_line('data: {"usage":{"prompt_tokens":42}}'), {"usage": {"prompt_tokens": 42}})
+
+    def test_parse_sse_line_empty_choices_no_usage(self):
+        self.assertIsNone(h.parse_sse_line('data: {"id":"x","choices":[]}'))
+
+    def test_parse_sse_line_delta_still_works(self):
+        self.assertEqual(
+            h.parse_sse_line('data: {"choices":[{"delta":{"content":"hi"}}]}'), {"content": "hi"}
+        )
+
+    def test_build_request_stream_options(self):
+        req = h._build_request([{"role": "user", "content": "hi"}], "m", stream=True)
+        body = json.loads(req.data.decode("utf-8"))
+        self.assertEqual(body["stream_options"], {"include_usage": True})
+        req2 = h._build_request([{"role": "user", "content": "hi"}], "m", stream=False)
+        body2 = json.loads(req2.data.decode("utf-8"))
+        self.assertNotIn("stream_options", body2)
+
+    def test_chat_records_usage(self):
+        data = {
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 55, "completion_tokens": 2, "total_tokens": 57},
+        }
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps(data).encode("utf-8")
+
+        with mock.patch.object(h.urllib.request, "urlopen", return_value=FakeResp()):
+            msgs = [{"role": "user", "content": "hi"}]
+            out = h.chat(msgs, "m")
+        self.assertEqual(out["choices"][0]["message"]["content"], "ok")
+        self.assertEqual(h.USAGE_BY_CONV[id(msgs)]["prompt_tokens"], 55)
+
+    def test_stream_chat_records_usage(self):
+        lines = [
+            b'data: {"choices":[{"delta":{"content":"hi"}}]}\n',
+            b'data: {"choices":[],"usage":{"prompt_tokens":170000,"completion_tokens":1,"total_tokens":170001}}\n',
+            b"data: [DONE]\n",
+        ]
+
+        class FakeResp:
+            def __enter__(self):
+                return iter(lines)
+
+            def __exit__(self, *a):
+                return False
+
+        with mock.patch.object(h.urllib.request, "urlopen", return_value=FakeResp()):
+            msgs = [{"role": "user", "content": "hi"}]
+            deltas = list(h.stream_chat(msgs, "m"))
+        self.assertEqual(deltas, [{"content": "hi"}])
+        self.assertEqual(h.USAGE_BY_CONV[id(msgs)]["prompt_tokens"], 170000)
+
+    def test_format_status_server_reported(self):
+        msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]
+        h._record_usage(msgs, {"prompt_tokens": 170000, "completion_tokens": 10, "total_tokens": 170010})
+        out = h.format_status(msgs, context_window=200000)
+        self.assertIn("context: 170000 tokens (server-reported) in 2 messages", out)
+        self.assertIn("~85% of 200000 window", out)
+
+    def test_format_status_estimated_fallback(self):
+        msgs = [{"role": "user", "content": "hi"}]
+        out = h.format_status(msgs, context_window=1000)
+        self.assertIn("tokens (estimated, ~", out)
 
 
 class TestNoVisionCli(Base):

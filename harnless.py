@@ -31,6 +31,8 @@ CWD = os.getcwd()
 VISION_ENABLED = True
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_REMOTE_BYTES = 10 * 1024 * 1024
+# Server-reported token usage per conversation, keyed by id(messages).
+USAGE_BY_CONV: dict[int, dict] = {}
 IMAGE_MIME = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
@@ -742,11 +744,17 @@ def tool_todo(args: dict) -> str:
     global TODO_NEXT_ID
     action = (args.get("action") or "list").strip().lower()
     if action == "add":
-        text = (args.get("text") or "").strip()
-        if not text:
-            return "error: 'add' requires text"
-        TODO_ITEMS.append({"id": TODO_NEXT_ID, "text": text, "status": "pending"})
-        TODO_NEXT_ID += 1
+        items = args.get("items")
+        if isinstance(items, list):
+            texts = [str(t).strip() for t in items]
+        else:
+            texts = [(args.get("text") or "").strip()]
+        texts = [t for t in texts if t]
+        if not texts:
+            return "error: 'add' requires text or a non-empty items array"
+        for t in texts:
+            TODO_ITEMS.append({"id": TODO_NEXT_ID, "text": t, "status": "pending"})
+            TODO_NEXT_ID += 1
     elif action == "update":
         if args.get("id") is None:
             return "error: 'update' requires id"
@@ -1237,11 +1245,12 @@ TOOLS = {
             "function": {
                 "name": "todo",
                 "description": (
-                    "Manage a todo list for tracking multi-step work. Actions: 'add' (text) to add an "
-                    "item, 'update' (id, plus status and/or text) to change an item, 'list' to show all "
-                    "items, 'clear' to remove all items. The current list is re-shown to you automatically "
-                    "after changes. Use it for multi-step tasks: add the steps up front, mark each "
-                    "in_progress then done as you go."
+                    "Manage a todo list for tracking multi-step work. Actions: 'add' (items array, or "
+                    "text for a single item) to add items, 'update' (id, plus status and/or text) to "
+                    "change an item, 'list' to show all items, 'clear' to remove all items. The current "
+                    "list is re-shown to you automatically after changes. Use it for multi-step tasks: "
+                    "add all the steps up front in a single 'add' call, mark each in_progress then done "
+                    "as you go."
                 ),
                 "parameters": {
                     "type": "object",
@@ -1253,6 +1262,14 @@ TOOLS = {
                         "text": {
                             "type": "string",
                             "description": "Item text (for add), or replacement text (for update)",
+                        },
+                        "items": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "Item texts to add in one call (for add; preferred over repeated "
+                                "single-item adds)"
+                            ),
                         },
                         "id": {
                             "type": "integer",
@@ -1852,7 +1869,7 @@ def get_system_prompt(cwd, additional) -> str:
         "only proceed once the user has confirmed. Read-only exploration does not require approval. "
         "Use the ask_user tool whenever you need feedback, a decision, clarification, or missing information, "
         "and the confirm tool for yes/no approval; both block until the user responds. "
-        "For multi-step work, track progress with the todo tool: add the steps up front, mark each in_progress then done as you go. "
+        "For multi-step work, track progress with the todo tool: add all the steps up front in a single 'add' call, mark each in_progress then done as you go. "
         "When you hit an error and determine the root cause, record a one-line note with the gotcha tool so you don't repeat it. "
         "Use the memory tool to store durable facts (user preferences, project conventions) that should survive across sessions. "
         "Format responses in Markdown (headings, lists, tables, fenced code blocks); the terminal renders it. "
@@ -2091,6 +2108,8 @@ def _iter_keys_windows():
             yield ext_map.get(code, "ignore")
         elif ch == "\r":
             yield "enter"
+        elif ch == "\n":
+            yield "newline"
         elif ch == "\x08":
             yield "backspace"
         elif ch == "\x03":
@@ -2180,8 +2199,10 @@ def _iter_keys_posix():
                     yield _parse_csi_seq(read_char)
                 else:
                     yield "ignore"
-            elif ch in ("\r", "\n"):
+            elif ch == "\r":
                 yield "enter"
+            elif ch == "\n":
+                yield "newline"
             elif ch in ("\x7f", "\x08"):
                 yield "backspace"
             elif ch == "\x03":
@@ -2198,24 +2219,79 @@ def _iter_keys_posix():
         termios.tcsetattr(fd, termios.TCSADRAIN, old)  # type: ignore[reportAttributeAccessIssue]
 
 
+def _edit_phys_pos(text: str, prompt_w: int, pos: int, width: int) -> tuple:
+    """Physical (row, col) of the cursor at character position `pos` in
+    `text`, assuming `text` is printed after a prompt of display width
+    `prompt_w` in a terminal `width` columns wide (soft-wrapping). `pos` may
+    be len(text) (end of text)."""
+    lines = text.split("\n")
+    row = 0
+    for i, ln in enumerate(lines):
+        start = prompt_w if i == 0 else 0
+        if pos <= len(ln):
+            total = start + display_width(ln[:pos])
+            at_end = i == len(lines) - 1 and pos == len(ln)
+            if at_end and total > 0 and total % width == 0:
+                # The text ends exactly on a column boundary: the terminal
+                # has not wrapped yet, so the cursor sits at the last column.
+                return row + total // width - 1, width - 1
+            return row + total // width, total % width
+        row += (start + display_width(ln)) // width
+        pos -= len(ln) + 1
+    return row, 0
+
+
 def _edit_line(prompt: str, keys) -> str:
-    """Run a minimal line editor over a key-token iterator. Returns the line."""
+    """Run a minimal line editor over a key-token iterator. Returns the line
+    (may contain newlines inserted via the "newline" token, e.g. Ctrl+J)."""
     buf = []
     pos = 0
     hist_idx = len(HISTORY)
 
-    prev_len = 0
+    prev_text = ""
+    prev_width = 0
+    prev_rendered = False
 
     def render():
-        nonlocal prev_len
+        nonlocal prev_text, prev_width, prev_rendered
         line = "".join(buf)
-        pad = max(0, prev_len - max(len(line), pos))
-        sys.stdout.write(
-            "\r" + prompt + line + " " * pad
-            + "\r" + prompt + line[:pos]
-        )
+        width = terminal_width()
+        prompt_w = display_width(_ANSI_RE.sub("", prompt))
+        out = ""
+        if prev_rendered:
+            # Move the cursor back to the first physical line of the previous
+            # render and clear each physical line it occupied (the text may
+            # soft-wrap past the terminal width). Uses cursor moves (no
+            # newlines) so the screen never scrolls while editing.
+            prev_row, _ = _edit_phys_pos(prev_text, prompt_w, len(prev_text), prev_width)
+            if prev_row:
+                out += f"\x1b[{prev_row}A"
+            out += "\r"
+            for i in range(prev_row + 1):
+                out += "\x1b[2K"
+                if i < prev_row:
+                    out += "\x1b[B"
+            if prev_row:
+                out += f"\x1b[{prev_row}A"
+        out += prompt + line
+        if pos < len(line):
+            # Position the cursor at the edit position with cursor moves (not
+            # by re-printing, which would re-draw every line after the first
+            # newline). Positions are physical (row, col), so soft-wrapped
+            # lines are handled too.
+            trow, tcol = _edit_phys_pos(line, prompt_w, pos, width)
+            erow, ecol = _edit_phys_pos(line, prompt_w, len(line), width)
+            drow = trow - erow
+            dcol = tcol - ecol
+            if drow:
+                out += f"\x1b[{drow}A" if drow > 0 else f"\x1b[{-drow}B"
+            if dcol:
+                out += f"\x1b[{dcol}C" if dcol > 0 else f"\x1b[{-dcol}D"
+        sys.stdout.write(out)
         sys.stdout.flush()
-        prev_len = len(line)
+        prev_text = line
+        prev_width = width
+        prev_rendered = True
 
     def newline():
         sys.stdout.write("\r\n")
@@ -2262,6 +2338,9 @@ def _edit_line(prompt: str, keys) -> str:
                 hist_idx += 1
                 buf = list(HISTORY[hist_idx]) if hist_idx < len(HISTORY) else []
                 pos = len(buf)
+        elif token == "newline":
+            buf.insert(pos, "\n")
+            pos += 1
         elif isinstance(token, tuple) and token[0] == "char":
             buf.insert(pos, token[1])
             pos += 1
@@ -2341,6 +2420,16 @@ def probe_context_window() -> int:
     )
 
 
+def _record_usage(messages: list, usage) -> None:
+    """Remember the server-reported token usage for a conversation.
+
+    Keyed by id(messages) so each conversation (including sub-agents)
+    tracks its own; /status looks it up to show exact prompt tokens.
+    """
+    if isinstance(usage, dict) and usage.get("prompt_tokens"):
+        USAGE_BY_CONV[id(messages)] = usage
+
+
 def chat(
     messages: list, model: str, interactive: bool = False, temperature: float = 0.2
 ) -> dict:
@@ -2355,7 +2444,9 @@ def chat(
     ).encode("utf-8")
     req = urllib.request.Request(API_URL, data=payload, headers=_headers())
     with urllib.request.urlopen(req, timeout=600) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+        data = json.loads(resp.read().decode("utf-8"))
+    _record_usage(messages, data.get("usage"))
+    return data
 
 
 def _build_request(
@@ -2365,24 +2456,28 @@ def _build_request(
     interactive: bool = False,
     temperature: float = 0.2,
 ) -> urllib.request.Request:
-    payload = json.dumps(
-        {
-            "model": model,
-            "messages": messages,
-            "tools": _active_tools(interactive),
-            "tool_choice": "auto",
-            "temperature": temperature,
-            "stream": stream,
-        }
-    ).encode("utf-8")
+    body = {
+        "model": model,
+        "messages": messages,
+        "tools": _active_tools(interactive),
+        "tool_choice": "auto",
+        "temperature": temperature,
+        "stream": stream,
+    }
+    if stream:
+        # Ask for a final usage chunk so /status can show exact token counts.
+        body["stream_options"] = {"include_usage": True}
+    payload = json.dumps(body).encode("utf-8")
     return urllib.request.Request(API_URL, data=payload, headers=_headers())
 
 
 def parse_sse_line(line: str):
     """Parse one SSE line from a streaming chat response.
 
-    Returns the delta dict for data lines, the string "[DONE]" for the
-    terminator, or None for comments/blank/malformed lines.
+    Returns the delta dict for data lines, a {"usage": ...} dict for the
+    final usage chunk (when stream_options.include_usage is set), the
+    string "[DONE]" for the terminator, or None for comments/blank/
+    malformed lines.
     """
     line = line.strip()
     if not line.startswith("data:"):
@@ -2394,8 +2489,13 @@ def parse_sse_line(line: str):
         chunk = json.loads(data)
     except json.JSONDecodeError:
         return None
-    choice = chunk["choices"][0]
-    return choice.get("delta") or {}
+    usage = chunk.get("usage")
+    if usage:
+        return {"usage": usage}
+    choices = chunk.get("choices") or []
+    if not choices:
+        return None
+    return choices[0].get("delta") or {}
 
 
 def stream_chat(
@@ -2412,6 +2512,9 @@ def stream_chat(
                 continue
             if parsed == "[DONE]":
                 break
+            if "usage" in parsed:
+                _record_usage(messages, parsed["usage"])
+                continue
             yield parsed
 
 
@@ -3029,11 +3132,21 @@ def format_status(messages: list, context_window: int = 0) -> str:
         for tc in m.get("tool_calls") or []:
             total_chars += len((tc.get("function") or {}).get("arguments") or "")
     approx_tokens = total_chars // 4
+    usage = USAGE_BY_CONV.get(id(messages))
+    prompt_tokens = (
+        int(usage["prompt_tokens"])
+        if isinstance(usage, dict) and usage.get("prompt_tokens")
+        else 0
+    )
     tool_names = ", ".join(sorted(s["function"]["name"] for s in tools))
-    ctx = f"context: {approx_tokens} tokens (~{total_chars} chars) in {len(messages)} messages"
+    if prompt_tokens:
+        ctx = f"context: {prompt_tokens} tokens (server-reported) in {len(messages)} messages"
+    else:
+        ctx = f"context: ~{approx_tokens} tokens (estimated, ~{total_chars} chars) in {len(messages)} messages"
     if context_window > 0:
-        pct = approx_tokens * 100 // context_window
-        pct_str = "<1%" if pct == 0 and approx_tokens > 0 else f"~{pct}%"
+        used = prompt_tokens or approx_tokens
+        pct = used * 100 // context_window
+        pct_str = "<1%" if pct == 0 and used > 0 else f"~{pct}%"
         ctx += f" ({pct_str} of {context_window} window)"
     lines = [
         ctx,
@@ -3059,6 +3172,7 @@ def format_help() -> str:
         "/tools <name>   toggle a tool on/off\n"
         "/help           show this help\n"
         "/exit           quit (alias: /quit)\n"
+        "Ctrl+J          insert a newline (multi-line input); Enter submits\n"
         "\n"
         "file references (attach a file to your message):\n"
         "  @[cwd://relative/path]   file relative to the working directory\n"
@@ -3360,7 +3474,7 @@ def main():
         colorize(
             "type /new to start over, /clear-screen to clear the screen, /status for session info, /tools to toggle tools, /help for commands, /exit to quit\n"
             "attach files with @[cwd://rel/path], @[file:///abs/path] or @[http(s)://host/file]\n"
-            "use up/down arrows to recall previous input\n",
+            "use up/down arrows to recall previous input, Ctrl+J inserts a newline (multi-line prompt)\n",
             "dim",
         )
     )
