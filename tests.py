@@ -1,6 +1,7 @@
 """Tests for harnless.py. Run from the repo root: python tests.py"""
 
 import contextlib
+import email.message
 import io
 import json
 import os
@@ -431,7 +432,7 @@ class TestFetchUrl(unittest.TestCase):
         )
 
     def test_http_error(self):
-        err = urllib.error.HTTPError("https://x", 404, "Not Found", {}, None)
+        err = urllib.error.HTTPError("https://x", 404, "Not Found", email.message.Message(), None)
         with mock.patch("urllib.request.urlopen", side_effect=err):
             out = h.tool_fetch_url({"url": "https://x"})
         self.assertEqual(out, "error: HTTP 404 Not Found for https://x")
@@ -1479,7 +1480,7 @@ class TestCsiSequences(unittest.TestCase):
     def test_delete_key_via_pty(self):
         import pty
 
-        master, slave = pty.openpty()
+        master, slave = pty.openpty()  # type: ignore[reportAttributeAccessIssue]
         old = sys.stdin
         stdin_file = os.fdopen(slave, "r")
         try:
@@ -1504,10 +1505,10 @@ class TestCsiSequences(unittest.TestCase):
         import pty
         import tty
 
-        master, slave = pty.openpty()
+        master, slave = pty.openpty()  # type: ignore[reportAttributeAccessIssue]
         # Put the slave in raw mode before writing so the lone ESC byte is
         # not held back by the canonical-mode line discipline.
-        tty.setraw(slave)
+        tty.setraw(slave)  # type: ignore[reportAttributeAccessIssue]
         old = sys.stdin
         stdin_file = os.fdopen(slave, "r")
         try:
@@ -1676,7 +1677,7 @@ class TestMcpConfig(Base):
 class TestMcpRegister(Base):
     def _fake_client(self, name, tools):
         c = h.MCPClient(name, {"transport": "stdio", "command": "x"})
-        c.connect = lambda: None
+        c.connect = lambda: {}
         c.list_tools = lambda: tools
         c.close = lambda: None
         return c
@@ -1786,7 +1787,7 @@ class TestMcpHttpIntegration(Base):
                 self.end_headers()
                 self.wfile.write(payload)
 
-            def log_message(self, *a):
+            def log_message(self, format, *args):
                 pass
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -1832,7 +1833,7 @@ class TestMcpHttpIntegration(Base):
                 self.end_headers()
                 self.wfile.write(payload)
 
-            def log_message(self, *a):
+            def log_message(self, format, *args):
                 pass
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)

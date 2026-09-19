@@ -1542,11 +1542,11 @@ class MCPClient:
         self.transport = config.get("transport", "stdio")
         self.tool_names = []
         self._id = 0
-        self._proc = None
-        self._out_q = None
+        self._proc: subprocess.Popen | None = None
+        self._out_q: queue.Queue | None = None
         self._stderr_buf = []
         self._session_id = None
-        self._url = None
+        self._url: str | None = None
         self._headers = {}
 
     # -- lifecycle
@@ -1611,16 +1611,26 @@ class MCPClient:
         threading.Thread(target=self._drain_stderr, daemon=True).start()
 
     def _drain_stdout(self):
+        if self._proc is None or self._out_q is None:
+            return
+        stdout = self._proc.stdout
+        if stdout is None:
+            return
         try:
-            for line in self._proc.stdout:
+            for line in stdout:
                 self._out_q.put(line)
         except Exception:
             pass
         self._out_q.put(None)  # sentinel on EOF
 
     def _drain_stderr(self):
+        if self._proc is None:
+            return
+        stderr = self._proc.stderr
+        if stderr is None:
+            return
         try:
-            for line in self._proc.stderr:
+            for line in stderr:
                 self._stderr_buf.append(line.rstrip("\n"))
                 if len(self._stderr_buf) > 500:
                     self._stderr_buf.pop(0)
@@ -1630,10 +1640,15 @@ class MCPClient:
     def _send_stdio(self, msg: dict):
         if self._proc is None or self._proc.poll() is not None:
             raise MCPError(f"stdio server '{self.name}' is not running")
-        self._proc.stdin.write(json.dumps(msg) + "\n")
-        self._proc.stdin.flush()
+        stdin = self._proc.stdin
+        if stdin is None:
+            raise MCPError(f"stdio server '{self.name}' has no stdin")
+        stdin.write(json.dumps(msg) + "\n")
+        stdin.flush()
 
     def _recv_stdio(self) -> dict:
+        if self._out_q is None:
+            raise MCPError(f"stdio server '{self.name}' is not connected")
         try:
             line = self._out_q.get(timeout=MCP_TIMEOUT)
         except queue.Empty:
@@ -1654,6 +1669,8 @@ class MCPClient:
         self._headers = dict(self.config.get("headers") or {})
 
     def _http_post(self, payload: dict):
+        if self._url is None:
+            raise MCPError(f"http server '{self.name}' is not connected")
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
@@ -1847,7 +1864,7 @@ def load_agents_md() -> str:
 # ---------------------------------------------------------------- line editor
 
 HISTORY = []
-HISTORY_MAX = 100
+HISTORY_MAX = 1000
 HISTORY_FILE = os.environ.get("HARNLESS_HISTORY") or os.path.join(
     os.path.expanduser("~"), ".harnless_history"
 )
@@ -1958,7 +1975,7 @@ def _iter_keys_posix():
     import tty
 
     fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
+    old = termios.tcgetattr(fd)  # type: ignore[reportAttributeAccessIssue]
 
     def read_char():
         b = os.read(fd, 1)
@@ -1981,7 +1998,7 @@ def _iter_keys_posix():
         return (b + rest).decode("utf-8", errors="replace")
 
     try:
-        tty.setraw(fd)
+        tty.setraw(fd)  # type: ignore[reportAttributeAccessIssue]
         while True:
             ch = read_char()
             if ch is None:
@@ -2014,7 +2031,7 @@ def _iter_keys_posix():
             else:
                 yield ("char", ch)
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)  # type: ignore[reportAttributeAccessIssue]
 
 
 def _edit_line(prompt: str, keys) -> str:
@@ -2106,7 +2123,7 @@ def readline_prompt(prompt: str) -> str:
 # ---------------------------------------------------------------- client
 
 
-def normalize_api_url(url: str) -> str:
+def normalize_api_url(url: str | None) -> str:
     """Return the chat completions endpoint for a given API URL.
 
     Accepts either a full endpoint (``https://openrouter.ai/api/v1/chat/completions``)
@@ -2637,7 +2654,7 @@ class MarkdownRenderer:
 
 def stream_once(
     messages: list, model: str, interactive: bool = False, temperature: float = 0.2
-):
+) -> tuple[dict, bool]:
     """Stream one chat turn, printing reasoning and content live.
 
     Returns (message, streamed) where streamed is False if no deltas
@@ -2978,7 +2995,7 @@ def main():
     global API_URL, API_KEY, MODEL, TEMPERATURE, MAX_SUBAGENT_DEPTH
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[reportAttributeAccessIssue]
         except Exception:
             pass
 
