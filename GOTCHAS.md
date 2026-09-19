@@ -1,3 +1,4 @@
 - Nuitka 4.x requires `--option=value` syntax for options taking arguments (e.g. `--output-dir=dist`); space-separated form errors out.
 - Emoji icons auto-disable when stdout's encoding can't encode them (`EMOJI_ENABLED` set at import and in `main()`); in tests, cleanups must restore the original `EMOJI_ENABLED`, not hardcode True, or later tests printing icons crash on non-UTF-8 consoles
 - CLI flag wiring in main() (e.g. --mcp-http adding to mcp_servers) is untested by unit tests — cover it with the subprocess test test_cli_mcp_http_flag_registers_tools
+- On Python 3.14/Windows, urllib.request.pathname2url returns the path WITHOUT the file:// scheme (e.g. '///X:/...'); prepend 'file://' when building a file:// URI in tests.

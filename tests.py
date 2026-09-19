@@ -1,5 +1,6 @@
 """Tests for harnless.py. Run from the repo root: python tests.py"""
 
+import base64
 import contextlib
 import email.message
 import io
@@ -10,6 +11,7 @@ import sys
 import unittest
 import urllib.error
 from unittest import mock
+from urllib.request import pathname2url
 
 import harnless as h
 
@@ -2390,6 +2392,183 @@ class TestAskUser(Base):
         self.assertEqual(
             h.tool_confirm({"question": "ok?"}), "user cancelled (no confirmation)"
         )
+
+
+class TestFileRefs(Base):
+    PNG = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+    )
+
+    def setUp(self):
+        super().setUp()
+        self._old_vision = h.VISION_ENABLED
+        self._old_cwd = h.CWD
+        h.VISION_ENABLED = True
+        h.CWD = self.p("")
+
+    def tearDown(self):
+        h.VISION_ENABLED = self._old_vision
+        h.CWD = self._old_cwd
+        super().tearDown()
+
+    def _write(self, rel, content):
+        path = os.path.join(self.tmp, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return path
+
+    def test_no_refs_returns_string(self):
+        self.assertEqual(h.expand_file_refs("hello world"), "hello world")
+
+    def test_non_uri_ref_stays_literal(self):
+        self.assertEqual(h.expand_file_refs("see @[not-a-uri] here"), "see @[not-a-uri] here")
+
+    def test_cwd_text_ref(self):
+        self._write("notes.txt", "line one\nline two\n")
+        out = h.expand_file_refs("read @[cwd://notes.txt] now")
+        self.assertIsInstance(out, list)
+        texts = [p["text"] for p in out if p.get("type") == "text"]
+        joined = "\n".join(texts)
+        self.assertIn("[file: notes.txt]", joined)
+        self.assertIn("line one", joined)
+        self.assertIn("line two", joined)
+        self.assertTrue(any(t.startswith("read ") for t in texts))
+        self.assertTrue(any(t.endswith(" now") for t in texts))
+
+    def test_cwd_image_ref(self):
+        with open(os.path.join(self.tmp, "dot.png"), "wb") as f:
+            f.write(self.PNG)
+        out = h.expand_file_refs("@[cwd://dot.png]")
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["type"], "image_url")
+        url = out[0]["image_url"]["url"]
+        self.assertTrue(url.startswith("data:image/png;base64,"))
+        self.assertEqual(base64.b64decode(url.split(",", 1)[1]), self.PNG)
+
+    def test_cwd_missing_file(self):
+        out = h.expand_file_refs("@[cwd://nope.txt]")
+        self.assertEqual(out, [{"type": "text", "text": "[error: file not found: nope.txt]"}])
+
+    def test_cwd_escape_rejected(self):
+        out = h.expand_file_refs("@[cwd://../evil.txt]")
+        self.assertEqual(
+            out,
+            [{"type": "text", "text": "[error: Path escapes working directory: ../evil.txt]"}],
+        )
+
+    def test_file_uri_text_ref(self):
+        abs_path = self.p("abs.txt")
+        with open(abs_path, "w", encoding="utf-8") as f:
+            f.write("absolute content")
+        uri = pathname2url(abs_path)
+        if not uri.startswith("file://"):
+            uri = "file://" + uri
+        out = h.expand_file_refs(f"@[{uri}]")
+        self.assertIsInstance(out, list)
+        joined = "\n".join(p["text"] for p in out if p.get("type") == "text")
+        self.assertIn("absolute content", joined)
+
+    def test_file_uri_missing(self):
+        out = h.expand_file_refs("@[file:///nonexistent/xyz.txt]")
+        self.assertEqual(
+            out,
+            [{"type": "text", "text": "[error: file not found: file:///nonexistent/xyz.txt]"}],
+        )
+
+    def test_no_vision_image_becomes_note(self):
+        h.VISION_ENABLED = False
+        with open(os.path.join(self.tmp, "dot.png"), "wb") as f:
+            f.write(self.PNG)
+        out = h.expand_file_refs("@[cwd://dot.png]")
+        self.assertEqual(
+            out,
+            [{"type": "text", "text": "[image: dot.png (not sent; vision disabled)]"}],
+        )
+
+    def test_truncation(self):
+        self._write("big.txt", "a" * 60_000)
+        out = h.expand_file_refs("@[cwd://big.txt]")
+        self.assertEqual(len(out), 1)
+        self.assertTrue(out[0]["text"].endswith("\n... [truncated]"))
+
+    def test_multiple_refs_ordering(self):
+        self._write("a.txt", "AAA")
+        self._write("b.txt", "BBB")
+        out = h.expand_file_refs("@[cwd://a.txt] mid @[cwd://b.txt]")
+        self.assertEqual(len(out), 3)
+        self.assertEqual(out[0]["text"], "[file: a.txt]\nAAA")
+        self.assertEqual(out[1]["text"], " mid ")
+        self.assertEqual(out[2]["text"], "[file: b.txt]\nBBB")
+
+    def test_build_user_message(self):
+        self._write("n.txt", "X")
+        msg = h.build_user_message("@[cwd://n.txt]")
+        self.assertEqual(msg["role"], "user")
+        self.assertIsInstance(msg["content"], list)
+
+    def test_format_status_list_content(self):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hello"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,XYZ"}},
+                ],
+            }
+        ]
+        out = h.format_status(messages)
+        self.assertTrue(out.startswith("context:"))
+
+
+class TestContentChars(unittest.TestCase):
+    def test_string(self):
+        self.assertEqual(h._content_chars("hello"), 5)
+
+    def test_none(self):
+        self.assertEqual(h._content_chars(None), 0)
+
+    def test_list_text(self):
+        self.assertEqual(h._content_chars([{"type": "text", "text": "abc"}]), 3)
+
+    def test_list_image(self):
+        url = "data:image/png;base64,AAAA"
+        self.assertEqual(
+            h._content_chars([{"type": "image_url", "image_url": {"url": url}}]), len(url)
+        )
+
+    def test_list_mixed(self):
+        self.assertEqual(
+            h._content_chars(
+                [
+                    {"type": "text", "text": "ab"},
+                    {"type": "image_url", "image_url": {"url": "cccc"}},
+                ]
+            ),
+            6,
+        )
+
+
+class TestNoVisionCli(Base):
+    def test_no_vision_flag_accepted(self):
+        import subprocess
+
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "harnless.py",
+                "--no-color",
+                "--no-vision",
+                "--context-window",
+                "1000",
+            ],
+            input="/exit\n",
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=60,
+        )
+        self.assertEqual(proc.returncode, 0)
 
 
 if __name__ == "__main__":

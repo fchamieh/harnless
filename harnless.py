@@ -3,6 +3,7 @@
 
 import argparse
 import atexit
+import base64
 import html.parser
 import json
 import os
@@ -15,7 +16,10 @@ import threading
 import unicodedata
 import urllib.request
 import urllib.error
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
+VERSION = "1.0.0"
 API_URL = "http://127.0.0.1:11434/v1/chat/completions"
 API_KEY = None
 MODEL = "local-model"
@@ -24,6 +28,18 @@ MAX_SUBAGENT_DEPTH = 3
 _AGENT_DEPTH = 0
 OUTPUT_INDENT = ""
 CWD = os.getcwd()
+VISION_ENABLED = True
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_REMOTE_BYTES = 10 * 1024 * 1024
+IMAGE_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+}
+_REF_RE = re.compile(r"@\[((?:cwd|file|https?)://[^\]]+)\]")
 SHELL_NOTE = (
     " Commands run in cmd.exe; prefer cross-platform commands (e.g. dir, type, copy, del) over bash-specific syntax."
     if os.name == "nt"
@@ -1562,7 +1578,7 @@ class MCPClient:
             {
                 "protocolVersion": MCP_PROTOCOL_VERSION,
                 "capabilities": {},
-                "clientInfo": {"name": "harnless", "version": "0.1"},
+                "clientInfo": {"name": "harnless", "version": VERSION},
             },
         )
         self._notify("notifications/initialized", {})
@@ -1859,6 +1875,154 @@ def load_agents_md() -> str:
     if len(content) > 20_000:
         content = content[:20_000] + "\n... [truncated]"
     return content
+
+
+# ---------------------------------------------------------------- file references
+
+
+def _content_chars(content) -> int:
+    """Approximate character length of a message content value.
+
+    Handles both plain strings and OpenAI multimodal content (a list of
+    parts) so /status can estimate context usage for either.
+    """
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        total = 0
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            ptype = part.get("type")
+            if ptype == "text":
+                total += len(part.get("text", ""))
+            elif ptype == "image_url":
+                total += len((part.get("image_url") or {}).get("url", ""))
+        return total
+    return 0
+
+
+def _read_local_file(path: str, label: str) -> dict:
+    """Read a local file into a content part (text or image_url)."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in IMAGE_MIME:
+        if not VISION_ENABLED:
+            return {"type": "text", "text": f"[image: {label} (not sent; vision disabled)]"}
+        size = os.path.getsize(path)
+        if size > MAX_IMAGE_BYTES:
+            return {"type": "text", "text": f"[error: image too large ({size} bytes): {label}]"}
+        with open(path, "rb") as f:
+            data = f.read()
+        b64 = base64.b64encode(data).decode("ascii")
+        return {
+            "type": "image_url",
+            "image_url": {"url": f"data:{IMAGE_MIME[ext]};base64,{b64}"},
+        }
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        content = f.read()
+    if len(content) > 50_000:
+        content = content[:50_000] + "\n... [truncated]"
+    return {"type": "text", "text": f"[file: {label}]\n{content}"}
+
+
+def _read_cwd_relative(rel: str) -> dict:
+    """Resolve a cwd:// reference (CWD-relative, sandboxed) to a content part."""
+    try:
+        path = safe_resolve(rel)
+    except ValueError as e:
+        return {"type": "text", "text": f"[error: {e}]"}
+    if not os.path.isfile(path):
+        return {"type": "text", "text": f"[error: file not found: {rel}]"}
+    return _read_local_file(path, rel)
+
+
+def _read_local_uri(uri: str) -> dict:
+    """Resolve a file:// reference (absolute local path) to a content part."""
+    path = url2pathname(urlparse(uri).path)
+    if not os.path.isfile(path):
+        return {"type": "text", "text": f"[error: file not found: {uri}]"}
+    return _read_local_file(path, uri)
+
+
+def _fetch_remote(uri: str) -> dict:
+    """Fetch an http(s):// reference and return a content part (text or image)."""
+    url = uri.replace(" ", "%20")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "harnless/1.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = resp.read(MAX_REMOTE_BYTES + 1)
+            ctype = resp.headers.get_content_type() or ""
+    except Exception as e:
+        return {"type": "text", "text": f"[error: could not fetch {uri}: {e}]"}
+    truncated = len(data) > MAX_REMOTE_BYTES
+    if truncated:
+        data = data[:MAX_REMOTE_BYTES]
+    ext = os.path.splitext(urlparse(uri).path)[1].lower()
+    mime = ctype if ctype.startswith("image/") else IMAGE_MIME.get(ext)
+    if mime:
+        if not VISION_ENABLED:
+            return {"type": "text", "text": f"[image: {uri} (not sent; vision disabled)]"}
+        b64 = base64.b64encode(data).decode("ascii")
+        return {
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{b64}"},
+        }
+    text = data.decode("utf-8", errors="replace")
+    if len(text) > 50_000:
+        text = text[:50_000]
+    if truncated:
+        text += "\n... [truncated]"
+    return {"type": "text", "text": f"[file: {uri}]\n{text}"}
+
+
+def _resolve_uri(uri: str):
+    """Resolve a reference URI to a content part, or None for an unknown scheme."""
+    if uri.startswith("cwd://"):
+        return _read_cwd_relative(uri[len("cwd://"):])
+    if uri.startswith("file://"):
+        return _read_local_uri(uri)
+    if re.match(r"^https?://", uri):
+        return _fetch_remote(uri)
+    return None
+
+
+def expand_file_refs(text: str):
+    """Expand @[uri] file references in text into OpenAI message content.
+
+    Returns the original string when no reference resolves, otherwise a list
+    of content parts (text and image_url) in order. A @[...] token whose
+    scheme is not cwd/file/http(s) is left as literal text.
+    """
+    refs_found = False
+    parts = []
+    last = 0
+    for m in _REF_RE.finditer(text):
+        if m.start() > last:
+            parts.append(("text", text[last:m.start()]))
+        part = _resolve_uri(m.group(1))
+        if part is None:
+            parts.append(("text", m.group(0)))
+        else:
+            refs_found = True
+            parts.append(("part", part))
+        last = m.end()
+    if last < len(text):
+        parts.append(("text", text[last:]))
+    if not refs_found:
+        return text
+    content = []
+    for kind, value in parts:
+        if kind == "text":
+            if value:
+                content.append({"type": "text", "text": value})
+        else:
+            content.append(value)
+    return content
+
+
+def build_user_message(text: str) -> dict:
+    """Build a user message, expanding any @[uri] file references in text."""
+    return {"role": "user", "content": expand_file_refs(text)}
 
 
 # ---------------------------------------------------------------- line editor
@@ -2860,7 +3024,7 @@ def format_status(messages: list, context_window: int = 0) -> str:
     # Tool schemas are sent with every request — a fixed per-request cost.
     total_chars = len(json.dumps(tools))
     for m in messages:
-        total_chars += len(m.get("content") or "")
+        total_chars += _content_chars(m.get("content"))
         total_chars += len(m.get("reasoning_content") or "")
         for tc in m.get("tool_calls") or []:
             total_chars += len((tc.get("function") or {}).get("arguments") or "")
@@ -2886,7 +3050,7 @@ def format_status(messages: list, context_window: int = 0) -> str:
 
 
 def format_help() -> str:
-    """Build the /help report: list of REPL commands."""
+    """Build the /help report: list of REPL commands and file references."""
     return (
         "/new            clear session history and start over\n"
         "/clear-screen   clear the terminal screen\n"
@@ -2894,7 +3058,13 @@ def format_help() -> str:
         "/tools          interactive tool menu: up/down move, space toggle, enter apply, esc cancel\n"
         "/tools <name>   toggle a tool on/off\n"
         "/help           show this help\n"
-        "/exit           quit (alias: /quit)"
+        "/exit           quit (alias: /quit)\n"
+        "\n"
+        "file references (attach a file to your message):\n"
+        "  @[cwd://relative/path]   file relative to the working directory\n"
+        "  @[file:///abs/path]      absolute local file\n"
+        "  @[http(s)://host/file]   remote file\n"
+        "text is inlined; images are sent when the model supports vision"
     )
 
 
@@ -2992,14 +3162,22 @@ def run_agent(
 
 
 def main():
-    global API_URL, API_KEY, MODEL, TEMPERATURE, MAX_SUBAGENT_DEPTH
+    global API_URL, API_KEY, MODEL, TEMPERATURE, MAX_SUBAGENT_DEPTH, VISION_ENABLED
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[reportAttributeAccessIssue]
         except Exception:
             pass
 
-    parser = argparse.ArgumentParser(description="harnless: minimal LLM agent harness")
+    parser = argparse.ArgumentParser(
+        description=f"harnless {VERSION}: minimal LLM agent harness"
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"harnless {VERSION}",
+        help="show the harnless version and exit",
+    )
     parser.add_argument(
         "--api-url",
         default=API_URL,
@@ -3058,6 +3236,11 @@ def main():
         help="use plain ASCII labels instead of emoji icons",
     )
     parser.add_argument(
+        "--no-vision",
+        action="store_true",
+        help="do not send image file references to the model (replace them with a text note); use with text-only models",
+    )
+    parser.add_argument(
         "--mcp-config",
         action="append",
         default=None,
@@ -3085,6 +3268,7 @@ def main():
     MODEL = args.model
     TEMPERATURE = args.temperature
     MAX_SUBAGENT_DEPTH = args.max_subagents
+    VISION_ENABLED = not args.no_vision
 
     context_window = args.context_window
     if context_window == 0 and args.prompt is None:
@@ -3165,16 +3349,17 @@ def main():
     messages = [{"role": "system", "content": system_prompt}]
 
     if args.prompt is not None:
-        print(colorize(f"harnless one-shot in {CWD} (api: {API_URL})", "dim"))
-        messages.append({"role": "user", "content": args.prompt})
+        print(colorize(f"harnless {VERSION} one-shot in {CWD} (api: {API_URL})", "dim"))
+        messages.append(build_user_message(args.prompt))
         sys.exit(run_agent(messages, args.model, temperature=args.temperature))
 
     _history_load()
 
-    print(colorize(f"harnless ready in {CWD} (api: {API_URL})", "dim"))
+    print(colorize(f"harnless {VERSION} ready in {CWD} (api: {API_URL})", "dim"))
     print(
         colorize(
             "type /new to start over, /clear-screen to clear the screen, /status for session info, /tools to toggle tools, /help for commands, /exit to quit\n"
+            "attach files with @[cwd://rel/path], @[file:///abs/path] or @[http(s)://host/file]\n"
             "use up/down arrows to recall previous input\n",
             "dim",
         )
@@ -3220,7 +3405,7 @@ def main():
         if user_input == "/help":
             print(colorize(format_help(), "dim"))
             continue
-        messages.append({"role": "user", "content": user_input})
+        messages.append(build_user_message(user_input))
         run_agent(
             messages, args.model, interactive=True, temperature=args.temperature
         )
