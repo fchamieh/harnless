@@ -1377,6 +1377,19 @@ class TestLineEditor(Base):
         self.assertEqual(line, "01234")
         self.assertTrue(out.endswith("\x1b[2Kyou> 01234\r\n"))
 
+    def test_soft_wrap_then_newline_clears_all_rows(self):
+        # Width 10, prompt "you> " (5 cols): 8 chars wrap to rows 0-1, and a
+        # Ctrl+J newline drops the cursor to row 2. The next keystroke must
+        # clear all three physical rows (move up 2), not just two, or the
+        # stale first line is re-printed on every key.
+        keys = [("char", c) for c in "01234567"] + ["newline", ("char", "x"), "enter"]
+        line, out = self._narrow_edit(keys)
+        self.assertEqual(line, "01234567\nx")
+        self.assertIn(
+            "\x1b[2A\r\x1b[2K\x1b[B\x1b[2K\x1b[B\x1b[2K\x1b[2Ayou> 01234567\nx", out
+        )
+        self.assertTrue(out.endswith("you> 01234567\nx\r\n"))
+
     def test_newline_in_middle_of_line(self):
         keys = [("char", "a"), ("char", "b"), "left", "newline", "enter"]
         self.assertEqual(self.edit(keys)[0], "a\nb")

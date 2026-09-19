@@ -2236,7 +2236,11 @@ def _edit_phys_pos(text: str, prompt_w: int, pos: int, width: int) -> tuple:
                 # has not wrapped yet, so the cursor sits at the last column.
                 return row + total // width - 1, width - 1
             return row + total // width, total % width
-        row += (start + display_width(ln)) // width
+        # Physical rows this logical line occupies: ceiling division (a line
+        # that soft-wraps but doesn't end on a column boundary still takes the
+        # next row), and an empty line still counts as one row.
+        total = start + display_width(ln)
+        row += max(1, (total + width - 1) // width)
         pos -= len(ln) + 1
     return row, 0
 
