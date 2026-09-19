@@ -2346,8 +2346,20 @@ def _edit_line(prompt: str, keys) -> str:
             buf.insert(pos, "\n")
             pos += 1
         elif isinstance(token, tuple) and token[0] == "char":
-            buf.insert(pos, token[1])
-            pos += 1
+            ch = token[1]
+            if ch == "/" and not buf:
+                # Slash on an empty line opens the command menu; a selection
+                # replaces the line, a cancel keeps the typed slash.
+                cmd = commands_menu()
+                if cmd is not None:
+                    buf = list(cmd)
+                    pos = len(buf)
+                else:
+                    buf.insert(pos, ch)
+                    pos += 1
+            else:
+                buf.insert(pos, ch)
+                pos += 1
         render()
     newline()
     return "".join(buf)
@@ -3166,17 +3178,98 @@ def format_status(messages: list, context_window: int = 0) -> str:
     return "\n".join(lines)
 
 
+REPL_COMMANDS = [
+    ("/new", "clear session history and start over"),
+    ("/clear-screen", "clear the terminal screen"),
+    ("/status", "show context usage, api url, and tools"),
+    ("/tools", "interactive tool menu: up/down move, space toggle, enter apply, esc cancel"),
+    ("/help", "show this help"),
+    ("/exit", "quit (alias: /quit)"),
+]
+
+
+def commands_menu(keys=None) -> str | None:
+    """Interactive REPL command menu, opened by typing / on an empty line.
+
+    Up/down move the cursor, enter selects the highlighted command (returned),
+    esc (or ctrl+c/ctrl+d) cancels (returns None). Draws below the prompt
+    line and restores the cursor to it on exit.
+    """
+    names = [name for name, _ in REPL_COMMANDS]
+    descs = [desc for _, desc in REPL_COMMANDS]
+    cursor = 0
+    width = shutil.get_terminal_size((80, 24)).columns
+
+    def build_lines():
+        lines = [colorize("commands — up/down: move, enter: select, esc: cancel", "dim")]
+        for i, name in enumerate(names):
+            if i == cursor:
+                lines.append(colorize(f"> {name}", "tool"))
+            else:
+                lines.append(f"  {name}")
+        desc = descs[cursor]
+        if len(desc) > width - 1:
+            desc = desc[: width - 4] + "..."
+        lines.append(colorize(desc, "dim"))
+        return lines
+
+    drawn = 0
+
+    def draw():
+        nonlocal drawn
+        lines = build_lines()
+        for line in lines:
+            sys.stdout.write("\r\x1b[2K" + line + "\n")
+        if lines:
+            sys.stdout.write(f"\x1b[{len(lines)}A")
+        sys.stdout.flush()
+        drawn = len(lines)
+
+    if keys is None:
+        keys = _iter_keys_windows() if os.name == "nt" else _iter_keys_posix()
+    # Start on the line below the prompt (the cursor sits at its end).
+    sys.stdout.write("\r\n")
+    sys.stdout.flush()
+    draw()
+    try:
+        while True:
+            token = next(keys)
+            if token == "up":
+                cursor = max(0, cursor - 1)
+            elif token == "down":
+                cursor = min(len(names) - 1, cursor + 1)
+            elif token == "enter":
+                return names[cursor]
+            elif token in ("esc", "ctrl_c", "ctrl_d"):
+                return None
+            draw()
+    except StopIteration:
+        return None
+    finally:
+        close = getattr(keys, "close", None)
+        if close is not None:
+            close()
+        if drawn:
+            # Cursor is on the first menu line: clear each menu line, then
+            # return to the prompt line.
+            out = ""
+            for i in range(drawn):
+                out += "\x1b[2K"
+                if i < drawn - 1:
+                    out += "\x1b[B"
+            out += f"\x1b[{drawn}A"
+            sys.stdout.write(out)
+            sys.stdout.flush()
+
+
 def format_help() -> str:
     """Build the /help report: list of REPL commands and file references."""
+    lines = [f"{name:<16} {desc}" for name, desc in REPL_COMMANDS]
+    lines.append(f"{'/tools <name>':<16} toggle a tool on/off")
+    lines.append("Ctrl+J          insert a newline (multi-line input); Enter submits")
     return (
-        "/new            clear session history and start over\n"
-        "/clear-screen   clear the terminal screen\n"
-        "/status         show context usage, api url, and tools\n"
-        "/tools          interactive tool menu: up/down move, space toggle, enter apply, esc cancel\n"
-        "/tools <name>   toggle a tool on/off\n"
-        "/help           show this help\n"
-        "/exit           quit (alias: /quit)\n"
-        "Ctrl+J          insert a newline (multi-line input); Enter submits\n"
+        "\n".join(lines)
+        + "\n"
         "\n"
         "file references (attach a file to your message):\n"
         "  @[cwd://relative/path]   file relative to the working directory\n"
@@ -3476,7 +3569,7 @@ def main():
     print(colorize(f"harnless {VERSION} ready in {CWD} (api: {API_URL})", "dim"))
     print(
         colorize(
-            "type /new to start over, /clear-screen to clear the screen, /status for session info, /tools to toggle tools, /help for commands, /exit to quit\n"
+            "type / for a command menu, /help for all commands, /exit to quit\n"
             "attach files with @[cwd://rel/path], @[file:///abs/path] or @[http(s)://host/file]\n"
             "use up/down arrows to recall previous input, Ctrl+J inserts a newline (multi-line prompt)\n",
             "dim",

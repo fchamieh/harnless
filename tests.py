@@ -1501,6 +1501,36 @@ class TestLineEditor(Base):
         finally:
             sys.stdin = old
 
+    def _patch_menu(self, result):
+        real = h.commands_menu
+        calls = []
+        h.commands_menu = lambda: (calls.append(1), result)[1]
+        self.addCleanup(setattr, h, "commands_menu", real)
+        return calls
+
+    def test_slash_on_empty_line_opens_menu(self):
+        calls = self._patch_menu("/new")
+        line, out = self.edit([("char", "/"), "enter"])
+        self.assertEqual(calls, [1])
+        self.assertEqual(line, "/new")
+        self.assertTrue(out.endswith("you> /new\r\n"))
+
+    def test_slash_menu_selection_is_extensible(self):
+        self._patch_menu("/tools")
+        line, _ = self.edit([("char", "/"), ("char", " "), ("char", "r"), "enter"])
+        self.assertEqual(line, "/tools r")
+
+    def test_slash_menu_cancel_keeps_slash(self):
+        self._patch_menu(None)
+        line, _ = self.edit([("char", "/"), ("char", "n"), ("char", "e"), ("char", "w"), "enter"])
+        self.assertEqual(line, "/new")
+
+    def test_slash_nonempty_line_no_menu(self):
+        calls = self._patch_menu("/new")
+        line, _ = self.edit([("char", "a"), ("char", "/"), "enter"])
+        self.assertEqual(line, "a/")
+        self.assertEqual(calls, [])
+
 
 class TestWindowsKeyMap(unittest.TestCase):
     def first(self, chars):
@@ -2127,6 +2157,65 @@ class TestToolsMenu(unittest.TestCase):
         applied, out = self.menu(["enter"])
         self.assertTrue(applied)
         self.assertIn("[ ] read_file", out)
+
+
+class TestCommandsMenu(unittest.TestCase):
+    def menu(self, keys):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            selected = h.commands_menu(iter(keys))
+        return selected, buf.getvalue()
+
+    def test_enter_selects_first(self):
+        selected, _ = self.menu(["enter"])
+        self.assertEqual(selected, h.REPL_COMMANDS[0][0])
+
+    def test_down_moves_cursor(self):
+        selected, _ = self.menu(["down", "enter"])
+        self.assertEqual(selected, h.REPL_COMMANDS[1][0])
+
+    def test_up_at_top_stays(self):
+        selected, _ = self.menu(["up", "up", "enter"])
+        self.assertEqual(selected, h.REPL_COMMANDS[0][0])
+
+    def test_down_clamps_at_end(self):
+        selected, _ = self.menu(["down"] * (len(h.REPL_COMMANDS) + 5) + ["enter"])
+        self.assertEqual(selected, h.REPL_COMMANDS[-1][0])
+
+    def test_esc_cancels(self):
+        selected, _ = self.menu(["esc"])
+        self.assertIsNone(selected)
+
+    def test_ctrl_c_cancels(self):
+        selected, _ = self.menu(["ctrl_c"])
+        self.assertIsNone(selected)
+
+    def test_ctrl_d_cancels(self):
+        selected, _ = self.menu(["ctrl_d"])
+        self.assertIsNone(selected)
+
+    def test_eof_cancels(self):
+        selected, _ = self.menu([])
+        self.assertIsNone(selected)
+
+    def test_rendering(self):
+        selected, out = self.menu(["enter"])
+        self.assertEqual(selected, "/new")
+        self.assertIn("> /new", out)
+        self.assertIn("/clear-screen", out)
+        self.assertIn("enter: select", out)
+        # The menu starts on the line below the prompt.
+        self.assertTrue(out.startswith("\r\n"))
+
+    def test_exit_clears_menu_lines_and_returns_to_prompt(self):
+        _, out = self.menu(["enter"])
+        n = 1 + len(h.REPL_COMMANDS) + 1  # header + commands + description
+        # On exit each menu line is cleared, then the cursor moves back up
+        # to the prompt line.
+        tail = "\x1b[2K\x1b[B" * (n - 1) + "\x1b[2K" + f"\x1b[{n}A"
+        self.assertTrue(out.endswith(tail))
 
 
 class TestTodo(Base):
