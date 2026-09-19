@@ -740,6 +740,27 @@ def _todo_load():
         TODO_LAST_INJECTED = None
 
 
+def _todo_update_one(args: dict):
+    """Apply a single update (id, plus status and/or text). Returns an error string or None."""
+    if args.get("id") is None:
+        return "error: 'update' requires id"
+    try:
+        tid = int(args["id"])
+    except (TypeError, ValueError):
+        return "error: id must be an integer"
+    item = next((i for i in TODO_ITEMS if i["id"] == tid), None)
+    if item is None:
+        return f"error: no todo with id {tid}"
+    if args.get("text"):
+        item["text"] = args["text"].strip()
+    if args.get("status"):
+        status = args["status"].strip().lower()
+        if status not in ("pending", "in_progress", "done"):
+            return "error: status must be pending, in_progress, or done"
+        item["status"] = status
+    return None
+
+
 def tool_todo(args: dict) -> str:
     global TODO_NEXT_ID
     action = (args.get("action") or "list").strip().lower()
@@ -756,22 +777,18 @@ def tool_todo(args: dict) -> str:
             TODO_ITEMS.append({"id": TODO_NEXT_ID, "text": t, "status": "pending"})
             TODO_NEXT_ID += 1
     elif action == "update":
-        if args.get("id") is None:
-            return "error: 'update' requires id"
-        try:
-            tid = int(args["id"])
-        except (TypeError, ValueError):
-            return "error: id must be an integer"
-        item = next((i for i in TODO_ITEMS if i["id"] == tid), None)
-        if item is None:
-            return f"error: no todo with id {tid}"
-        if args.get("text"):
-            item["text"] = args["text"].strip()
-        if args.get("status"):
-            status = args["status"].strip().lower()
-            if status not in ("pending", "in_progress", "done"):
-                return "error: status must be pending, in_progress, or done"
-            item["status"] = status
+        updates = args.get("updates")
+        if isinstance(updates, list):
+            for u in updates:
+                if not isinstance(u, dict):
+                    return "error: each entry in 'updates' must be an object with an 'id'"
+                err = _todo_update_one(u)
+                if err:
+                    return err
+        else:
+            err = _todo_update_one(args)
+            if err:
+                return err
     elif action == "clear":
         TODO_ITEMS.clear()
     elif action != "list":
@@ -1246,8 +1263,9 @@ TOOLS = {
                 "name": "todo",
                 "description": (
                     "Manage a todo list for tracking multi-step work. Actions: 'add' (items array, or "
-                    "text for a single item) to add items, 'update' (id, plus status and/or text) to "
-                    "change an item, 'list' to show all items, 'clear' to remove all items. The current "
+                    "text for a single item) to add items, 'update' (id, plus status and/or text, or an "
+                    "updates array of such objects) to change item(s), 'list' to show all items, 'clear' "
+                    "to remove all items. The current "
                     "list is re-shown to you automatically after changes. Use it for multi-step tasks: "
                     "add all the steps up front in a single 'add' call, mark each in_progress then done "
                     "as you go."
@@ -1278,6 +1296,28 @@ TOOLS = {
                         "status": {
                             "type": "string",
                             "description": "New status (for update): pending, in_progress, or done",
+                        },
+                        "updates": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {"type": "integer", "description": "Item id"},
+                                    "status": {
+                                        "type": "string",
+                                        "description": "New status: pending, in_progress, or done",
+                                    },
+                                    "text": {
+                                        "type": "string",
+                                        "description": "Replacement text",
+                                    },
+                                },
+                                "required": ["id"],
+                            },
+                            "description": (
+                                "Item updates to apply in one call (for update; preferred over repeated "
+                                "single-item updates)"
+                            ),
                         },
                     },
                     "required": ["action"],

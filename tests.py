@@ -2285,6 +2285,30 @@ class TestTodo(Base):
         self.todo(action="add", text="a")
         self.assertEqual(self.todo(action="update", status="done"), "error: 'update' requires id")
 
+    def test_update_multiple(self):
+        self.todo(action="add", items=["a", "b", "c"])
+        self.assertEqual(
+            self.todo(action="update", updates=[
+                {"id": 1, "status": "done"},
+                {"id": 2, "status": "in_progress", "text": "renamed"},
+            ]),
+            "todo list:\n- [x] 1. a\n- [~] 2. renamed\n- [ ] 3. c")
+
+    def test_update_multiple_bad_id(self):
+        self.todo(action="add", text="a")
+        self.assertEqual(self.todo(action="update", updates=[{"id": 9, "status": "done"}]),
+                         "error: no todo with id 9")
+
+    def test_update_multiple_bad_status(self):
+        self.todo(action="add", text="a")
+        self.assertEqual(self.todo(action="update", updates=[{"id": 1, "status": "nope"}]),
+                         "error: status must be pending, in_progress, or done")
+
+    def test_update_multiple_bad_entry(self):
+        self.todo(action="add", text="a")
+        self.assertEqual(self.todo(action="update", updates=["nope"]),
+                         "error: each entry in 'updates' must be an object with an 'id'")
+
     def test_clear(self):
         self.todo(action="add", text="a")
         self.assertEqual(self.todo(action="clear"), "todo list:\n(empty)")
