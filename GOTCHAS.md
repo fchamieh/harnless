@@ -4,3 +4,5 @@
 - On Python 3.14/Windows, urllib.request.pathname2url returns the path WITHOUT the file:// scheme (e.g. '///X:/...'); prepend 'file://' when building a file:// URI in tests.
 - _edit_line render() must use physical (soft-wrapped) rows via _edit_phys_pos + terminal_width, not logical line counts, or wrapped input reprints the previous line on every key.
 - _edit_phys_pos row accumulation must use ceiling division (max(1,(total+width-1)//width)), not floor — floor undercounts a soft-wrapped line that doesn't end on a column boundary, so prev_row is too small and the first physical line is never cleared (stale line re-prints on every key after a Ctrl+J newline).
+- On Windows, socket.shutdown() does NOT unblock a pending blocking recv on the same socket; socket.close() from another thread does (raises ConnectionAbortedError 10053). Use close() to cancel a blocked stream read.
+- On Python 3.14, urllib/http.client response `resp.fp` is the BufferedReader directly (SocketFile wrapper removed) — use `resp.fp.raw._sock` for the socket, not `resp.fp.fp.raw._sock` (harnless `_response_socket` tries both).

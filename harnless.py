@@ -5,6 +5,7 @@ import argparse
 import atexit
 import base64
 import html.parser
+import http.client
 import json
 import os
 import queue
@@ -13,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import unicodedata
 import urllib.request
 import urllib.error
@@ -29,6 +31,20 @@ _AGENT_DEPTH = 0
 OUTPUT_INDENT = ""
 CWD = os.getcwd()
 VISION_ENABLED = True
+# Double-ESC streaming interrupt: enabled for interactive REPL sessions
+# (set in main()); two ESC presses within this window cancel the stream.
+INTERRUPT_ENABLED = False
+DOUBLE_ESC_WINDOW = 2.0
+# Show a "sending context" progress line while waiting for the LLM's first
+# token, for large requests only (estimated token count, chars/4, including
+# the tool schemas). The line appears CONTEXT_PROGRESS_DELAY seconds in,
+# reports request-body upload progress (percent + tokens sent so far) while
+# the payload is being sent, then the elapsed wait. Active only on a TTY.
+CONTEXT_PROGRESS_THRESHOLD = 30_000
+CONTEXT_PROGRESS_DELAY = 1.0
+# Chunk size the counting opener writes the request body in, so upload
+# progress is observable (http.client would otherwise sendall() it at once).
+PROGRESS_CHUNK = 64 * 1024
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_REMOTE_BYTES = 10 * 1024 * 1024
 # Server-reported token usage per conversation, keyed by id(messages).
@@ -78,6 +94,7 @@ ICONS = {
     "result": "↳",
     "exit": "🏁",
     "error": "⚠️",
+    "wait": "⏳",
 }
 ASCII_ICONS = {
     "user": "you",
@@ -87,6 +104,7 @@ ASCII_ICONS = {
     "result": "out",
     "exit": "exit",
     "error": "err",
+    "wait": "wait",
 }
 
 
@@ -2125,45 +2143,62 @@ def _history_add(entry: str):
     _history_save()
 
 
+_WINDOWS_EXT_MAP = {
+    "H": "up",
+    "P": "down",
+    "K": "left",
+    "M": "right",
+    "G": "home",
+    "O": "end",
+    "R": "ignore",
+    "S": "delete",
+    "I": "ignore",
+    "Q": "ignore",
+}
+
+
+def _windows_key_token(getwch):
+    """Read one key via getwch and return its token."""
+    ch = getwch()
+    if ch in ("\x00", "\xe0"):
+        return _WINDOWS_EXT_MAP.get(getwch(), "ignore")
+    if ch == "\r":
+        return "enter"
+    if ch == "\n":
+        return "newline"
+    if ch == "\x08":
+        return "backspace"
+    if ch == "\x03":
+        return "ctrl_c"
+    if ch == "\x04":
+        return "ctrl_d"
+    if ch == "\x15":
+        return "ctrl_u"
+    if ch == "\x1b":
+        return "esc"
+    if ch == "\t" or ord(ch) < 32:
+        return "ignore"
+    return ("char", ch)
+
+
 def _iter_keys_windows():
     """Yield key tokens from the Windows console via msvcrt."""
     import msvcrt
 
-    ext_map = {
-        "H": "up",
-        "P": "down",
-        "K": "left",
-        "M": "right",
-        "G": "home",
-        "O": "end",
-        "R": "ignore",
-        "S": "delete",
-        "I": "ignore",
-        "Q": "ignore",
-    }
     while True:
-        ch = msvcrt.getwch()
-        if ch in ("\x00", "\xe0"):
-            code = msvcrt.getwch()
-            yield ext_map.get(code, "ignore")
-        elif ch == "\r":
-            yield "enter"
-        elif ch == "\n":
-            yield "newline"
-        elif ch == "\x08":
-            yield "backspace"
-        elif ch == "\x03":
-            yield "ctrl_c"
-        elif ch == "\x04":
-            yield "ctrl_d"
-        elif ch == "\x15":
-            yield "ctrl_u"
-        elif ch == "\x1b":
-            yield "esc"
-        elif ch == "\t" or ord(ch) < 32:
-            yield "ignore"
-        else:
-            yield ("char", ch)
+        yield _windows_key_token(msvcrt.getwch)
+
+
+def _iter_keys_windows_poll(stop_event):
+    """Like _iter_keys_windows, but polls kbhit() so the reader thread can
+    be stopped without a keypress."""
+    import msvcrt
+
+    while not stop_event.is_set():
+        if not msvcrt.kbhit():
+            time.sleep(0.02)
+            continue
+        yield _windows_key_token(msvcrt.getwch)
 
 
 def _parse_csi_seq(read_char):
@@ -2257,6 +2292,313 @@ def _iter_keys_posix():
                 yield ("char", ch)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)  # type: ignore[reportAttributeAccessIssue]
+
+
+def _iter_keys_posix_poll(stop_event):
+    """Like _iter_keys_posix, but polls with select() so the reader thread
+    can be stopped without a keypress."""
+    import select
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)  # type: ignore[reportAttributeAccessIssue]
+
+    def read_char():
+        b = os.read(fd, 1)
+        if not b:
+            return None
+        first = b[0]
+        if first < 0x80:
+            return chr(first)
+        if first >= 0xF0:
+            n = 4
+        elif first >= 0xE0:
+            n = 3
+        elif first >= 0xC0:
+            n = 2
+        else:
+            return chr(first)
+        rest = b""
+        for _ in range(n - 1):
+            rest += os.read(fd, 1)
+        return (b + rest).decode("utf-8", errors="replace")
+
+    try:
+        tty.setraw(fd)  # type: ignore[reportAttributeAccessIssue]
+        while not stop_event.is_set():
+            ready, _, _ = select.select([fd], [], [], 0.05)
+            if not ready:
+                continue
+            ch = read_char()
+            if ch is None:
+                yield "ctrl_d"
+                return
+            if ch == "\x1b":
+                # A bare ESC has no following bytes; an escape sequence does.
+                ready, _, _ = select.select([fd], [], [], 0.05)
+                if not ready:
+                    yield "esc"
+                    continue
+                seq = read_char()
+                if seq == "[":
+                    yield _parse_csi_seq(read_char)
+                else:
+                    yield "ignore"
+            elif ch == "\r":
+                yield "enter"
+            elif ch == "\n":
+                yield "newline"
+            elif ch in ("\x7f", "\x08"):
+                yield "backspace"
+            elif ch == "\x03":
+                yield "ctrl_c"
+            elif ch == "\x04":
+                yield "ctrl_d"
+            elif ch == "\x15":
+                yield "ctrl_u"
+            elif ch == "\t" or ord(ch) < 32:
+                yield "ignore"
+            else:
+                yield ("char", ch)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)  # type: ignore[reportAttributeAccessIssue]
+
+
+def _iter_keys_interrupt(stop_event):
+    """Yield key tokens, polling so the reader thread can be stopped."""
+    if os.name == "nt":
+        yield from _iter_keys_windows_poll(stop_event)
+    else:
+        yield from _iter_keys_posix_poll(stop_event)
+
+
+def check_double_esc(state: dict, token, now: float) -> bool:
+    """Track ESC presses in `state` ({"last_esc": float}).
+
+    Returns True when a second ESC arrives within DOUBLE_ESC_WINDOW seconds
+    of the first; any other key resets the wait.
+    """
+    if token == "esc":
+        if now - state["last_esc"] < DOUBLE_ESC_WINDOW:
+            return True
+        state["last_esc"] = now
+    else:
+        state["last_esc"] = 0.0
+    return False
+
+
+class StreamInterrupted(Exception):
+    """The user interrupted a streaming response (double ESC)."""
+
+    def __init__(self, message: dict):
+        super().__init__("stream interrupted")
+        self.message = message  # the partial assistant message
+
+
+def _response_socket(resp):
+    """Best-effort: the underlying socket of a urllib response (for shutdown).
+
+    Older Pythons wrap the socket in a SocketFile (resp.fp.fp.raw._sock);
+    Python 3.14+ removed it, so resp.fp is the BufferedReader directly
+    (resp.fp.raw._sock). Try both layouts.
+    """
+    for attr in ("fp.fp.raw._sock", "fp.raw._sock"):
+        try:
+            obj = resp
+            for part in attr.split("."):
+                obj = getattr(obj, part)
+            return obj
+        except AttributeError:
+            continue
+    return None
+
+
+class InterruptWatcher:
+    """Watches stdin on a background thread while a stream is in flight.
+
+    Two ESC presses within DOUBLE_ESC_WINDOW seconds cancel the stream:
+    the attached socket is closed so the main thread's blocked send or
+    read unblocks, and `triggered` is set for the stream loop to check.
+    The upload socket is attached while the request body is being sent
+    (see _open_request's on_socket), so an interrupt can also abort the
+    context send itself.
+    """
+
+    def __init__(self):
+        self._stop = threading.Event()
+        self._sock = None
+        self._sock_lock = threading.Lock()
+        self._thread = None
+        self.triggered = False
+        # Called after the "press esc again" hint is printed (the hint adds
+        # 2 lines below any progress line; the spinner uses this to clear
+        # the right line on stop).
+        self.on_hint = None
+
+    def attach_socket(self, sock):
+        with self._sock_lock:
+            self._sock = sock
+
+    def start(self):
+        if not sys.stdin.isatty():
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        thread = self._thread
+        self._thread = None
+        if (
+            thread is not None
+            and thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
+            thread.join(timeout=0.5)
+
+    def _cancel(self):
+        self.triggered = True
+        with self._sock_lock:
+            sock = self._sock
+        if sock is not None:
+            # close() (not shutdown()) unblocks a pending recv on Windows;
+            # the stream loop swallows the resulting read error.
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _run(self):
+        state = {"last_esc": 0.0}
+        hinted = False
+        for token in _iter_keys_interrupt(self._stop):
+            if check_double_esc(state, token, time.monotonic()):
+                self._cancel()
+                return
+            if token == "esc" and not hinted:
+                hinted = True
+                sys.stdout.write(
+                    "\n" + colorize("press esc again to interrupt", "dim") + "\n"
+                )
+                sys.stdout.flush()
+                if self.on_hint is not None:
+                    self.on_hint()
+
+
+def _format_tokens(n: int) -> str:
+    """Compact token count: 999, 1.5k, 2.3M."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}k"
+    return str(n)
+
+
+def _format_elapsed(seconds: float) -> str:
+    """Elapsed time: 5s, 1m05s."""
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    m, s = divmod(int(seconds), 60)
+    return f"{m}m{s:02d}s"
+
+
+class ContextProgress:
+    """Shows a "sending context" progress line while waiting for the LLM's
+    first token, for large requests only (estimated >= CONTEXT_PROGRESS_THRESHOLD
+    tokens). The line appears CONTEXT_PROGRESS_DELAY seconds in, reports the
+    request-body upload (percent + tokens sent so far) while it is in flight,
+    then the elapsed wait, and is cleared when the wait ends.
+
+    Only active when stdout is a TTY. If lines are printed below the progress
+    line (e.g. the double-ESC hint), the line freezes so a redraw can't
+    clobber them, and stop() clears the right line.
+    """
+
+    def __init__(self, messages: list, interactive: bool = False):
+        self.tokens = estimate_context_tokens(messages, interactive)
+        self.upload = None  # _UploadProgress, set by _open_request before sending
+        self._stop = threading.Event()
+        self._thread = None
+        self._drawn = False
+        self._hint_before = False
+        self._lock = threading.Lock()
+        self._t0 = time.monotonic()
+        self.extra_lines = 0  # lines printed below the progress line
+
+    @property
+    def active(self) -> bool:
+        return self._thread is not None
+
+    def start(self):
+        if self.tokens < CONTEXT_PROGRESS_THRESHOLD:
+            return
+        if not sys.stdout.isatty():
+            return
+        self._t0 = time.monotonic()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        thread = self._thread
+        self._thread = None
+        if (
+            thread is not None
+            and thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
+            thread.join(timeout=2.0)
+        with self._lock:
+            if self._drawn:
+                self._drawn = False
+                if not self._hint_before and self.extra_lines:
+                    # lines were printed below us (e.g. the esc hint): move
+                    # back up to the progress line before clearing it
+                    sys.stdout.write(f"\x1b[{self.extra_lines}A")
+                sys.stdout.write("\r\x1b[2K")
+                sys.stdout.flush()
+
+    def note_lines_below(self, n: int):
+        """Called when `n` lines are printed below the progress line."""
+        self.extra_lines += n
+
+    def _run(self):
+        if self._stop.wait(CONTEXT_PROGRESS_DELAY):
+            return
+        with self._lock:
+            self._hint_before = self.extra_lines > 0
+            self._drawn = True
+            sys.stdout.write(self._line())
+            sys.stdout.flush()
+        while not self._stop.is_set():
+            if self._stop.wait(0.5):
+                return
+            if self.extra_lines:
+                # something was printed below us (e.g. the esc hint); freeze
+                # the line so the redraw can't clobber it
+                continue
+            with self._lock:
+                sys.stdout.write("\r\x1b[2K" + self._line())
+                sys.stdout.flush()
+
+    def _line(self) -> str:
+        elapsed = _format_elapsed(time.monotonic() - self._t0)
+        upload = self.upload
+        if upload is None or upload.sent >= upload.total:
+            text = (
+                f"{icon('wait')} waiting for first token "
+                f"({_format_tokens(self.tokens)} tokens) {elapsed}"
+            )
+        else:
+            pct = upload.sent * 100 // upload.total
+            sent_tokens = self.tokens * upload.sent // upload.total
+            text = (
+                f"{icon('wait')} sending context… {pct}% "
+                f"({_format_tokens(sent_tokens)}/{_format_tokens(self.tokens)} tokens) "
+                f"{elapsed}"
+            )
+        return OUTPUT_INDENT + colorize(text, "dim")
 
 
 def _edit_phys_pos(text: str, prompt_w: int, pos: int, width: int) -> tuple:
@@ -2486,6 +2828,75 @@ def _record_usage(messages: list, usage) -> None:
         USAGE_BY_CONV[id(messages)] = usage
 
 
+class _UploadProgress:
+    """Bytes-sent counter for a request body (updated by the counting opener)."""
+
+    def __init__(self, total: int):
+        self.total = total
+        self.sent = 0
+        self.on_socket = None  # called with the connection socket once open
+
+    def add(self, n: int):
+        self.sent = min(self.total, self.sent + n)
+
+
+def _progress_opener(upload: _UploadProgress) -> urllib.request.OpenerDirector:
+    """A urllib opener whose HTTP(S) connections report body upload progress.
+
+    Large writes are sent in PROGRESS_CHUNK pieces (http.client would
+    otherwise sendall() the whole body at once, so no progress would be
+    observable). All other urllib behavior (proxies, redirects, https,
+    timeouts) is unchanged.
+    """
+
+    def make_handler(base):
+        class Handler(base):
+            # Before the stock HTTP/HTTPS handlers (order 500) so ours wins.
+            handler_order = 499
+
+            def do_open(self, http_class, request, **kwargs):
+                class Counting(http_class):
+                    def connect(self):
+                        super().connect()
+                        # Report the socket as soon as it exists so a
+                        # double ESC can close it to abort the send.
+                        if upload.on_socket is not None:
+                            upload.on_socket(self.sock)
+
+                    def send(self, data):
+                        total = len(data)
+                        if total <= PROGRESS_CHUNK:
+                            return super().send(data)
+                        mv = memoryview(data)
+                        for i in range(0, total, PROGRESS_CHUNK):
+                            piece = bytes(mv[i : i + PROGRESS_CHUNK])
+                            super().send(piece)
+                            upload.add(len(piece))
+
+                return super(Handler, self).do_open(Counting, request, **kwargs)
+
+        return Handler()
+
+    opener = urllib.request.build_opener()
+    opener.add_handler(make_handler(urllib.request.HTTPHandler))
+    opener.add_handler(make_handler(urllib.request.HTTPSHandler))
+    return opener
+
+
+def _open_request(req: urllib.request.Request, progress=None, on_socket=None):
+    """urlopen `req`; if `progress` (a ContextProgress) is given, track the
+    request-body upload in it (progress.upload is set before sending); if
+    `on_socket` is given it is called with the connection socket once open,
+    so an interrupt can close it to abort the send."""
+    if progress is None and on_socket is None:
+        return urllib.request.urlopen(req, timeout=600)
+    upload = _UploadProgress(len(req.data or b""))
+    if progress is not None:
+        progress.upload = upload
+    upload.on_socket = on_socket
+    return _progress_opener(upload).open(req, timeout=600)
+
+
 def chat(
     messages: list, model: str, interactive: bool = False, temperature: float = 0.2
 ) -> dict:
@@ -2499,8 +2910,13 @@ def chat(
         }
     ).encode("utf-8")
     req = urllib.request.Request(API_URL, data=payload, headers=_headers())
-    with urllib.request.urlopen(req, timeout=600) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    spinner = ContextProgress(messages, interactive)
+    spinner.start()
+    try:
+        with _open_request(req, spinner if spinner.active else None) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    finally:
+        spinner.stop()
     _record_usage(messages, data.get("usage"))
     return data
 
@@ -2555,23 +2971,54 @@ def parse_sse_line(line: str):
 
 
 def stream_chat(
-    messages: list, model: str, interactive: bool = False, temperature: float = 0.2
+    messages: list,
+    model: str,
+    interactive: bool = False,
+    temperature: float = 0.2,
+    watcher=None,
+    progress=None,
 ):
-    """Yield deltas from a streaming chat response until [DONE]."""
+    """Yield deltas from a streaming chat response until [DONE].
+
+    If `watcher` (an InterruptWatcher) is given, the connection and response
+    sockets are attached to it and the stream stops once it is triggered: a
+    double ESC during the request-body upload closes the upload socket and
+    aborts the send. If `progress` (a ContextProgress) is given, the
+    request-body upload is tracked in it.
+    """
     req = _build_request(
         messages, model, stream=True, interactive=interactive, temperature=temperature
     )
-    with urllib.request.urlopen(req, timeout=600) as resp:
-        for raw in resp:
-            parsed = parse_sse_line(raw.decode("utf-8"))
-            if parsed is None:
-                continue
-            if parsed == "[DONE]":
-                break
-            if "usage" in parsed:
-                _record_usage(messages, parsed["usage"])
-                continue
-            yield parsed
+    try:
+        resp_cm = _open_request(req, progress, watcher.attach_socket if watcher else None)
+    except (OSError, http.client.HTTPException):
+        # An interrupt during the context send closes the socket, which
+        # surfaces as a send error; swallow it only when the interrupt
+        # caused it.
+        if watcher is None or not watcher.triggered:
+            raise
+        return
+    with resp_cm as resp:
+        if watcher is not None:
+            watcher.attach_socket(_response_socket(resp))
+        try:
+            for raw in resp:
+                if watcher is not None and watcher.triggered:
+                    break
+                parsed = parse_sse_line(raw.decode("utf-8"))
+                if parsed is None:
+                    continue
+                if parsed == "[DONE]":
+                    break
+                if "usage" in parsed:
+                    _record_usage(messages, parsed["usage"])
+                    continue
+                yield parsed
+        except (OSError, http.client.HTTPException):
+            # An interrupt closes the socket, which surfaces as a read
+            # error here; swallow it only when the interrupt caused it.
+            if watcher is None or not watcher.triggered:
+                raise
 
 
 def accumulate_delta(message: dict, delta: dict) -> dict:
@@ -2982,40 +3429,72 @@ def stream_once(
 
     Returns (message, streamed) where streamed is False if no deltas
     arrived (e.g. server ignored stream mode) — caller should fall back.
+    Raises StreamInterrupted (carrying the partial message) if the user
+    interrupts with a double ESC.
     """
     message = {"role": "assistant"}
     started_reasoning = False
     renderer = None
     streamed = False
-    for delta in stream_chat(
-        messages, model, interactive=interactive, temperature=temperature
-    ):
-        streamed = True
-        reasoning = delta.get("reasoning_content")
-        if reasoning:
-            if not started_reasoning:
-                print(
-                    OUTPUT_INDENT
-                    + colorize(f"{icon('thinking')} thinking: ", "thinking"),
-                    end="",
-                    flush=True,
-                )
-                started_reasoning = True
-            print(reasoning, end="", flush=True)
-        content = delta.get("content")
-        if content:
-            if renderer is None:
-                if started_reasoning:
-                    print()
-                label = f"{icon('assistant')} assistant> "
-                print(
-                    OUTPUT_INDENT + colorize(label, "assistant"),
-                    end="",
-                    flush=True,
-                )
-                renderer = MarkdownRenderer(indent=display_width(OUTPUT_INDENT + label))
-            renderer.write(content)
-        accumulate_delta(message, delta)
+    watcher = InterruptWatcher() if INTERRUPT_ENABLED else None
+    if watcher is not None:
+        watcher.start()
+    spinner = ContextProgress(messages, interactive)
+    spinner.start()
+    if watcher is not None:
+        # the esc hint prints 2 lines below the progress line; tell the
+        # spinner so it can clear the right line on stop
+        watcher.on_hint = lambda: spinner.note_lines_below(2)
+    try:
+        for delta in stream_chat(
+            messages,
+            model,
+            interactive=interactive,
+            temperature=temperature,
+            watcher=watcher,
+            progress=spinner if spinner.active else None,
+        ):
+            spinner.stop()
+            streamed = True
+            reasoning = delta.get("reasoning_content")
+            if reasoning:
+                if not started_reasoning:
+                    print(
+                        OUTPUT_INDENT
+                        + colorize(f"{icon('thinking')} thinking: ", "thinking"),
+                        end="",
+                        flush=True,
+                    )
+                    started_reasoning = True
+                print(reasoning, end="", flush=True)
+            content = delta.get("content")
+            if content:
+                if renderer is None:
+                    if started_reasoning:
+                        print()
+                    label = f"{icon('assistant')} assistant> "
+                    print(
+                        OUTPUT_INDENT + colorize(label, "assistant"),
+                        end="",
+                        flush=True,
+                    )
+                    renderer = MarkdownRenderer(
+                        indent=display_width(OUTPUT_INDENT + label)
+                    )
+                renderer.write(content)
+            accumulate_delta(message, delta)
+    finally:
+        if watcher is not None:
+            watcher.stop()
+        spinner.stop()
+    if watcher is not None and watcher.triggered:
+        if started_reasoning:
+            print()
+        if renderer is not None:
+            renderer.flush()
+            print()
+        print(OUTPUT_INDENT + colorize("(interrupted)", "dim"))
+        raise StreamInterrupted(message)
     if started_reasoning:
         print()
     if renderer is not None:
@@ -3177,16 +3656,31 @@ def tools_menu(keys=None) -> bool:
             sys.stdout.flush()
 
 
+def estimate_context_chars(messages: list, interactive: bool = False) -> int:
+    """Approximate character count of the next request payload.
+
+    Counts the tool schemas (sent with every request) plus all message
+    content (text, reasoning, tool-call arguments). Dividing by 4 gives a
+    rough token estimate — the same heuristic /status uses.
+    """
+    total = len(json.dumps(_active_tools(interactive)))
+    for m in messages:
+        total += _content_chars(m.get("content"))
+        total += len(m.get("reasoning_content") or "")
+        for tc in m.get("tool_calls") or []:
+            total += len((tc.get("function") or {}).get("arguments") or "")
+    return total
+
+
+def estimate_context_tokens(messages: list, interactive: bool = False) -> int:
+    """Rough token count of the next request (chars/4)."""
+    return estimate_context_chars(messages, interactive) // 4
+
+
 def format_status(messages: list, context_window: int = 0) -> str:
     """Build the /status report: context usage, API URL, tool names, MCP servers."""
     tools = _active_tools(True)
-    # Tool schemas are sent with every request — a fixed per-request cost.
-    total_chars = len(json.dumps(tools))
-    for m in messages:
-        total_chars += _content_chars(m.get("content"))
-        total_chars += len(m.get("reasoning_content") or "")
-        for tc in m.get("tool_calls") or []:
-            total_chars += len((tc.get("function") or {}).get("arguments") or "")
+    total_chars = estimate_context_chars(messages, interactive=True)
     approx_tokens = total_chars // 4
     usage = USAGE_BY_CONV.get(id(messages))
     prompt_tokens = (
@@ -3307,6 +3801,7 @@ def format_help() -> str:
     lines = [f"{name:<16} {desc}" for name, desc in REPL_COMMANDS]
     lines.append(f"{'/tools <name>':<16} toggle a tool on/off")
     lines.append("Ctrl+J          insert a newline (multi-line input); Enter submits")
+    lines.append(f"{'esc esc':<16} interrupt generation (press twice within 2 s)")
     return (
         "\n".join(lines)
         + "\n"
@@ -3340,6 +3835,15 @@ def run_agent(
             )
             if not streamed:
                 message = None
+        except StreamInterrupted as e:
+            # Keep the partial output (minus any half-formed tool calls,
+            # which would leave the conversation in an invalid state) so
+            # the model can see what it had said, then back out.
+            message = e.message
+            message.pop("tool_calls", None)
+            if message.get("content") or message.get("reasoning_content"):
+                messages.append(message)
+            return 0
         except (urllib.error.URLError, ConnectionError, OSError) as e:
             print(
                 OUTPUT_INDENT
@@ -3414,6 +3918,7 @@ def run_agent(
 
 def main():
     global API_URL, API_KEY, MODEL, TEMPERATURE, MAX_SUBAGENT_DEPTH, VISION_ENABLED
+    global INTERRUPT_ENABLED
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[reportAttributeAccessIssue]
@@ -3606,15 +4111,17 @@ def main():
 
     _history_load()
 
+    INTERRUPT_ENABLED = sys.stdin.isatty()
+
     print(colorize(f"harnless {VERSION} ready in {CWD} (api: {API_URL})", "dim"))
-    print(
-        colorize(
-            "type / for a command menu, /help for all commands, /exit to quit\n"
-            "attach files with @[cwd://rel/path], @[file:///abs/path] or @[http(s)://host/file]\n"
-            "use up/down arrows to recall previous input, Ctrl+J inserts a newline (multi-line prompt)\n",
-            "dim",
-        )
+    banner = (
+        "type / for a command menu, /help for all commands, /exit to quit\n"
+        "attach files with @[cwd://rel/path], @[file:///abs/path] or @[http(s)://host/file]\n"
+        "use up/down arrows to recall previous input, Ctrl+J inserts a newline (multi-line prompt)\n"
     )
+    if INTERRUPT_ENABLED:
+        banner += "press esc twice (within 2 s) to interrupt generation\n"
+    print(colorize(banner, "dim"))
 
     while True:
         try:

@@ -8,8 +8,10 @@ import json
 import os
 import shutil
 import sys
+import time
 import unittest
 import urllib.error
+import urllib.request
 from unittest import mock
 from urllib.request import pathname2url
 
@@ -2912,6 +2914,491 @@ class TestNoVisionCli(Base):
             timeout=60,
         )
         self.assertEqual(proc.returncode, 0)
+
+
+class TestInterrupt(Base):
+    class _RespAfterError:
+        """Yields the given lines, then raises ConnectionResetError (like a
+        socket shutdown mid-stream)."""
+
+        def __init__(self, lines):
+            self._it = iter(lines)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            try:
+                return next(self._it)
+            except StopIteration:
+                raise ConnectionResetError("socket shut down")
+
+    def test_check_double_esc_within_window(self):
+        state = {"last_esc": 0.0}
+        self.assertFalse(h.check_double_esc(state, "esc", 10.0))
+        self.assertTrue(h.check_double_esc(state, "esc", 11.5))
+
+    def test_check_double_esc_outside_window(self):
+        state = {"last_esc": 0.0}
+        self.assertFalse(h.check_double_esc(state, "esc", 10.0))
+        self.assertFalse(h.check_double_esc(state, "esc", 12.1))
+        self.assertTrue(h.check_double_esc(state, "esc", 13.0))
+
+    def test_check_double_esc_other_key_resets(self):
+        state = {"last_esc": 0.0}
+        self.assertFalse(h.check_double_esc(state, "esc", 10.0))
+        self.assertFalse(h.check_double_esc(state, ("char", "a"), 10.5))
+        self.assertFalse(h.check_double_esc(state, "esc", 11.0))
+        self.assertTrue(h.check_double_esc(state, "esc", 11.5))
+
+    def test_stream_chat_breaks_when_triggered(self):
+        lines = [
+            b'data: {"choices":[{"delta":{"content":"hi"}}]}\n',
+            b'data: {"choices":[{"delta":{"content":"there"}}]}\n',
+        ]
+
+        class FakeResp:
+            """Yields the lines; the interrupt lands while the 2nd is read."""
+
+            def __init__(self, lines, watcher):
+                self._it = iter(lines)
+                self._watcher = watcher
+                self._first = True
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                line = next(self._it)
+                if self._first:
+                    self._first = False
+                else:
+                    self._watcher.triggered = True
+                return line
+
+        watcher = h.InterruptWatcher()
+        with mock.patch.object(
+            h, "_open_request", return_value=FakeResp(lines, watcher)
+        ):
+            msgs = [{"role": "user", "content": "hi"}]
+            deltas = list(h.stream_chat(msgs, "m", watcher=watcher))
+        self.assertEqual(deltas, [{"content": "hi"}])
+
+    def test_stream_chat_swallows_read_error_when_triggered(self):
+        lines = [b'data: {"choices":[{"delta":{"content":"hi"}}]}\n']
+
+        class RespInterruptedMidRead(self._RespAfterError):
+            """The socket shutdown surfaces as a read error on the 2nd line."""
+
+            def __init__(self, lines, watcher):
+                super().__init__(lines)
+                self._watcher = watcher
+                self._first = True
+
+            def __next__(self):
+                if self._first:
+                    self._first = False
+                    return super().__next__()
+                self._watcher.triggered = True
+                raise ConnectionResetError("socket shut down")
+
+        watcher = h.InterruptWatcher()
+        with mock.patch.object(
+            h, "_open_request", return_value=RespInterruptedMidRead(lines, watcher)
+        ):
+            msgs = [{"role": "user", "content": "hi"}]
+            deltas = list(h.stream_chat(msgs, "m", watcher=watcher))
+        self.assertEqual(deltas, [{"content": "hi"}])
+
+    def test_stream_chat_raises_read_error_without_watcher(self):
+        lines = [b'data: {"choices":[{"delta":{"content":"hi"}}]}\n']
+        with mock.patch.object(
+            h.urllib.request, "urlopen", return_value=self._RespAfterError(lines)
+        ):
+            msgs = [{"role": "user", "content": "hi"}]
+            with self.assertRaises(ConnectionResetError):
+                list(h.stream_chat(msgs, "m"))
+
+    def test_stream_chat_swallows_send_error_when_triggered(self):
+        """A double ESC during the context send aborts the upload; the
+        resulting send error is swallowed and the stream ends with no deltas."""
+        import socket
+
+        a, b = socket.socketpair()
+        watcher = h.InterruptWatcher()
+
+        def fake_open(req, progress=None, on_socket=None):
+            # the opener reports the connection socket, then the interrupt
+            # lands: the watcher closes the socket and the send fails
+            on_socket(b)
+            watcher.triggered = True
+            b.close()
+            raise ConnectionResetError("socket closed during send")
+
+        try:
+            with mock.patch.object(h, "_open_request", side_effect=fake_open):
+                msgs = [{"role": "user", "content": "hi"}]
+                deltas = list(h.stream_chat(msgs, "m", watcher=watcher))
+            self.assertEqual(deltas, [])
+            self.assertTrue(watcher.triggered)
+        finally:
+            a.close()
+
+    def test_stream_chat_raises_send_error_without_trigger(self):
+        with mock.patch.object(
+            h, "_open_request", side_effect=ConnectionResetError("socket closed")
+        ):
+            msgs = [{"role": "user", "content": "hi"}]
+            with self.assertRaises(ConnectionResetError):
+                list(h.stream_chat(msgs, "m", watcher=h.InterruptWatcher()))
+
+    def test_stream_once_interrupt_raises_with_partial(self):
+        class FakeWatcher:
+            def __init__(self):
+                self.triggered = False
+
+            def start(self):
+                self.triggered = True
+
+            def stop(self):
+                pass
+
+            def attach_socket(self, sock):
+                pass
+
+        def fake_stream_chat(messages, model, interactive=False, temperature=0.2, watcher=None, progress=None):
+            yield {"content": "partial"}
+
+        old_enabled = h.INTERRUPT_ENABLED
+        old_watcher = h.InterruptWatcher
+        old_chat = h.stream_chat
+        h.INTERRUPT_ENABLED = True
+        h.InterruptWatcher = FakeWatcher
+        h.stream_chat = fake_stream_chat
+        self.addCleanup(setattr, h, "INTERRUPT_ENABLED", old_enabled)
+        self.addCleanup(setattr, h, "InterruptWatcher", old_watcher)
+        self.addCleanup(setattr, h, "stream_chat", old_chat)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaises(h.StreamInterrupted) as cm:
+                h.stream_once([{"role": "user", "content": "go"}], "m")
+        self.assertEqual(cm.exception.message.get("content"), "partial")
+        self.assertIn("(interrupted)", buf.getvalue())
+
+    def test_stream_once_interrupt_before_any_delta(self):
+        """A double ESC during the context send (before the first delta)
+        interrupts the turn with an empty partial message."""
+
+        class FakeWatcher:
+            def __init__(self):
+                self.triggered = True
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+            def attach_socket(self, sock):
+                pass
+
+        def fake_stream_chat(messages, model, interactive=False, temperature=0.2, watcher=None, progress=None):
+            yield from ()
+
+        old_enabled = h.INTERRUPT_ENABLED
+        old_watcher = h.InterruptWatcher
+        old_chat = h.stream_chat
+        h.INTERRUPT_ENABLED = True
+        h.InterruptWatcher = FakeWatcher
+        h.stream_chat = fake_stream_chat
+        self.addCleanup(setattr, h, "INTERRUPT_ENABLED", old_enabled)
+        self.addCleanup(setattr, h, "InterruptWatcher", old_watcher)
+        self.addCleanup(setattr, h, "stream_chat", old_chat)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaises(h.StreamInterrupted) as cm:
+                h.stream_once([{"role": "user", "content": "go"}], "m")
+        self.assertNotIn("content", cm.exception.message)
+        self.assertIn("(interrupted)", buf.getvalue())
+
+    def test_run_agent_interrupt_keeps_partial_strips_tool_calls(self):
+        def fake_stream_once(messages, model, interactive=False, temperature=0.2):
+            raise h.StreamInterrupted(
+                {
+                    "role": "assistant",
+                    "content": "partial answer",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": '{"path": '},
+                        }
+                    ],
+                }
+            )
+
+        old = h.stream_once
+        h.stream_once = fake_stream_once
+        self.addCleanup(setattr, h, "stream_once", old)
+        messages = [{"role": "user", "content": "go"}]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = h.run_agent(messages, "m")
+        self.assertEqual(code, 0)
+        self.assertEqual(messages[-1], {"role": "assistant", "content": "partial answer"})
+
+    def test_run_agent_interrupt_empty_appends_nothing(self):
+        def fake_stream_once(messages, model, interactive=False, temperature=0.2):
+            raise h.StreamInterrupted({"role": "assistant"})
+
+        old = h.stream_once
+        h.stream_once = fake_stream_once
+        self.addCleanup(setattr, h, "stream_once", old)
+        messages = [{"role": "user", "content": "go"}]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = h.run_agent(messages, "m")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(messages), 1)
+
+    def test_watcher_start_noop_without_tty(self):
+        if sys.stdin.isatty():
+            self.skipTest("stdin is a tty")
+        watcher = h.InterruptWatcher()
+        watcher.start()
+        self.assertIsNone(watcher._thread)
+        watcher.stop()
+
+
+class TestContextProgress(unittest.TestCase):
+    def _big_messages(self):
+        # Well over CONTEXT_PROGRESS_THRESHOLD tokens (chars/4).
+        return [{"role": "user", "content": "x" * (h.CONTEXT_PROGRESS_THRESHOLD * 4 + 1000)}]
+
+    def test_estimate_context_tokens_counts_content_and_tools(self):
+        messages = [
+            {"role": "system", "content": "a" * 100},
+            {"role": "user", "content": "b" * 50},
+            {
+                "role": "assistant",
+                "content": "c" * 10,
+                "tool_calls": [
+                    {
+                        "id": "1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "d" * 40},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "1", "content": "e" * 20},
+        ]
+        total = 220 + len(json.dumps(h._active_tools(True)))
+        self.assertEqual(h.estimate_context_chars(messages, interactive=True), total)
+        self.assertEqual(h.estimate_context_tokens(messages, interactive=True), total // 4)
+
+    def test_format_tokens(self):
+        self.assertEqual(h._format_tokens(999), "999")
+        self.assertEqual(h._format_tokens(1500), "1.5k")
+        self.assertEqual(h._format_tokens(32400), "32.4k")
+        self.assertEqual(h._format_tokens(1_500_000), "1.5M")
+
+    def test_format_elapsed(self):
+        self.assertEqual(h._format_elapsed(5.4), "5s")
+        self.assertEqual(h._format_elapsed(59.4), "59s")
+        self.assertEqual(h._format_elapsed(75), "1m15s")
+
+    def test_noop_below_threshold(self):
+        spinner = h.ContextProgress([{"role": "user", "content": "hi"}], interactive=True)
+        spinner.start()
+        self.assertFalse(spinner.active)
+        spinner.stop()
+
+    def test_noop_without_tty(self):
+        if sys.stdout.isatty():
+            self.skipTest("stdout is a tty")
+        spinner = h.ContextProgress(self._big_messages(), interactive=True)
+        spinner.start()
+        self.assertFalse(spinner.active)
+        spinner.stop()
+
+    def test_line_shows_upload_progress(self):
+        spinner = h.ContextProgress([{"role": "user", "content": "hi"}], interactive=True)
+        spinner.tokens = 32_000
+        spinner.upload = h._UploadProgress(1000)
+        spinner.upload.sent = 450
+        line = spinner._line()
+        self.assertIn("sending context", line)
+        self.assertIn("45%", line)
+        # tokens sent so far: 32000 * 450 // 1000 = 14400 -> "14.4k/32.0k"
+        self.assertIn("14.4k/32.0k", line)
+
+    def test_line_waiting_state(self):
+        spinner = h.ContextProgress([{"role": "user", "content": "hi"}], interactive=True)
+        spinner.tokens = 32_000
+        spinner.upload = h._UploadProgress(1000)
+        spinner.upload.sent = 1000  # upload complete
+        line = spinner._line()
+        self.assertIn("waiting for first token", line)
+        self.assertIn("32.0k tokens", line)
+
+    def test_draws_line_and_clears(self):
+        old_delay = h.CONTEXT_PROGRESS_DELAY
+        h.CONTEXT_PROGRESS_DELAY = 0.05
+        self.addCleanup(setattr, h, "CONTEXT_PROGRESS_DELAY", old_delay)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), mock.patch.object(buf, "isatty", return_value=True):
+            spinner = h.ContextProgress(self._big_messages(), interactive=True)
+            spinner.start()
+            self.assertTrue(spinner.active)
+            deadline = time.time() + 5
+            while "waiting for first token" not in buf.getvalue() and time.time() < deadline:
+                time.sleep(0.01)
+            spinner.stop()
+        out = buf.getvalue()
+        self.assertIn("waiting for first token", out)
+        self.assertIn("tokens", out)
+        self.assertIn("\x1b[2K", out)  # the line was cleared
+
+    def test_stop_clears_above_hint_lines(self):
+        old_delay = h.CONTEXT_PROGRESS_DELAY
+        h.CONTEXT_PROGRESS_DELAY = 0.05
+        self.addCleanup(setattr, h, "CONTEXT_PROGRESS_DELAY", old_delay)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), mock.patch.object(buf, "isatty", return_value=True):
+            spinner = h.ContextProgress(self._big_messages(), interactive=True)
+            spinner.start()
+            deadline = time.time() + 5
+            while "waiting for first token" not in buf.getvalue() and time.time() < deadline:
+                time.sleep(0.01)
+            spinner.note_lines_below(2)  # e.g. the esc hint printed below
+            spinner.stop()
+        out = buf.getvalue()
+        self.assertIn("\x1b[2A", out)  # moved up 2 lines to the progress line
+        self.assertIn("\x1b[2K", out)
+
+    def test_open_request_plain_without_progress(self):
+        req = urllib.request.Request("http://127.0.0.1:1/x", data=b"hi")
+        with mock.patch.object(h.urllib.request, "urlopen", return_value="RESP") as m:
+            self.assertEqual(h._open_request(req, None), "RESP")
+            m.assert_called_once_with(req, timeout=600)
+
+    def test_upload_progress_counts_bytes(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                self.rfile.read(length)
+                payload = b'{"ok":true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *a):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        port = server.server_address[1]
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        try:
+            body = b"x" * (3 * h.PROGRESS_CHUNK + 123)
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/chat/completions",
+                data=body,
+                headers={"Content-Type": "application/json"},
+            )
+            spinner = h.ContextProgress([{"role": "user", "content": "hi"}])
+            with h._open_request(req, spinner) as resp:
+                data = resp.read()
+            self.assertEqual(json.loads(data), {"ok": True})
+            self.assertIsNotNone(spinner.upload)
+            self.assertEqual(spinner.upload.total, len(body))
+            self.assertEqual(spinner.upload.sent, spinner.upload.total)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_upload_socket_reported(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                payload = b'{"ok":1}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *a):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        port = server.server_address[1]
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/x",
+                data=b"x" * (2 * h.PROGRESS_CHUNK + 1),
+                headers={"Content-Type": "application/json"},
+            )
+            seen = []
+            with h._open_request(req, None, seen.append) as resp:
+                resp.read()
+            self.assertTrue(seen)  # the connection socket was reported
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_response_socket_finds_socket(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                payload = b'{"ok":1}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *a):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        port = server.server_address[1]
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/x", data=b"hi")
+            resp = urllib.request.urlopen(req, timeout=5)
+            try:
+                self.assertIsNotNone(h._response_socket(resp))
+            finally:
+                resp.read()
+                resp.close()
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":
