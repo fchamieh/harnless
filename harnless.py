@@ -3838,10 +3838,13 @@ def run_agent(
         except StreamInterrupted as e:
             # Keep the partial output (minus any half-formed tool calls,
             # which would leave the conversation in an invalid state) so
-            # the model can see what it had said, then back out.
+            # the model can see what it had said, then back out. Partials
+            # without content (e.g. interrupted mid-thinking) are dropped:
+            # servers reject assistant messages that have neither content
+            # nor tool_calls, which would break every later request.
             message = e.message
             message.pop("tool_calls", None)
-            if message.get("content") or message.get("reasoning_content"):
+            if message.get("content"):
                 messages.append(message)
             return 0
         except (urllib.error.URLError, ConnectionError, OSError) as e:

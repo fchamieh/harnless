@@ -3173,6 +3173,79 @@ class TestInterrupt(Base):
         self.assertEqual(code, 0)
         self.assertEqual(len(messages), 1)
 
+    def test_run_agent_interrupt_reasoning_only_dropped(self):
+        """A partial with reasoning but no content is dropped: servers
+        reject assistant messages without content/tool_calls, which would
+        break every later request in the conversation."""
+
+        def fake_stream_once(messages, model, interactive=False, temperature=0.2):
+            raise h.StreamInterrupted(
+                {"role": "assistant", "reasoning_content": "still thinking"}
+            )
+
+        old = h.stream_once
+        h.stream_once = fake_stream_once
+        self.addCleanup(setattr, h, "stream_once", old)
+        messages = [{"role": "user", "content": "go"}]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = h.run_agent(messages, "m")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(messages), 1)
+
+    def test_run_agent_interrupt_reasoning_and_tool_calls_dropped(self):
+        """Stripping the half-formed tool calls leaves a content-less
+        partial (reasoning only), which is dropped too."""
+
+        def fake_stream_once(messages, model, interactive=False, temperature=0.2):
+            raise h.StreamInterrupted(
+                {
+                    "role": "assistant",
+                    "reasoning_content": "still thinking",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "todo", "arguments": '{"action": '},
+                        }
+                    ],
+                }
+            )
+
+        old = h.stream_once
+        h.stream_once = fake_stream_once
+        self.addCleanup(setattr, h, "stream_once", old)
+        messages = [{"role": "user", "content": "go"}]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = h.run_agent(messages, "m")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(messages), 1)
+
+    def test_run_agent_interrupt_content_and_reasoning_kept(self):
+        def fake_stream_once(messages, model, interactive=False, temperature=0.2):
+            raise h.StreamInterrupted(
+                {
+                    "role": "assistant",
+                    "content": "partial answer",
+                    "reasoning_content": "some thinking",
+                }
+            )
+
+        old = h.stream_once
+        h.stream_once = fake_stream_once
+        self.addCleanup(setattr, h, "stream_once", old)
+        messages = [{"role": "user", "content": "go"}]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = h.run_agent(messages, "m")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            messages[-1],
+            {"role": "assistant", "content": "partial answer",
+             "reasoning_content": "some thinking"},
+        )
+
     def test_watcher_start_noop_without_tty(self):
         if sys.stdin.isatty():
             self.skipTest("stdin is a tty")
