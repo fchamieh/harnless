@@ -21,7 +21,7 @@ import urllib.error
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 API_URL = "http://127.0.0.1:11434/v1/chat/completions"
 API_KEY = None
 MODEL = "local-model"
@@ -765,8 +765,6 @@ TODO_LAST_INJECTED = None  # serialized list state last injected as a reminder
 MEMORY_PROJECT_FILE = os.path.join(CWD, ".harnless", "memory.md")
 MEMORY_GLOBAL_FILE = os.path.join(os.path.expanduser("~"), ".harnless", "memory.md")
 
-GOTCHAS_FILE = os.path.join(CWD, "GOTCHAS.md")
-
 
 def _todo_render() -> str:
     if not TODO_ITEMS:
@@ -952,48 +950,12 @@ def load_memory() -> str:
     return "\n\n".join(parts)
 
 
-def _gotchas_read() -> list:
-    try:
-        with open(GOTCHAS_FILE, "r", encoding="utf-8", errors="replace") as f:
-            return [ln[2:].strip() for ln in f.read().splitlines() if ln.startswith("- ")]
-    except OSError:
-        return []
-
-
-def tool_gotcha(args: dict) -> str:
-    action = (args.get("action") or "list").strip().lower()
-    if action == "add":
-        text = (args.get("text") or "").strip()
-        if not text:
-            return "error: 'add' requires text"
-        notes = _gotchas_read()
-        if any(text in n for n in notes):
-            return "already recorded in GOTCHAS.md"
-        notes.append(text)
-        with open(GOTCHAS_FILE, "w", encoding="utf-8") as f:
-            f.write("\n".join(f"- {n}" for n in notes) + "\n")
-        return f"recorded in GOTCHAS.md ({len(notes)} total)"
-    if action != "list":
-        return f"error: unknown action '{action}' (use add or list)"
-    notes = _gotchas_read()
-    return "gotchas:\n" + ("\n".join(f"- {n}" for n in notes) if notes else "(none recorded)")
-
-
-def load_gotchas() -> str:
-    """Read GOTCHAS.md from CWD. Returns the note lines joined, '' if absent/empty."""
-    return "\n".join(f"- {n}" for n in _gotchas_read())
-
-
 def _context_additions() -> str:
-    """Memory and gotchas blocks to append to a system prompt ('' if none)."""
-    parts = []
+    """Memory block to append to a system prompt ('' if none)."""
     memory = load_memory()
-    if memory:
-        parts.append("Memory (persistent notes from previous sessions):\n" + memory)
-    gotchas = load_gotchas()
-    if gotchas:
-        parts.append("Known gotchas (pitfalls discovered in previous sessions):\n" + gotchas)
-    return "\n\n".join(parts)
+    if not memory:
+        return ""
+    return "Memory (persistent notes from previous sessions):\n" + memory
 
 
 TOOLS = {
@@ -1409,7 +1371,9 @@ TOOLS = {
                     "startup. Actions: 'add' (text, scope) to store a note, 'list' (scope) to show notes, "
                     "'remove' (text, scope) to delete notes containing the text. Scope: 'project' (this "
                     "working directory, default) or 'global' (all projects); omit scope for list to see "
-                    "both. Use it for durable facts about the user, their preferences, or the project."
+                    "both. Use it for durable facts about the user, their preferences, or the project, and "
+                    "for one-line pitfall notes learned while working — prefix those with 'gotcha: ' "
+                    "(e.g. 'gotcha: tests must run from the repo root')."
                 ),
                 "parameters": {
                     "type": "object",
@@ -1432,34 +1396,6 @@ TOOLS = {
             },
         },
         tool_memory,
-    ),
-    "gotcha": (
-        {
-            "type": "function",
-            "function": {
-                "name": "gotcha",
-                "description": (
-                    "Record or list gotchas: one-line notes about pitfalls discovered while working "
-                    "(e.g. 'tests must run from repo root'). Loaded into your context at startup. "
-                    "Actions: 'add' (text) to record a gotcha, 'list' to show all."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "action": {
-                            "type": "string",
-                            "description": "One of: add, list (default: list)",
-                        },
-                        "text": {
-                            "type": "string",
-                            "description": "One-line gotcha (for add)",
-                        },
-                    },
-                    "required": ["action"],
-                },
-            },
-        },
-        tool_gotcha,
     ),
     "task": (
         {
@@ -1983,8 +1919,8 @@ def get_system_prompt(cwd, additional) -> str:
         "Use the ask_user tool whenever you need feedback, a decision, clarification, or missing information, "
         "and the confirm tool for yes/no approval; both block until the user responds. "
         "For multi-step work, track progress with the todo tool: add all the steps up front in a single 'add' call, mark each in_progress then done as you go. "
-        "When you hit an error and determine the root cause, record a one-line note with the gotcha tool so you don't repeat it. "
-        "Use the memory tool to store durable facts (user preferences, project conventions) that should survive across sessions. "
+        "When you hit an error and determine the root cause, record a one-line note with the memory tool, prefixed 'gotcha: ' (e.g. 'gotcha: tests must run from the repo root'), so you don't repeat it. "
+        "Use the memory tool for durable facts (user preferences, project conventions) that should survive across sessions. "
         "Format responses in Markdown (headings, lists, tables, fenced code blocks); the terminal renders it. "
         "{additional}"
     ).format(cwd=cwd, additional=additional)

@@ -2588,67 +2588,43 @@ class TestMemory(Base):
         self.assertEqual(h.load_memory(), "")
 
 
-class TestGotcha(Base):
-    def setUp(self):
-        super().setUp()
-        self._old_file = h.GOTCHAS_FILE
-        h.GOTCHAS_FILE = os.path.join(self.tmp, "GOTCHAS.md")
-        self.addCleanup(setattr, h, "GOTCHAS_FILE", self._old_file)
-
-    def gotcha(self, **kw):
-        return h.tool_gotcha(kw)
-
-    def test_add_and_list(self):
-        self.assertEqual(self.gotcha(action="add", text="tests must run from repo root"),
-                         "recorded in GOTCHAS.md (1 total)")
-        self.assertEqual(self.gotcha(action="list"), "gotchas:\n- tests must run from repo root")
-
-    def test_add_requires_text(self):
-        self.assertEqual(self.gotcha(action="add"), "error: 'add' requires text")
-
-    def test_add_duplicate(self):
-        self.gotcha(action="add", text="note one")
-        self.assertEqual(self.gotcha(action="add", text="note one"), "already recorded in GOTCHAS.md")
-        # a more specific note is not a duplicate
-        self.assertEqual(self.gotcha(action="add", text="note one variant"), "recorded in GOTCHAS.md (2 total)")
-
-    def test_list_empty(self):
-        self.assertEqual(self.gotcha(action="list"), "gotchas:\n(none recorded)")
-
-    def test_unknown_action(self):
-        self.assertEqual(self.gotcha(action="fly"), "error: unknown action 'fly' (use add or list)")
-
-    def test_load_gotchas(self):
-        self.gotcha(action="add", text="a")
-        self.gotcha(action="add", text="b")
-        self.assertEqual(h.load_gotchas(), "- a\n- b")
-
-    def test_load_gotchas_absent(self):
-        self.assertEqual(h.load_gotchas(), "")
-
-
 class TestStateToolsRegistered(unittest.TestCase):
     def test_new_tools_in_both_lists(self):
         all_names = [s["function"]["name"] for s in h.OPENAI_TOOLS]
         interactive_names = [s["function"]["name"] for s in h.OPENAI_TOOLS_INTERACTIVE]
-        for name in ("todo", "memory", "gotcha"):
+        for name in ("todo", "memory"):
             self.assertIn(name, all_names)
             self.assertIn(name, interactive_names)
             self.assertIn(name, h.DISPATCH)
 
+    def test_gotcha_tool_removed(self):
+        # pitfalls are recorded through the memory tool now, not a separate one
+        for tools in (h.OPENAI_TOOLS, h.OPENAI_TOOLS_INTERACTIVE):
+            self.assertNotIn("gotcha", [s["function"]["name"] for s in tools])
+        self.assertNotIn("gotcha", h.DISPATCH)
+        for name in ("tool_gotcha", "load_gotchas", "GOTCHAS_FILE", "GOTCHAS_LABEL"):
+            self.assertFalse(hasattr(h, name))
+
     def test_system_prompt_mentions_state_tools(self):
         prompt = h.get_system_prompt("/x", "")
-        for name in ("todo", "memory", "gotcha"):
+        for name in ("todo", "memory"):
             self.assertIn(name, prompt)
+        # the pitfall-recording habit survives, routed through memory
+        self.assertIn("root cause", prompt)
+        self.assertIn("gotcha:", prompt)
+
+    def test_memory_schema_covers_pitfall_notes(self):
+        schema = next(s for s in h.OPENAI_TOOLS
+                      if s["function"]["name"] == "memory")["function"]
+        self.assertIn("pitfall", schema["description"])
+        self.assertIn("gotcha:", schema["description"])
 
     def test_context_additions(self):
-        old_proj, old_glob, old_got = h.MEMORY_PROJECT_FILE, h.MEMORY_GLOBAL_FILE, h.GOTCHAS_FILE
+        old_proj, old_glob = h.MEMORY_PROJECT_FILE, h.MEMORY_GLOBAL_FILE
         h.MEMORY_PROJECT_FILE = "/nonexistent/proj.md"
         h.MEMORY_GLOBAL_FILE = "/nonexistent/glob.md"
-        h.GOTCHAS_FILE = "/nonexistent/gotchas.md"
         self.addCleanup(setattr, h, "MEMORY_PROJECT_FILE", old_proj)
         self.addCleanup(setattr, h, "MEMORY_GLOBAL_FILE", old_glob)
-        self.addCleanup(setattr, h, "GOTCHAS_FILE", old_got)
         self.assertEqual(h._context_additions(), "")
 
 
