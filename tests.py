@@ -56,6 +56,128 @@ class TestSafeResolve(Base):
             h.safe_resolve("..\\evil.txt")
 
 
+def _make_dir_link(target: str, link: str) -> bool:
+    """Create a directory link (symlink, else a Windows junction) pointing at target."""
+    try:
+        os.symlink(target, link, target_is_directory=True)
+        return True
+    except (OSError, NotImplementedError):
+        pass
+    if os.name == "nt":
+        import subprocess
+
+        return (
+            subprocess.run(["cmd", "/c", "mklink", "/J", link, target], capture_output=True).returncode
+            == 0
+        )
+    return False
+
+
+def _remove_dir_link(link: str):
+    """Remove a directory link without touching its target."""
+    for fn in (os.unlink, os.rmdir):
+        try:
+            fn(link)
+            return
+        except OSError:
+            continue
+
+
+class TestSymlinkedCwd(Base):
+    """Tools must work when the working directory itself is a symlink/junction."""
+
+    def setUp(self):
+        super().setUp()
+        self._old_cwd = h.CWD
+        self.real = self.p("realdir")  # the link target, holding the files
+        self.link = os.path.abspath(os.path.join(self.tmp, "linkdir"))
+        os.makedirs(os.path.join(self.real, "src"), exist_ok=True)
+        with open(os.path.join(self.real, "src", "main.py"), "w", encoding="utf-8") as f:
+            f.write("def calc(x):\n    return x + 1\n")
+        with open(os.path.join(self.real, "top.txt"), "w", encoding="utf-8") as f:
+            f.write("AAA\n")
+        if not _make_dir_link(self.real, self.link):
+            self.skipTest("cannot create a directory symlink or junction")
+        h.CWD = self.link  # work through the link, as os.getcwd() would report it
+
+    def tearDown(self):
+        h.CWD = self._old_cwd
+        _remove_dir_link(self.link)
+        super().tearDown()
+
+    def test_get_cwd_reports_the_link(self):
+        self.assertEqual(h.tool_get_cwd({}), self.link)
+
+    def test_safe_resolve_stays_inside_the_linked_cwd(self):
+        self.assertEqual(h.safe_resolve("./src/main.py"), self.p("realdir/src/main.py"))
+        self.assertEqual(h.safe_resolve("./"), self.p("realdir"))
+
+    def test_safe_resolve_rejects_escape(self):
+        with self.assertRaises(ValueError):
+            h.safe_resolve("../evil.txt")
+
+    def test_link_inside_cwd_pointing_outside_is_rejected(self):
+        escape = os.path.join(self.real, "escape")
+        self.assertTrue(_make_dir_link(self.p(""), escape))
+        try:
+            with self.assertRaises(ValueError):
+                h.safe_resolve("./escape/st.txt")
+        finally:
+            _remove_dir_link(escape)
+
+    def test_grep_reports_cwd_relative_paths(self):
+        self.assertEqual(h.tool_grep({"path": "./", "pattern": "AAA"}), "top.txt:1: AAA")
+        self.assertEqual(
+            h.tool_grep({"path": "./", "pattern": "def calc"}), "src/main.py:1: def calc(x):"
+        )
+
+    def test_glob_reports_cwd_relative_paths(self):
+        self.assertEqual(h.tool_glob({"path": "./", "pattern": "**/*.py"}), "src/main.py")
+        self.assertEqual(h.tool_glob({"path": "./", "pattern": "*.txt"}), "top.txt")
+
+    def test_list_dir(self):
+        self.assertEqual(h.tool_list_dir({"path": "./"}), "src/\ntop.txt")
+
+    def test_write_then_read_through_the_link(self):
+        msg = h.tool_write_file({"path": "./new.txt", "content": "hello\n"})
+        self.assertEqual(msg, f"wrote 6 chars to {self.p('realdir/new.txt')}")
+        self.assertTrue(os.path.exists(os.path.join(self.link, "new.txt")))
+        self.assertEqual(h.tool_read_file({"path": "./new.txt", "line_numbers": False}), "hello")
+
+
+class TestCwdPathHelpers(unittest.TestCase):
+    def test_rel_to_cwd_uses_resolved_cwd(self):
+        real = os.path.realpath(h.CWD)
+        self.assertEqual(h._rel_to_cwd(os.path.join(real, "src", "main.py")), "src/main.py")
+        self.assertEqual(h._rel_to_cwd(real), ".")
+
+    def test_rel_to_cwd_outside_cwd(self):
+        outside = os.path.realpath(os.path.join(os.path.realpath(h.CWD), "..", "outside.txt"))
+        self.assertTrue(h._rel_to_cwd(outside).startswith(".."))
+
+    def test_inside_cwd(self):
+        roots = h._cwd_roots()
+        self.assertTrue(h._inside_cwd(os.path.realpath(h.CWD), roots))
+        self.assertTrue(h._inside_cwd(os.path.realpath(os.path.join(h.CWD, "a", "b.txt")), roots))
+        self.assertFalse(h._inside_cwd(os.path.realpath(os.path.join(h.CWD, "..", "evil.txt")), roots))
+
+    def test_glob_to_regex_double_star_matches_root_files(self):
+        regex = h._glob_to_regex("**/*.py")
+        self.assertTrue(regex.match("main.py"))
+        self.assertTrue(regex.match("src/deep/main.py"))
+        self.assertFalse(regex.match("main.md"))
+
+    def test_glob_to_regex_single_star(self):
+        regex = h._glob_to_regex("*.txt")
+        self.assertTrue(regex.match("dir/a.txt"))
+        self.assertFalse(regex.match("dir/a.md"))
+
+    def test_glob_to_regex_regex_passthrough(self):
+        regex = h._glob_to_regex(r"src/(main|util)\.py")
+        self.assertTrue(regex.match("src/main.py"))
+        self.assertFalse(regex.match("src/other.py"))
+
+
 class TestReadFile(Base):
     def setUp(self):
         super().setUp()
@@ -282,6 +404,11 @@ class TestGlob(Base):
     def test_nested(self):
         self.w("src/deep/c.py", "x")
         self.assertEqual(self.glob("**/*.py"), "_test_tmp/src/deep/c.py")
+
+    def test_double_star_also_matches_files_in_searched_dir(self):
+        self.w("a.py", "x")
+        self.w("src/deep/c.py", "x")
+        self.assertEqual(self.glob("**/*.py"), "_test_tmp/a.py\n_test_tmp/src/deep/c.py")
 
     def test_no_match(self):
         self.w("a.txt", "x")

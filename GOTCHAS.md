@@ -7,3 +7,5 @@
 - On Windows, socket.shutdown() does NOT unblock a pending blocking recv on the same socket; socket.close() from another thread does (raises ConnectionAbortedError 10053). Use close() to cancel a blocked stream read.
 - On Python 3.14, urllib/http.client response `resp.fp` is the BufferedReader directly (SocketFile wrapper removed) — use `resp.fp.raw._sock` for the socket, not `resp.fp.fp.raw._sock` (harnless `_response_socket` tries both).
 - llama-server rejects assistant messages that have neither `content` nor `tool_calls` (HTTP 400) — an interrupted partial with only `reasoning_content` must not be appended to the conversation or every later request fails.
+- When CWD is a symlink/junction, safe_resolve returns realpath but os.path.relpath(fp, CWD) yields '../../../real/...' — compare against realpath(CWD) (harnless _rel_to_cwd/_cwd_roots) for displayed paths.
+- harnless glob/grep patterns are matched against the whole CWD-relative path, so '**/*.py' needs _glob_to_regex's '**/' -> '(?:.*/)?'; before that it only matched nested files by accident.

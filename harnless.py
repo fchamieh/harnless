@@ -173,6 +173,54 @@ class ExitSignal(Exception):
         self.message = message
 
 
+def _cwd_roots() -> list:
+    """Absolute forms of CWD: as given, plus fully resolved when CWD is a link.
+
+    CWD itself may be a symlink/junction (e.g. X:\\links\\proj -> X:\\real\\proj),
+    while paths are resolved with realpath(), so both forms are needed to keep the
+    containment check and the paths shown to the model consistent.
+    """
+    roots = [CWD]
+    real = os.path.realpath(CWD)
+    if os.path.normcase(real) != os.path.normcase(CWD):
+        roots.append(real)
+    return roots
+
+
+def _inside_cwd(full: str, roots: list = None) -> bool:
+    """True if an already realpath-resolved absolute path stays inside CWD.
+
+    Case-insensitive on Windows (normcase); comparing against the resolved CWD is
+    what makes a symlinked working directory work, while a link *inside* CWD that
+    points outside is still rejected because `full` has already been resolved.
+    """
+    p = os.path.normcase(full)
+    for root in (roots or _cwd_roots()):
+        r = os.path.normcase(root).rstrip("\\/")
+        if p == r or p.startswith(r + os.sep):
+            return True
+    return False
+
+
+def _rel_to_cwd(full: str, roots: list = None) -> str:
+    """Express an absolute path relative to CWD, using forward slashes.
+
+    Picks whichever CWD form (the link or its target) actually contains the path,
+    so a symlinked CWD yields `src/main.py` instead of `../../../real/src/main.py`.
+    """
+    fallback = None
+    for root in (roots or _cwd_roots()):
+        try:
+            rel = os.path.relpath(full, root).replace("\\", "/")
+        except ValueError:  # e.g. path on a different drive (Windows)
+            continue
+        if not rel.startswith(".."):
+            return rel
+        if fallback is None or len(rel) < len(fallback):
+            fallback = rel
+    return fallback if fallback is not None else full
+
+
 def safe_resolve(rel_path: str) -> str:
     """Resolve a relative path and ensure it stays inside CWD. Returns absolute path."""
     rel_path = rel_path.replace("\\", "/")
@@ -180,11 +228,26 @@ def safe_resolve(rel_path: str) -> str:
         rel_path = rel_path[2:]
     if os.path.isabs(rel_path):
         raise ValueError(f"Absolute paths are not allowed: {rel_path}")
+    roots = _cwd_roots()
     full = os.path.realpath(os.path.join(CWD, rel_path))
-    cwd_real = os.path.realpath(CWD)
-    if full != cwd_real and not full.startswith(cwd_real + os.sep):
+    if not _inside_cwd(full, roots):
         raise ValueError(f"Path escapes working directory: {rel_path}")
     return full
+
+
+def _glob_to_regex(pattern: str):
+    """Compile a glob pattern (or a raw regex) for matching CWD-relative paths.
+
+    `**/` matches zero or more directories, so `**/*.py` also matches files sitting
+    directly in the searched directory; plain `*`/`?` match across path separators
+    because patterns are matched against the whole relative path. A pattern
+    containing regex metacharacters is used as a regex.
+    """
+    if any(c in pattern for c in "[](){}|\\^$"):
+        return re.compile(pattern)
+    translated = pattern.replace("**/", "\x00")  # placeholder, so it isn't re-translated
+    translated = translated.replace("?", ".").replace("*", ".*")
+    return re.compile("^" + translated.replace("\x00", "(?:.*/)?") + "$")
 
 
 # ---------------------------------------------------------------- tools
@@ -369,21 +432,16 @@ def tool_grep(args: dict) -> str:
     pattern = re.compile(args["pattern"], re.IGNORECASE)
     context = max(0, int(args.get("context", 0)))
     file_pattern = args.get("file_pattern")
-    file_re = None
-    if file_pattern:
-        file_re = (
-            re.compile("^" + file_pattern.replace("?", ".").replace("*", ".*") + "$")
-            if not any(c in file_pattern for c in "[](){}|\\^$")
-            else re.compile(file_pattern)
-        )
+    file_re = _glob_to_regex(file_pattern) if file_pattern else None
     matches = []
+    roots = _cwd_roots()
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [
             d for d in dirnames if d not in (".git", "node_modules", "__pycache__")
         ]
         for name in filenames:
             fp = os.path.join(dirpath, name)
-            rel = os.path.relpath(fp, CWD).replace("\\", "/")
+            rel = _rel_to_cwd(fp, roots)
             if file_re is not None and not (
                 file_re.search(rel) or file_re.search(os.path.basename(rel))
             ):
@@ -470,20 +528,17 @@ def tool_patch_file(args: dict) -> str:
 def tool_glob(args: dict) -> str:
     root = safe_resolve(args["path"])
     pattern = args["pattern"]
-    regex = (
-        re.compile("^" + pattern.replace("?", ".").replace("*", ".*") + "$")
-        if not any(c in pattern for c in "[](){}|\\^$")
-        else re.compile(pattern)
-    )
+    regex = _glob_to_regex(pattern)
     results = []
+    roots = _cwd_roots()
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [
             d for d in dirnames if d not in (".git", "node_modules", "__pycache__")
         ]
         for name in filenames:
-            rel = os.path.relpath(os.path.join(dirpath, name), CWD)
-            if regex.search(rel.replace("\\", "/")):
-                results.append(rel.replace("\\", "/"))
+            rel = _rel_to_cwd(os.path.join(dirpath, name), roots)
+            if regex.search(rel):
+                results.append(rel)
     if not results:
         return "no files matched"
     return "\n".join(sorted(results)[:500]) + (
