@@ -21,7 +21,7 @@ import urllib.error
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 API_URL = "http://127.0.0.1:11434/v1/chat/completions"
 API_KEY = None
 MODEL = "local-model"
@@ -47,6 +47,24 @@ CONTEXT_PROGRESS_DELAY = 1.0
 PROGRESS_CHUNK = 64 * 1024
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_REMOTE_BYTES = 10 * 1024 * 1024
+# Output caps. Two layers: a tool's `limit`-style argument is model-facing (the
+# agent can ask for less), the constants below are the harness-side ceiling it
+# cannot exceed. TOOL_RESULT_LIMIT is the final backstop in execute_tool, kept
+# above every per-tool cap so a tool that already trimmed is never trimmed twice.
+TOOL_RESULT_LIMIT = 60_000  # any single tool result (chars)
+READ_FILE_LIMIT = 50_000  # read_file and @[cwd://] refs (chars)
+SHELL_OUTPUT_LIMIT = 20_000  # run_shell stdout+stderr (chars)
+FETCH_TEXT_LIMIT = 50_000  # fetch_url body text (chars)
+GREP_MATCH_LIMIT = 200  # grep matching lines (count)
+GREP_LINE_LIMIT = 400  # grep: chars kept per matched line
+GREP_TEXT_LIMIT = 30_000  # grep: whole result (chars)
+LIST_LIMIT = 500  # glob / list_dir entries (count)
+MAX_COUNT_LIMIT = 5_000  # ceiling on a model-supplied count-based limit
+MCP_RESULT_LIMIT = 30_000  # MCP tools/call result (chars)
+SUBAGENT_SUMMARY_LIMIT = 20_000  # task: sub-agent final summary (chars)
+TODO_BLOCK_LIMIT = 8_000  # todo render + reminder injection (chars)
+MEMORY_BLOCK_LIMIT = 12_000  # memory notes injected into the system prompt (chars)
+AGENTS_MD_LIMIT = 20_000  # AGENTS.md appended to the system prompt (chars)
 # Server-reported token usage per conversation, keyed by id(messages).
 USAGE_BY_CONV: dict[int, dict] = {}
 IMAGE_MIME = {
@@ -250,6 +268,56 @@ def _glob_to_regex(pattern: str):
     return re.compile("^" + translated.replace("\x00", "(?:.*/)?") + "$")
 
 
+# ---------------------------------------------------------------- output caps
+
+
+def _limit_arg(args: dict, key: str, default: int, ceiling: int) -> int:
+    """Read an integer limit-style argument, clamped to [1, ceiling].
+
+    Model-facing: the agent can ask for a smaller (or bigger) result, but
+    never past the harness-side ceiling. A missing or bogus value falls back
+    to the default.
+    """
+    raw = args.get(key)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(value, ceiling))
+
+
+def _cap_note(stat: str, hint: str) -> str:
+    """The marker appended to a capped result: how much was dropped + how to recover."""
+    return f"\n... [truncated: {stat}{'; ' + hint if hint else ''}]"
+
+
+def _truncate(text: str, limit: int, *, unit: str = "chars", hint: str = "") -> str:
+    """Cap `text` at `limit` characters, appending what was dropped and a recovery hint."""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + _cap_note(
+        f"{len(text)} {unit} total, showing first {limit}", hint
+    )
+
+
+def _cap_count(items: list, limit: int, *, unit: str, hint: str = "") -> str:
+    """Join at most `limit` items, appending how many exist and a recovery hint."""
+    if len(items) <= limit:
+        return "\n".join(str(i) for i in items)
+    return "\n".join(str(i) for i in items[:limit]) + _cap_note(
+        f"{len(items)} {unit}, showing first {limit}", hint
+    )
+
+
+def _clip_line(line: str, limit: int) -> str:
+    """Clip one over-long line (e.g. minified JS) so a single hit can't dump megabytes."""
+    if len(line) <= limit:
+        return line
+    return line[:limit] + f" …[+{len(line) - limit} chars on this line]"
+
+
 # ---------------------------------------------------------------- tools
 
 
@@ -354,8 +422,12 @@ def tool_run_shell(args: dict) -> str:
         if proc.stderr:
             out.append(f"[stderr]\n{proc.stderr.rstrip()}")
         result = "\n".join(out) if out else "(no output)"
-        if len(result) > 20_000:
-            result = result[:20_000] + f"\n... [truncated, {len(result)} chars total]"
+        limit = _limit_arg(args, "max_output", SHELL_OUTPUT_LIMIT, TOOL_RESULT_LIMIT)
+        result = _truncate(
+            result,
+            limit,
+            hint="re-run with a larger max_output, or redirect to a file and read it with read_file",
+        )
         return f"exit code: {proc.returncode}\n{result}"
     except subprocess.TimeoutExpired:
         return f"error: command timed out after {args.get('timeout', 120)}s"
@@ -390,8 +462,10 @@ def tool_read_file(args: dict) -> str:
     if args.get("line_numbers", True):
         selected = [f"{i + start + 1}: {line}" for i, line in enumerate(selected)]
     content = "\n".join(selected)
-    if len(content) > 50_000:
-        content = content[:50_000] + "\n... [truncated]"
+    limit = _limit_arg(args, "max_chars", READ_FILE_LIMIT, TOOL_RESULT_LIMIT)
+    content = _truncate(
+        content, limit, hint="read the rest with offset/lines, or raise max_chars"
+    )
     if content and (offset != 1 or count != 0):
         content += f"\n[lines {offset}-{min(end, len(lines))} of {len(lines)}]"
     return content if content else "(empty)"
@@ -431,10 +505,23 @@ def tool_grep(args: dict) -> str:
     root = safe_resolve(args["path"])
     pattern = re.compile(args["pattern"], re.IGNORECASE)
     context = max(0, int(args.get("context", 0)))
+    limit = _limit_arg(args, "limit", GREP_MATCH_LIMIT, MAX_COUNT_LIMIT)
     file_pattern = args.get("file_pattern")
     file_re = _glob_to_regex(file_pattern) if file_pattern else None
     matches = []
+    used = 0
     roots = _cwd_roots()
+
+    def capped() -> str:
+        """Build the truncation note: stopped by match count, or by output size."""
+        if len(matches) >= limit:
+            stat = f"{limit} matching lines shown, more exist"
+        else:
+            stat = f"output capped at {GREP_TEXT_LIMIT} chars ({used} shown)"
+        return "\n".join(matches) + _cap_note(
+            stat, "narrow the pattern or file_pattern, or raise limit"
+        )
+
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [
             d for d in dirnames if d not in (".git", "node_modules", "__pycache__")
@@ -453,6 +540,7 @@ def tool_grep(args: dict) -> str:
             hit_idx = [i for i, line in enumerate(lines) if pattern.search(line)]
             if not hit_idx:
                 continue
+            entries = []
             if context > 0:
                 hits = set(hit_idx)
                 shown = []
@@ -464,14 +552,19 @@ def tool_grep(args: dict) -> str:
                             shown.append(j)
                 for k, j in enumerate(shown):
                     if k and j > shown[k - 1] + 1:
-                        matches.append("--")
+                        entries.append("--")
                     prefix = ">" if j in hits else " "
-                    matches.append(f"{prefix} {rel}:{j + 1}: {lines[j]}")
+                    entries.append(
+                        f"{prefix} {rel}:{j + 1}: {_clip_line(lines[j], GREP_LINE_LIMIT)}"
+                    )
             else:
                 for i in hit_idx:
-                    matches.append(f"{rel}:{i + 1}: {lines[i]}")
-            if len(matches) >= 200:
-                return "\n".join(matches) + "\n... [truncated at 200 matches]"
+                    entries.append(f"{rel}:{i + 1}: {_clip_line(lines[i], GREP_LINE_LIMIT)}")
+            for entry in entries:
+                if len(matches) >= limit or used + len(entry) > GREP_TEXT_LIMIT:
+                    return capped()
+                matches.append(entry)
+                used += len(entry)
     return "\n".join(matches) if matches else "no matches"
 
 
@@ -541,8 +634,9 @@ def tool_glob(args: dict) -> str:
                 results.append(rel)
     if not results:
         return "no files matched"
-    return "\n".join(sorted(results)[:500]) + (
-        "\n... [truncated at 500 files]" if len(results) > 500 else ""
+    limit = _limit_arg(args, "limit", LIST_LIMIT, MAX_COUNT_LIMIT)
+    return _cap_count(
+        sorted(results), limit, unit="files", hint="narrow the pattern, or raise limit"
     )
 
 
@@ -551,17 +645,20 @@ def tool_list_dir(args: dict) -> str:
     if not os.path.isdir(path):
         return f"error: not a directory: {args['path']}"
     entries = sorted(os.listdir(path))
+    limit = _limit_arg(args, "limit", LIST_LIMIT, MAX_COUNT_LIMIT)
     out = []
-    for name in entries:
+    for name in entries[:limit]:
         full = os.path.join(path, name)
         out.append(name + "/" if os.path.isdir(full) else name)
-        if len(out) >= 500:
-            break
     if not out:
         return "(empty)"
-    return "\n".join(out) + (
-        "\n... [truncated at 500 entries]" if len(entries) > 500 else ""
-    )
+    result = "\n".join(out)
+    if len(entries) > limit:
+        result += _cap_note(
+            f"{len(entries)} entries, showing first {limit}",
+            "raise limit, or glob the directory for a narrower match",
+        )
+    return result
 
 
 def tool_delete_file(args: dict) -> str:
@@ -687,11 +784,14 @@ def tool_fetch_url(args: dict) -> str:
         text = data.decode("utf-8", errors="replace")
     if args.get("strip_html"):
         text = _html_to_text(text)
-    if len(text) > 50_000:
-        text = text[:50_000]
-        truncated = True
-    if truncated:
-        text += "\n... [truncated]"
+    limit = _limit_arg(args, "max_chars", FETCH_TEXT_LIMIT, TOOL_RESULT_LIMIT)
+    clipped = len(text) > limit
+    text = _truncate(text, limit, hint="raise max_chars, or fetch a narrower URL")
+    if truncated and not clipped:
+        text += _cap_note(
+            f"body read stopped at {max_bytes} bytes",
+            "the response is larger than the harness read ceiling",
+        )
     return text if text else "(empty)"
 
 
@@ -751,6 +851,11 @@ def tool_task(args: dict) -> str:
             final = m["content"].strip()
             break
     if final:
+        final = _truncate(
+            final,
+            SUBAGENT_SUMMARY_LIMIT,
+            hint="delegate a narrower task, or ask the sub-agent for a shorter summary",
+        )
         return f"exit code: {code}\n{final}"
     return f"exit code: {code}"
 
@@ -772,6 +877,20 @@ def _todo_render() -> str:
     marks = {"pending": " ", "in_progress": "~", "done": "x"}
     return "\n".join(
         f"- [{marks.get(i['status'], ' ')}] {i['id']}. {i['text']}" for i in TODO_ITEMS
+    )
+
+
+def _todo_block() -> str:
+    """The todo list as shown to the model: capped, so a long list can't bloat context.
+
+    _todo_render() stays uncapped for the file on disk; only what enters the
+    conversation is trimmed.
+    """
+    return _truncate(
+        _todo_render(),
+        TODO_BLOCK_LIMIT,
+        unit="chars",
+        hint="the list is long; mark finished items done and use action 'clear'",
     )
 
 
@@ -865,7 +984,7 @@ def tool_todo(args: dict) -> str:
     elif action != "list":
         return f"error: unknown action '{action}' (use add, update, list, or clear)"
     _todo_save()
-    return "todo list:\n" + _todo_render()
+    return "todo list:\n" + _todo_block()
 
 
 def _todo_reminder(messages: list):
@@ -877,7 +996,7 @@ def _todo_reminder(messages: list):
     state = json.dumps(TODO_ITEMS, sort_keys=True)
     if state == TODO_LAST_INJECTED:
         return
-    messages.append({"role": "system", "content": "Current todo list:\n" + _todo_render()})
+    messages.append({"role": "system", "content": "Current todo list:\n" + _todo_block()})
     TODO_LAST_INJECTED = state
 
 
@@ -935,19 +1054,34 @@ def tool_memory(args: dict) -> str:
         for s in scopes:
             notes = _memory_read(_memory_path(s))
             body = "\n".join(f"- {n}" for n in notes) if notes else "(empty)"
+            body = _truncate(
+                body,
+                MEMORY_BLOCK_LIMIT,
+                unit="chars",
+                hint=f"the {s} memory is long; remove stale notes with action 'remove'",
+            )
             parts.append(f"{s} memory:\n{body}")
         return "\n\n".join(parts)
     return f"error: unknown action '{action}' (use add, list, or remove)"
 
 
 def load_memory() -> str:
-    """Read project and global memory notes. Returns a formatted block, '' if none."""
+    """Read project and global memory notes. Returns a formatted block, '' if none.
+
+    Capped: this block is appended to every system prompt (parent and
+    sub-agents), so an unbounded memory file would silently eat context.
+    """
     parts = []
     for label, path in (("project", MEMORY_PROJECT_FILE), ("global", MEMORY_GLOBAL_FILE)):
         notes = _memory_read(path)
         if notes:
             parts.append(f"{label}:\n" + "\n".join(f"- {n}" for n in notes))
-    return "\n\n".join(parts)
+    return _truncate(
+        "\n\n".join(parts),
+        MEMORY_BLOCK_LIMIT,
+        unit="chars",
+        hint="memory is long; remove stale or superseded notes",
+    )
 
 
 def _context_additions() -> str:
@@ -987,6 +1121,13 @@ TOOLS = {
                         "timeout": {
                             "type": "integer",
                             "description": "Timeout in seconds (default 120)",
+                        },
+                        "max_output": {
+                            "type": "integer",
+                            "description": (
+                                f"Max characters of stdout+stderr to return (default {SHELL_OUTPUT_LIMIT}, "
+                                f"max {TOOL_RESULT_LIMIT}); the rest is dropped with a truncation note"
+                            ),
                         },
                     },
                     "required": ["command"],
@@ -1039,6 +1180,13 @@ TOOLS = {
                         "line_numbers": {
                             "type": "boolean",
                             "description": "Prefix each line with its line number (default true)",
+                        },
+                        "max_chars": {
+                            "type": "integer",
+                            "description": (
+                                f"Max characters to return (default {READ_FILE_LIMIT}, max {TOOL_RESULT_LIMIT}); "
+                                "prefer offset/lines to read a file in chunks"
+                            ),
                         },
                     },
                     "required": ["path"],
@@ -1104,6 +1252,13 @@ TOOLS = {
                             "type": "string",
                             "description": "Optional glob (e.g. *.py) or regex matched against relative file paths to restrict files scanned",
                         },
+                        "limit": {
+                            "type": "integer",
+                            "description": (
+                                f"Max matching lines to return (default {GREP_MATCH_LIMIT}, max {MAX_COUNT_LIMIT}); "
+                                f"lines longer than {GREP_LINE_LIMIT} chars are clipped"
+                            ),
+                        },
                     },
                     "required": ["path", "pattern"],
                 },
@@ -1168,6 +1323,12 @@ TOOLS = {
                             "type": "string",
                             "description": "Glob pattern (e.g. **/*.ts) or regex matched against relative file paths",
                         },
+                        "limit": {
+                            "type": "integer",
+                            "description": (
+                                f"Max files to return (default {LIST_LIMIT}, max {MAX_COUNT_LIMIT})"
+                            ),
+                        },
                     },
                     "required": ["path", "pattern"],
                 },
@@ -1187,6 +1348,12 @@ TOOLS = {
                         "path": {
                             "type": "string",
                             "description": "Relative directory path, e.g. ./src",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": (
+                                f"Max entries to return (default {LIST_LIMIT}, max {MAX_COUNT_LIMIT})"
+                            ),
                         },
                     },
                     "required": ["path"],
@@ -1283,6 +1450,13 @@ TOOLS = {
                         "timeout": {
                             "type": "integer",
                             "description": "Timeout in seconds (default 30)",
+                        },
+                        "max_chars": {
+                            "type": "integer",
+                            "description": (
+                                f"Max characters of response body to return (default {FETCH_TEXT_LIMIT}, "
+                                f"max {TOOL_RESULT_LIMIT})"
+                            ),
                         },
                     },
                     "required": ["url"],
@@ -1554,7 +1728,12 @@ def _mcp_content_to_text(result: dict) -> str:
         text = "(no content)"
     if result.get("isError"):
         text = "error: " + text
-    return text
+    return _truncate(
+        text,
+        MCP_RESULT_LIMIT,
+        unit="chars",
+        hint="the MCP server returned more than the harness keeps; ask it for a narrower result",
+    )
 
 
 def _expand_env(value):
@@ -1910,6 +2089,8 @@ def get_system_prompt(cwd, additional) -> str:
         "You are a coding assistant running inside a harness. Your working directory is {cwd}. "
         "All file paths you use must be relative to it (e.g. ./src/main.py). "
         "Use the provided tools to inspect and modify files, run commands, and search the codebase. "
+        "Tool results are capped: if a result ends with a '[truncated: ...]' note, narrow the request "
+        "(a smaller limit/max_chars, a tighter pattern, or a narrower path) instead of re-running it unchanged. "
         "Explore with list_dir, glob, and grep; read files (the trailer shows total line count) before editing them, "
         "and use patch_file with exact matches for edits. "
         "If patch_file reports multiple matches, re-read the area with line numbers and retry using offset/lines. "
@@ -1938,9 +2119,12 @@ def load_agents_md() -> str:
             return ""
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         content = f.read()
-    if len(content) > 20_000:
-        content = content[:20_000] + "\n... [truncated]"
-    return content
+    return _truncate(
+        content,
+        AGENTS_MD_LIMIT,
+        unit="chars",
+        hint="AGENTS.md is long; trim the project instructions",
+    )
 
 
 # ---------------------------------------------------------------- file references
@@ -1986,8 +2170,12 @@ def _read_local_file(path: str, label: str) -> dict:
         }
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         content = f.read()
-    if len(content) > 50_000:
-        content = content[:50_000] + "\n... [truncated]"
+    content = _truncate(
+        content,
+        READ_FILE_LIMIT,
+        unit="chars",
+        hint="the referenced file is large; reference a narrower file",
+    )
     return {"type": "text", "text": f"[file: {label}]\n{content}"}
 
 
@@ -2034,10 +2222,17 @@ def _fetch_remote(uri: str) -> dict:
             "image_url": {"url": f"data:{mime};base64,{b64}"},
         }
     text = data.decode("utf-8", errors="replace")
-    if len(text) > 50_000:
-        text = text[:50_000]
-    if truncated:
-        text += "\n... [truncated]"
+    clipped = len(text) > FETCH_TEXT_LIMIT
+    text = _truncate(
+        text,
+        FETCH_TEXT_LIMIT,
+        hint="the referenced URL is large; reference a narrower page",
+    )
+    if truncated and not clipped:
+        text += _cap_note(
+            f"body read stopped at {MAX_REMOTE_BYTES} bytes",
+            "the response is larger than the harness read ceiling",
+        )
     return {"type": "text", "text": f"[file: {uri}]\n{text}"}
 
 
@@ -3518,18 +3713,28 @@ def execute_tool(name: str, raw_args: str) -> str:
         if mcp is not None:
             client, tool_name = mcp
             try:
-                return client.call_tool(tool_name, args)
+                result = client.call_tool(tool_name, args)
             except MCPError as e:
                 return f"error: {e}"
             except Exception as e:
                 return f"error: {type(e).__name__}: {e}"
-        return f"error: unknown tool: {name}"
-    try:
-        return str(fn(args))
-    except ExitSignal:
-        raise
-    except Exception as e:
-        return f"error: {type(e).__name__}: {e}"
+        else:
+            return f"error: unknown tool: {name}"
+    else:
+        try:
+            result = str(fn(args))
+        except ExitSignal:
+            raise
+        except Exception as e:
+            return f"error: {type(e).__name__}: {e}"
+    # Final backstop: no single tool result may exceed this, whatever the
+    # built-in tool (or an external MCP server) decided to return.
+    return _truncate(
+        result,
+        TOOL_RESULT_LIMIT,
+        unit="chars",
+        hint="output exceeded the harness limit; split the work or narrow the request",
+    )
 
 
 def _active_tools(interactive: bool) -> list:

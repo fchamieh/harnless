@@ -214,7 +214,24 @@ class TestReadFile(Base):
         self.w("big.txt", "a" * 60_000 + "\n")
         out = self.r("big.txt")
         self.assertTrue(out.startswith("a" * 50_000))
-        self.assertTrue(out.endswith("\n... [truncated]"))
+        self.assertIn("[truncated: 60000 chars total, showing first 50000;", out)
+        self.assertTrue(out.endswith("read the rest with offset/lines, or raise max_chars]"))
+
+    def test_read_max_chars_arg(self):
+        self.w("mid.txt", "b" * 5_000 + "\n")
+        out = self.r("mid.txt", max_chars=1_000)
+        self.assertEqual(len(out.split("\n")[0]), 1_000)
+        self.assertIn("[truncated: 5000 chars total, showing first 1000;", out)
+
+    def test_read_max_chars_clamped_to_ceiling(self):
+        self.w("big2.txt", "c" * 70_000 + "\n")
+        out = self.r("big2.txt", max_chars=10_000_000)
+        self.assertIn(f"showing first {h.TOOL_RESULT_LIMIT};", out)
+
+    def test_read_max_chars_bogus_falls_back(self):
+        self.w("mid2.txt", "d" * 60_000 + "\n")
+        out = self.r("mid2.txt", max_chars="not-a-number")
+        self.assertIn(f"showing first {h.READ_FILE_LIMIT};", out)
 
     def test_read_no_trailing_newline(self):
         self.w("nt.txt", "a\nb")
@@ -389,12 +406,38 @@ class TestGrep(Base):
     def test_match_truncation(self):
         self.w("st/many.txt", "\n".join("AAA" for _ in range(250)))
         out = self.grep("AAA")
-        self.assertTrue(out.endswith("... [truncated at 200 matches]"))
+        self.assertEqual(len(out.split("\n")), 201)
+        self.assertTrue(
+            out.endswith(
+                "... [truncated: 200 matching lines shown, more exist; "
+                "narrow the pattern or file_pattern, or raise limit]"
+            )
+        )
+
+    def test_limit_arg(self):
+        self.w("st/many2.txt", "\n".join("BBB" for _ in range(50)))
+        out = self.grep("BBB", limit=10)
+        self.assertEqual(len(out.split("\n")), 11)
+        self.assertIn("[truncated: 10 matching lines shown, more exist;", out)
+
+    def test_long_line_clipped(self):
+        self.w("st/min.txt", "AAA" + "z" * 1200)
+        out = self.grep("AAA")
+        self.assertIn("…[+803 chars on this line]", out)
+        self.assertLess(len(out), h.GREP_LINE_LIMIT + 100)
+
+    def test_output_char_budget(self):
+        self.w("st/wide.txt", "\n".join("AAA" + "y" * 300 for _ in range(200)))
+        out = self.grep("AAA")
+        self.assertIn(f"output capped at {h.GREP_TEXT_LIMIT} chars", out)
+        self.assertLess(len(out), h.GREP_TEXT_LIMIT + 200)
 
 
 class TestGlob(Base):
-    def glob(self, pattern):
-        return h.tool_glob({"path": self.tmp, "pattern": pattern})
+    def glob(self, pattern, **kw):
+        args = {"path": self.tmp, "pattern": pattern}
+        args.update(kw)
+        return h.tool_glob(args)
 
     def test_star(self):
         self.w("a.txt", "x")
@@ -419,6 +462,25 @@ class TestGlob(Base):
         with open(os.path.join(self.tmp, "__pycache__", "m.cpython-311.pyc"), "w") as f:
             f.write("x")
         self.assertEqual(self.glob("**/*.pyc"), "no files matched")
+
+    def test_truncation(self):
+        for i in range(600):
+            self.w(f"many/f{i:03d}.py", "x")
+        out = self.glob("**/*.py")
+        self.assertEqual(len(out.split("\n")), 501)
+        self.assertTrue(
+            out.endswith(
+                "... [truncated: 600 files, showing first 500; "
+                "narrow the pattern, or raise limit]"
+            )
+        )
+
+    def test_limit_arg(self):
+        for i in range(10):
+            self.w(f"few/f{i}.py", "x")
+        out = self.glob("**/*.py", limit=4)
+        self.assertEqual(len(out.split("\n")), 5)
+        self.assertIn("[truncated: 10 files, showing first 4;", out)
 
 
 class TestDirOps(Base):
@@ -450,7 +512,20 @@ class TestDirOps(Base):
                 f.write("x")
         out = h.tool_list_dir({"path": self.tmp})
         self.assertEqual(len(out.split("\n")), 501)
-        self.assertTrue(out.endswith("... [truncated at 500 entries]"))
+        self.assertTrue(
+            out.endswith(
+                "... [truncated: 502 entries, showing first 500; raise limit, "
+                "or glob the directory for a narrower match]"
+            )
+        )
+
+    def test_list_dir_limit_arg(self):
+        for i in range(20):
+            with open(os.path.join(self.tmp, f"g{i:03d}.txt"), "w") as f:
+                f.write("x")
+        out = h.tool_list_dir({"path": self.tmp, "limit": 5})
+        self.assertEqual(len(out.split("\n")), 6)
+        self.assertIn("[truncated: 20 entries, showing first 5;", out)
 
     def test_copy(self):
         self.w("st/a.txt", "one\ntwo\n")
@@ -501,7 +576,19 @@ class TestRunShell(Base):
 
     def test_output_truncation(self):
         r = self.sh("python -c \"import sys; sys.stdout.write('x'*30000)\"")
-        self.assertTrue(r.startswith("exit code: 0\n" + "x" * 20_000 + "\n... [truncated, 30000 chars total]"))
+        self.assertTrue(
+            r.startswith(
+                "exit code: 0\n"
+                + "x" * 20_000
+                + "\n... [truncated: 30000 chars total, showing first 20000; re-run with a larger "
+                "max_output, or redirect to a file and read it with read_file]"
+            )
+        )
+
+    def test_max_output_arg(self):
+        r = self.sh("python -c \"import sys; sys.stdout.write('x'*3000)\"", max_output=500)
+        self.assertTrue(r.startswith("exit code: 0\n" + "x" * 500))
+        self.assertIn("[truncated: 3000 chars total, showing first 500;", r)
 
     def test_timeout(self):
         out = self.sh("python -c \"import time; time.sleep(2)\"", timeout=1)
@@ -584,8 +671,17 @@ class TestFetchUrl(unittest.TestCase):
 
     def test_truncation(self):
         out = self._fetch("x" * 60_000)
-        self.assertTrue(out.endswith("\n... [truncated]"))
-        self.assertEqual(len(out), 50_000 + len("\n... [truncated]"))
+        note = (
+            "\n... [truncated: 60000 chars total, showing first 50000; "
+            "raise max_chars, or fetch a narrower URL]"
+        )
+        self.assertTrue(out.endswith(note))
+        self.assertEqual(len(out), 50_000 + len(note))
+
+    def test_max_chars_arg(self):
+        out = self._fetch("y" * 5_000, max_chars=1_000)
+        self.assertTrue(out.startswith("y" * 1_000))
+        self.assertIn("[truncated: 5000 chars total, showing first 1000;", out)
 
     def test_empty(self):
         self.assertEqual(self._fetch(""), "(empty)")
@@ -596,6 +692,90 @@ class TestFetchUrl(unittest.TestCase):
         self.assertIn("fetch_url", all_names)
         self.assertIn("fetch_url", interactive_names)
         self.assertIn("fetch_url", h.DISPATCH)
+
+
+class TestOutputCaps(unittest.TestCase):
+    """Two layers: model-facing limit args, and harness-side ceilings that clamp them."""
+
+    def test_limit_arg_default_clamp_and_fallback(self):
+        self.assertEqual(h._limit_arg({}, "limit", 200, 5000), 200)
+        self.assertEqual(h._limit_arg({"limit": 5}, "limit", 200, 5000), 5)
+        self.assertEqual(h._limit_arg({"limit": 99999}, "limit", 200, 5000), 5000)
+        self.assertEqual(h._limit_arg({"limit": 0}, "limit", 200, 5000), 1)
+        self.assertEqual(h._limit_arg({"limit": -3}, "limit", 200, 5000), 1)
+        self.assertEqual(h._limit_arg({"limit": "42"}, "limit", 200, 5000), 42)
+        self.assertEqual(h._limit_arg({"limit": "abc"}, "limit", 200, 5000), 200)
+        self.assertEqual(h._limit_arg({"limit": None}, "limit", 200, 5000), 200)
+
+    def test_truncate_helper(self):
+        out = h._truncate("z" * 100, 50, hint="narrow it")
+        self.assertTrue(out.startswith("z" * 50))
+        self.assertEqual(
+            out[50:], "\n... [truncated: 100 chars total, showing first 50; narrow it]"
+        )
+
+    def test_truncate_noop_when_under_limit(self):
+        self.assertEqual(h._truncate("short", 50, hint="x"), "short")
+
+    def test_cap_count_helper(self):
+        out = h._cap_count([str(i) for i in range(10)], 3, unit="files", hint="narrow")
+        self.assertEqual(out, "0\n1\n2\n... [truncated: 10 files, showing first 3; narrow]")
+
+    def test_cap_count_noop_when_under_limit(self):
+        self.assertEqual(h._cap_count(["a", "b"], 5, unit="files"), "a\nb")
+
+    def test_clip_line_helper(self):
+        self.assertEqual(h._clip_line("q" * 500, 100), "q" * 100 + " …[+400 chars on this line]")
+        self.assertEqual(h._clip_line("short", 100), "short")
+
+    def test_execute_tool_backstop_caps_any_result(self):
+        h.DISPATCH["_huge"] = lambda args: "h" * (h.TOOL_RESULT_LIMIT + 5_000)
+        self.addCleanup(h.DISPATCH.pop, "_huge", None)
+        out = h.execute_tool("_huge", "{}")
+        self.assertTrue(out.startswith("h" * h.TOOL_RESULT_LIMIT))
+        self.assertIn(f"showing first {h.TOOL_RESULT_LIMIT};", out)
+
+    def test_execute_tool_backstop_applies_to_mcp_path(self):
+        class HugeClient:
+            def call_tool(self, name, args):
+                return "m" * (h.TOOL_RESULT_LIMIT + 9_000)
+
+        h.MCP_DISPATCH["_huge_mcp"] = (HugeClient(), "huge")
+        self.addCleanup(h.MCP_DISPATCH.pop, "_huge_mcp", None)
+        out = h.execute_tool("_huge_mcp", "{}")
+        self.assertTrue(out.startswith("m" * h.TOOL_RESULT_LIMIT))
+        self.assertIn("[truncated:", out)
+
+    def test_mcp_text_result_capped(self):
+        out = h._mcp_content_to_text({"content": [{"type": "text", "text": "m" * 40_000}]})
+        self.assertTrue(out.startswith("m" * h.MCP_RESULT_LIMIT))
+        self.assertIn(f"showing first {h.MCP_RESULT_LIMIT};", out)
+
+    def test_mcp_structured_content_capped(self):
+        out = h._mcp_content_to_text({"structuredContent": {"blob": "s" * 40_000}})
+        self.assertLess(len(out), h.MCP_RESULT_LIMIT + 200)
+        self.assertIn("[truncated:", out)
+
+    def test_limit_args_are_exposed_in_schemas(self):
+        expected = {
+            "grep": "limit",
+            "glob": "limit",
+            "list_dir": "limit",
+            "read_file": "max_chars",
+            "run_shell": "max_output",
+            "fetch_url": "max_chars",
+        }
+        for name, arg in expected.items():
+            props = h.TOOLS[name][0]["function"]["parameters"]["properties"]
+            self.assertIn(arg, props, f"{name} schema should expose {arg}")
+
+    def test_cap_constants_are_ordered(self):
+        # The backstop must sit above every per-tool cap, otherwise a tool that
+        # already trimmed gets a second truncation note appended.
+        for cap in (h.READ_FILE_LIMIT, h.SHELL_OUTPUT_LIMIT, h.FETCH_TEXT_LIMIT,
+                    h.MCP_RESULT_LIMIT, h.SUBAGENT_SUMMARY_LIMIT):
+            self.assertLess(cap, h.TOOL_RESULT_LIMIT)
+        self.assertLess(h.GREP_TEXT_LIMIT, h.TOOL_RESULT_LIMIT)
 
 
 class TestColorize(unittest.TestCase):
@@ -1009,7 +1189,12 @@ class TestLoadAgentsMd(Base):
             f.write("a" * 25_000)
         out = h.load_agents_md()
         self.assertTrue(out.startswith("a" * 20_000))
-        self.assertTrue(out.endswith("\n... [truncated]"))
+        self.assertTrue(
+            out.endswith(
+                "\n... [truncated: 25000 chars total, showing first 20000; "
+                "AGENTS.md is long; trim the project instructions]"
+            )
+        )
 
 
 class TestDispatch(Base):
@@ -1073,6 +1258,21 @@ class TestSubagents(unittest.TestCase):
         h._AGENT_DEPTH = h.MAX_SUBAGENT_DEPTH
         out = h.tool_task({"task": "do something"})
         self.assertTrue(out.startswith("error: sub-agent depth limit reached"))
+
+    def test_task_summary_capped(self):
+        def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0):
+            messages.append({"role": "assistant", "content": "s" * 30_000})
+            return 0
+
+        old = h.run_agent
+        h.run_agent = fake_run_agent
+        self.addCleanup(setattr, h, "run_agent", old)
+        out = h.tool_task({"task": "do X"})
+        self.assertTrue(out.startswith("exit code: 0\n" + "s" * h.SUBAGENT_SUMMARY_LIMIT))
+        self.assertIn(
+            f"showing first {h.SUBAGENT_SUMMARY_LIMIT};",
+            out,
+        )
 
     def test_task_runs_nested_agent(self):
         calls = []
@@ -2519,6 +2719,24 @@ class TestTodo(Base):
         self.assertEqual(len(reminders), 1)
         self.assertIn("1. step", reminders[0]["content"])
 
+    def test_output_capped(self):
+        for i in range(300):
+            h.tool_todo({"action": "add", "text": ("item %d " % i) * 40})
+        out = h.tool_todo({"action": "list"})
+        self.assertIn(f"showing first {h.TODO_BLOCK_LIMIT};", out)
+        # the file on disk keeps the full list; only what enters the chat is trimmed
+        with open(h.TODO_FILE, "r", encoding="utf-8") as f:
+            self.assertEqual(len(f.read().splitlines()), 300)
+
+    def test_reminder_capped(self):
+        for i in range(300):
+            h.tool_todo({"action": "add", "text": ("x " * 60) + str(i)})
+        messages = []
+        h._todo_reminder(messages)
+        reminders = [m for m in messages if m.get("role") == "system"]
+        self.assertEqual(len(reminders), 1)
+        self.assertLess(len(reminders[0]["content"]), h.TODO_BLOCK_LIMIT + 200)
+
 
 class TestMemory(Base):
     def setUp(self):
@@ -2586,6 +2804,21 @@ class TestMemory(Base):
 
     def test_load_memory_empty(self):
         self.assertEqual(h.load_memory(), "")
+
+    def test_list_output_capped(self):
+        for i in range(200):
+            self.mem(action="add", text=("note %d " % i) * 30)
+        out = self.mem(action="list", scope="project")
+        self.assertIn(f"showing first {h.MEMORY_BLOCK_LIMIT};", out)
+
+    def test_load_memory_capped(self):
+        # load_memory feeds every system prompt, so an unbounded notes file
+        # would silently eat context.
+        for i in range(200):
+            self.mem(action="add", text=("long note %d " % i) * 30)
+        block = h.load_memory()
+        self.assertLess(len(block), h.MEMORY_BLOCK_LIMIT + 200)
+        self.assertIn("[truncated:", block)
 
 
 class TestStateToolsRegistered(unittest.TestCase):
@@ -2836,7 +3069,12 @@ class TestFileRefs(Base):
         self._write("big.txt", "a" * 60_000)
         out = h.expand_file_refs("@[cwd://big.txt]")
         self.assertEqual(len(out), 1)
-        self.assertTrue(out[0]["text"].endswith("\n... [truncated]"))
+        self.assertTrue(
+            out[0]["text"].endswith(
+                "\n... [truncated: 60000 chars total, showing first 50000; "
+                "the referenced file is large; reference a narrower file]"
+            )
+        )
 
     def test_multiple_refs_ordering(self):
         self._write("a.txt", "AAA")
