@@ -2679,7 +2679,7 @@ class TestTodo(Base):
         self.todo(action="add", text="a")
         h._todo_reminder(messages)
         self.assertEqual(len(messages), 1)
-        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(messages[0]["role"], "user")
         self.assertIn("1. a", messages[0]["content"])
         h._todo_reminder(messages)  # unchanged list: no duplicate reminder
         self.assertEqual(len(messages), 1)
@@ -2715,7 +2715,7 @@ class TestTodo(Base):
         with contextlib.redirect_stdout(buf):
             code = h.run_agent(messages, "m")
         self.assertEqual(code, 0)
-        reminders = [m for m in messages if m.get("role") == "system" and "todo list" in (m.get("content") or "")]
+        reminders = [m for m in messages if m.get("role") == "user" and "todo list" in (m.get("content") or "")]
         self.assertEqual(len(reminders), 1)
         self.assertIn("1. step", reminders[0]["content"])
 
@@ -2733,7 +2733,7 @@ class TestTodo(Base):
             h.tool_todo({"action": "add", "text": ("x " * 60) + str(i)})
         messages = []
         h._todo_reminder(messages)
-        reminders = [m for m in messages if m.get("role") == "system"]
+        reminders = [m for m in messages if m.get("role") == "user"]
         self.assertEqual(len(reminders), 1)
         self.assertLess(len(reminders[0]["content"]), h.TODO_BLOCK_LIMIT + 200)
 

@@ -988,7 +988,12 @@ def tool_todo(args: dict) -> str:
 
 
 def _todo_reminder(messages: list):
-    """Append a system reminder with the current todo list if it changed since the last injection."""
+    """Append a reminder with the current todo list if it changed since the last injection.
+
+    Sent as a *user* message, not system: some chat templates (e.g. Qwen) forbid
+    system messages anywhere but the first position, and a mid-conversation system
+    reminder would make the server reject the whole request.
+    """
     global TODO_LAST_INJECTED
     if not TODO_ITEMS:
         TODO_LAST_INJECTED = None
@@ -996,7 +1001,7 @@ def _todo_reminder(messages: list):
     state = json.dumps(TODO_ITEMS, sort_keys=True)
     if state == TODO_LAST_INJECTED:
         return
-    messages.append({"role": "system", "content": "Current todo list:\n" + _todo_block()})
+    messages.append({"role": "user", "content": "Current todo list:\n" + _todo_block()})
     TODO_LAST_INJECTED = state
 
 
