@@ -1,0 +1,6 @@
+.git
+dist
+__pycache__
+.harnless
+.playwright-mcp
+*.pyc
