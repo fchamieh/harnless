@@ -45,8 +45,8 @@ python harnless.py --prompt "summarize the files in this directory"
 |---|---|
 | `/new` | Clear the session history |
 | `/clear-screen` | Clear the terminal |
-| `/tools` | Toggle tools on/off (interactive menu) |
-| `/tools <name>` | Toggle a specific tool on/off |
+| `/tools` | Toggle tools on/off (interactive menu; MCP tools are grouped under their server — space on the server row toggles all of its tools) |
+| `/tools <name>` | Toggle a specific tool on/off (`mcp:<server>` toggles all of a server's tools) |
 | `/status` | Show context usage, model, enabled tools, and MCP servers |
 | `/exit` | Quit (alias: `/quit`) |
 
@@ -83,7 +83,7 @@ External tools can be added via [Model Context Protocol](https://modelcontextpro
 - `--mcp-stdio 'NAME:COMMAND ARGS...'`
 - `--mcp-http 'NAME=URL'`
 
-A server entry may set `"enabled": false` to skip connecting it at startup (it can be enabled later from the `/tools` menu).
+A server entry may set `"enabled": false` to skip connecting it at startup (it can be enabled later from the `/tools` menu). Once connected, the server's tools stay grouped under its entry in the `/tools` menu: space on the server row enables/disables all of its tools at once, and each tool can still be toggled individually.
 
 ## Tools
 

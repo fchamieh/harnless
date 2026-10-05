@@ -2367,8 +2367,10 @@ class TestMcpPending(Base):
         server, port, _ = _fake_mcp_server("pw")
         try:
             h.PENDING_MCP.append(("pwserver", {"transport": "http", "url": f"http://127.0.0.1:{port}/mcp"}))
-            n_tools = len(h.OPENAI_TOOLS_INTERACTIVE) + len(h.MCP_TOOLS)
-            keys = ["down"] * n_tools + [("char", " "), "enter"]
+            # rows = built-ins + one row per mcp server + one row per mcp tool + pending
+            n_servers = len({client.name for _, (client, _) in h.MCP_DISPATCH.items()})
+            n_rows = len(h.OPENAI_TOOLS_INTERACTIVE) + n_servers + len(h.MCP_TOOLS)
+            keys = ["down"] * n_rows + [("char", " "), "enter"]
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 applied = h.tools_menu(iter(keys))
@@ -2727,12 +2729,34 @@ class TestToolsToggle(unittest.TestCase):
         self._old_disabled = h.DISABLED_TOOLS
         h.DISABLED_TOOLS = set()
         self.addCleanup(setattr, h, "DISABLED_TOOLS", self._old_disabled)
+        self._old_mcp = (h.MCP_TOOLS, h.MCP_DISPATCH, h.MCP_CLIENTS, h.PENDING_MCP)
+        h.MCP_TOOLS = []
+        h.MCP_DISPATCH = {}
+        h.MCP_CLIENTS = []
+        h.PENDING_MCP = []
+        self.addCleanup(self._restore_mcp)
+
+    def _restore_mcp(self):
+        h.MCP_TOOLS, h.MCP_DISPATCH, h.MCP_CLIENTS, h.PENDING_MCP = self._old_mcp
+
+    def _register(self, server, tools):
+        c = h.MCPClient(server, {"transport": "stdio", "command": "x"})
+        c.connect = lambda: {}
+        c.list_tools = lambda: tools
+        c.close = lambda: None
+        h.register_mcp_tools([c])
+        return c
+
+    def _mcp_tool(self, name, desc="d"):
+        return {"name": name, "description": desc, "inputSchema": {"type": "object", "properties": {}}}
 
     def test_format_tools_all_on(self):
         out = h.format_tools()
         lines = out.split("\n")
         self.assertTrue(lines)
-        self.assertTrue(all(l.startswith("[X] ") for l in lines))
+        for l in lines:
+            if l.lstrip().startswith("["):
+                self.assertTrue(l.lstrip().startswith("[X] "), l)
         self.assertIn("[X] read_file — ", out)
 
     def test_format_tools_reflects_disabled(self):
@@ -2774,12 +2798,73 @@ class TestToolsToggle(unittest.TestCase):
         self.assertNotIn("read_file", tools_line)
         self.assertIn("grep", tools_line)
 
+    def test_toggle_mcp_server_prefix(self):
+        self._register("srv", [self._mcp_tool("t1"), self._mcp_tool("t2")])
+        self.assertEqual(h.toggle_tools(["mcp:srv"]), [("mcp:srv", "off")])
+        self.assertEqual(h.DISABLED_TOOLS, {"t1", "t2"})
+        self.assertEqual(h.toggle_tools(["mcp:srv"]), [("mcp:srv", "on")])
+        self.assertEqual(h.DISABLED_TOOLS, set())
+
+    def test_toggle_mcp_server_prefix_mixed(self):
+        self._register("srv", [self._mcp_tool("t1"), self._mcp_tool("t2")])
+        h.DISABLED_TOOLS.add("t2")
+        self.assertEqual(h.toggle_tools(["mcp:srv"]), [("mcp:srv", "on")])
+        self.assertEqual(h.DISABLED_TOOLS, set())
+
+    def test_toggle_mcp_server_prefix_unknown(self):
+        self.assertEqual(h.toggle_tools(["mcp:nope"]), [("mcp:nope", "unknown")])
+        self.assertEqual(h.DISABLED_TOOLS, set())
+
+    def test_format_tools_groups_mcp(self):
+        self._register("srv", [self._mcp_tool("t1", "d1"), self._mcp_tool("t2", "d2")])
+        out = h.format_tools()
+        lines = out.split("\n")
+        self.assertIn("mcp servers:", lines)
+        self.assertIn("[X] mcp: srv (2 tools)", lines)
+        self.assertIn("  [X] t1 — d1", lines)
+        self.assertIn("  [X] t2 — d2", lines)
+        self.assertLess(lines.index("[X] mcp: srv (2 tools)"), lines.index("  [X] t1 — d1"))
+
+    def test_format_tools_mcp_mixed_mark(self):
+        self._register("srv", [self._mcp_tool("t1", "d1"), self._mcp_tool("t2", "d2")])
+        h.DISABLED_TOOLS.add("t2")
+        out = h.format_tools()
+        self.assertIn("[-] mcp: srv (2 tools)", out)
+        self.assertIn("  [X] t1 — d1", out)
+        self.assertIn("  [ ] t2 — d2", out)
+
+    def test_format_tools_mcp_all_off_mark(self):
+        self._register("srv", [self._mcp_tool("t1"), self._mcp_tool("t2")])
+        h.DISABLED_TOOLS.update({"t1", "t2"})
+        out = h.format_tools()
+        self.assertIn("[ ] mcp: srv (2 tools)", out)
+
 
 class TestToolsMenu(unittest.TestCase):
     def setUp(self):
         self._old_disabled = h.DISABLED_TOOLS
         h.DISABLED_TOOLS = set()
         self.addCleanup(setattr, h, "DISABLED_TOOLS", self._old_disabled)
+        self._old_mcp = (h.MCP_TOOLS, h.MCP_DISPATCH, h.MCP_CLIENTS, h.PENDING_MCP)
+        h.MCP_TOOLS = []
+        h.MCP_DISPATCH = {}
+        h.MCP_CLIENTS = []
+        h.PENDING_MCP = []
+        self.addCleanup(self._restore_mcp)
+
+    def _restore_mcp(self):
+        h.MCP_TOOLS, h.MCP_DISPATCH, h.MCP_CLIENTS, h.PENDING_MCP = self._old_mcp
+
+    def _register(self, server, tools):
+        c = h.MCPClient(server, {"transport": "stdio", "command": "x"})
+        c.connect = lambda: {}
+        c.list_tools = lambda: tools
+        c.close = lambda: None
+        h.register_mcp_tools([c])
+        return c
+
+    def _mcp_tool(self, name, desc="d"):
+        return {"name": name, "description": desc, "inputSchema": {"type": "object", "properties": {}}}
 
     def menu(self, keys):
         import io
@@ -2874,6 +2959,48 @@ class TestToolsMenu(unittest.TestCase):
         applied, out = self.menu(["enter"])
         self.assertTrue(applied)
         self.assertIn("[ ] read_file", out)
+
+    def test_mcp_group_rendering(self):
+        self._register("srv", [self._mcp_tool("t1", "d1"), self._mcp_tool("t2", "d2")])
+        n_builtin = len(h.OPENAI_TOOLS_INTERACTIVE)
+        applied, out = self.menu(["down"] * n_builtin + ["enter"])
+        self.assertTrue(applied)
+        self.assertIn("mcp servers:", out)
+        self.assertIn("> [x] srv", out)
+        self.assertIn("[x] t1", out)
+        self.assertIn("[x] t2", out)
+        self.assertIn("space toggles all", out)
+
+    def test_server_row_toggles_all_off(self):
+        self._register("srv", [self._mcp_tool("t1"), self._mcp_tool("t2")])
+        n_builtin = len(h.OPENAI_TOOLS_INTERACTIVE)
+        applied, _ = self.menu(["down"] * n_builtin + [("char", " "), "enter"])
+        self.assertTrue(applied)
+        self.assertEqual(h.DISABLED_TOOLS, {"t1", "t2"})
+
+    def test_server_row_mixed_toggles_all_on(self):
+        self._register("srv", [self._mcp_tool("t1"), self._mcp_tool("t2")])
+        h.DISABLED_TOOLS.add("t2")
+        n_builtin = len(h.OPENAI_TOOLS_INTERACTIVE)
+        applied, out = self.menu(["down"] * n_builtin + [("char", " "), "enter"])
+        self.assertTrue(applied)
+        self.assertEqual(h.DISABLED_TOOLS, set())
+        self.assertIn("[x] srv", out)
+
+    def test_server_row_mixed_mark(self):
+        self._register("srv", [self._mcp_tool("t1"), self._mcp_tool("t2")])
+        h.DISABLED_TOOLS.add("t2")
+        applied, out = self.menu(["enter"])
+        self.assertTrue(applied)
+        self.assertIn("[-] srv", out)
+
+    def test_individual_mcp_tool_toggle(self):
+        self._register("srv", [self._mcp_tool("t1"), self._mcp_tool("t2")])
+        n_builtin = len(h.OPENAI_TOOLS_INTERACTIVE)
+        # rows: built-ins, then the 'srv' server row, then its tools
+        applied, _ = self.menu(["down"] * (n_builtin + 1) + [("char", " "), "enter"])
+        self.assertTrue(applied)
+        self.assertEqual(h.DISABLED_TOOLS, {"t1"})
 
 
 class TestCommandsMenu(unittest.TestCase):

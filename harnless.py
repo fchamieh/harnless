@@ -2161,6 +2161,13 @@ def _enable_pending_mcp(name: str) -> tuple:
     return False, f"{icon('error')} mcp server '{name}' is not pending"
 
 
+def _mcp_server_tools(server: str) -> list:
+    """Sorted names of the tools registered from the given MCP server."""
+    return sorted(
+        name for name, (client, _) in MCP_DISPATCH.items() if client.name == server
+    )
+
+
 def get_system_prompt(cwd, additional) -> str:
     return (
         "You are a coding assistant running inside a harness. Your working directory is {cwd}. "
@@ -3825,22 +3832,62 @@ def _all_tool_names() -> set:
 
 
 def format_tools() -> str:
-    """Build the /tools checklist: '[X] name — description' per tool."""
+    """Build the /tools checklist: '[X] name — description' per tool.
+
+    MCP tools are grouped under their server ('[X] mcp: server (N tools)'),
+    mirroring the interactive menu.
+    """
     lines = []
-    for s in sorted(OPENAI_TOOLS_INTERACTIVE + MCP_TOOLS, key=lambda s: s["function"]["name"]):
+    for s in sorted(OPENAI_TOOLS_INTERACTIVE, key=lambda s: s["function"]["name"]):
         name = s["function"]["name"]
         desc = s["function"].get("description", "")
         mark = " " if name in DISABLED_TOOLS else "X"
         lines.append(f"[{mark}] {name} — {desc}")
+    mcp_descs = {s["function"]["name"]: s["function"].get("description", "") for s in MCP_TOOLS}
+    mcp_by_server = {}
+    for name, (client, _) in MCP_DISPATCH.items():
+        mcp_by_server.setdefault(client.name, []).append(name)
+    server_order = [c.name for c in MCP_CLIENTS if c.name in mcp_by_server]
+    if server_order:
+        lines.append("mcp servers:")
+        for server in server_order:
+            tools = sorted(mcp_by_server[server])
+            off = sum(1 for t in tools if t in DISABLED_TOOLS)
+            mark = "X" if off == 0 else (" " if off == len(tools) else "-")
+            lines.append(f"[{mark}] mcp: {server} ({len(tools)} tools)")
+            for t in tools:
+                tmark = " " if t in DISABLED_TOOLS else "X"
+                lines.append(f"  [{tmark}] {t} — {mcp_descs.get(t, '')}")
+    if PENDING_MCP:
+        lines.append("mcp servers (disabled in config):")
+        for n, _ in PENDING_MCP:
+            lines.append(f"[ ] {n}")
     return "\n".join(lines)
 
 
 def toggle_tools(names: list) -> list:
-    """Toggle the given tool names on/off. Returns [(name, 'on'|'off'|'unknown')]."""
+    """Toggle the given tool names on/off. Returns [(name, 'on'|'off'|'unknown')].
+
+    A name of the form 'mcp:<server>' toggles every tool of that server at
+    once (any off -> all on, otherwise all off).
+    """
     known = _all_tool_names()
     results = []
     for n in names:
-        if n not in known:
+        if n.startswith("mcp:"):
+            server = n[len("mcp:"):]
+            tools = _mcp_server_tools(server)
+            if not tools:
+                results.append((n, "unknown"))
+            else:
+                any_off = any(t in DISABLED_TOOLS for t in tools)
+                for t in tools:
+                    if any_off:
+                        DISABLED_TOOLS.discard(t)
+                    else:
+                        DISABLED_TOOLS.add(t)
+                results.append((n, "on" if any_off else "off"))
+        elif n not in known:
             results.append((n, "unknown"))
         elif n in DISABLED_TOOLS:
             DISABLED_TOOLS.discard(n)
@@ -3854,46 +3901,75 @@ def toggle_tools(names: list) -> list:
 def tools_menu(keys=None) -> bool:
     """Interactive tool toggle menu.
 
-    Up/down move the cursor, space toggles the highlighted tool (or enables a
-    disabled-in-config mcp server), enter applies the changes and quits, esc
-    (or ctrl+c/ctrl+d) quits without applying them. Returns True if changes
-    were applied, False if cancelled.
+    Built-in tools are listed flat; mcp tools are grouped under their server
+    entry, where space toggles all of the server's tools at once (individual
+    tools can still be toggled on their own rows). A disabled-in-config mcp
+    server is enabled by toggling its row. Up/down move the cursor, enter
+    applies the changes and quits, esc (or ctrl+c/ctrl+d) quits without
+    applying them. Returns True if changes were applied, False if cancelled.
     """
-    specs = sorted(
-        OPENAI_TOOLS_INTERACTIVE + MCP_TOOLS, key=lambda s: s["function"]["name"]
+    builtin_specs = sorted(
+        OPENAI_TOOLS_INTERACTIVE, key=lambda s: s["function"]["name"]
     )
-    tool_names = [s["function"]["name"] for s in specs]
-    tool_descs = [s["function"].get("description", "") for s in specs]
+    mcp_by_server = {}
+    for name, (client, _) in MCP_DISPATCH.items():
+        mcp_by_server.setdefault(client.name, []).append(name)
+    server_order = [c.name for c in MCP_CLIENTS if c.name in mcp_by_server]
     pending_names = [n for n, _ in PENDING_MCP]
-    names = tool_names + pending_names
-    descs = tool_descs + [f"mcp server '{n}' (disabled in config)" for n in pending_names]
-    if not names:
+    rows = [("tool", s["function"]["name"]) for s in builtin_specs]
+    for server in server_order:
+        rows.append(("server", server))
+        for t in sorted(mcp_by_server[server]):
+            rows.append(("tool", t))
+    rows += [("pending", n) for n in pending_names]
+    if not rows:
         return False
+    descs = {s["function"]["name"]: s["function"].get("description", "") for s in builtin_specs}
+    for s in MCP_TOOLS:
+        descs[s["function"]["name"]] = s["function"].get("description", "")
     disabled = set(DISABLED_TOOLS)
     pending_on = set()
     cursor = 0
     width = shutil.get_terminal_size((80, 24)).columns
     applied = False
     enable_msgs = []
+    n_builtin = len(builtin_specs)
+    n_server_rows = sum(1 + len(mcp_by_server[s]) for s in server_order)
+
+    def row_desc(kind, name):
+        if kind == "pending":
+            return f"mcp server '{name}' (disabled in config)"
+        if kind == "server":
+            return f"mcp server '{name}' — {len(mcp_by_server[name])} tools (space toggles all)"
+        return descs.get(name, "")
+
+    def server_mark(server):
+        tools = mcp_by_server[server]
+        off = sum(1 for t in tools if t in disabled)
+        if off == 0:
+            return "x"
+        if off == len(tools):
+            return " "
+        return "-"
 
     def build_lines():
         lines = [colorize("tools — space: toggle, enter: apply, esc: cancel", "dim")]
-        for i, name in enumerate(tool_names):
-            mark = " " if name in disabled else "x"
+        for i, (kind, name) in enumerate(rows):
+            if i == n_builtin and server_order:
+                lines.append(colorize("  mcp servers:", "dim"))
+            if i == n_builtin + n_server_rows and pending_names:
+                lines.append(colorize("  mcp servers (disabled in config):", "dim"))
+            if kind == "server":
+                mark = server_mark(name)
+            elif kind == "pending":
+                mark = "x" if name in pending_on else " "
+            else:
+                mark = " " if name in disabled else "x"
             if i == cursor:
                 lines.append(colorize(f"> [{mark}] {name}", "tool"))
             else:
                 lines.append(f"  [{mark}] {name}")
-        if pending_names:
-            lines.append(colorize("  mcp servers (disabled in config):", "dim"))
-            for j, name in enumerate(pending_names):
-                i = len(tool_names) + j
-                mark = "x" if name in pending_on else " "
-                if i == cursor:
-                    lines.append(colorize(f"> [{mark}] {name}", "tool"))
-                else:
-                    lines.append(f"  [{mark}] {name}")
-        desc = descs[cursor]
+        desc = row_desc(*rows[cursor])
         if len(desc) > width - 1:
             desc = desc[: width - 4] + "..."
         lines.append(colorize(desc, "dim"))
@@ -3920,7 +3996,7 @@ def tools_menu(keys=None) -> bool:
             if token == "up":
                 cursor = max(0, cursor - 1)
             elif token == "down":
-                cursor = min(len(names) - 1, cursor + 1)
+                cursor = min(len(rows) - 1, cursor + 1)
             elif token == "enter":
                 DISABLED_TOOLS.clear()
                 DISABLED_TOOLS.update(disabled)
@@ -3932,18 +4008,23 @@ def tools_menu(keys=None) -> bool:
             elif token in ("esc", "ctrl_c", "ctrl_d"):
                 break
             elif token == ("char", " "):
-                if cursor < len(tool_names):
-                    name = tool_names[cursor]
-                    if name in disabled:
-                        disabled.discard(name)
-                    else:
-                        disabled.add(name)
-                else:
-                    name = pending_names[cursor - len(tool_names)]
+                kind, name = rows[cursor]
+                if kind == "pending":
                     if name in pending_on:
                         pending_on.discard(name)
                     else:
                         pending_on.add(name)
+                elif kind == "server":
+                    tools = mcp_by_server[name]
+                    if any(t in disabled for t in tools):
+                        disabled.difference_update(tools)
+                    else:
+                        disabled.update(tools)
+                else:
+                    if name in disabled:
+                        disabled.discard(name)
+                    else:
+                        disabled.add(name)
             draw()
     except StopIteration:
         pass
@@ -4105,7 +4186,7 @@ def commands_menu(keys=None) -> str | None:
 def format_help() -> str:
     """Build the /help report: list of REPL commands and file references."""
     lines = [f"{name:<16} {desc}" for name, desc in REPL_COMMANDS]
-    lines.append(f"{'/tools <name>':<16} toggle a tool on/off")
+    lines.append(f"{'/tools <name>':<16} toggle a tool on/off ('mcp:<server>' toggles all of a server's tools)")
     lines.append("Ctrl+J          insert a newline (multi-line input); Enter submits")
     lines.append(f"{'esc esc':<16} interrupt generation (press twice within 2 s)")
     return (
