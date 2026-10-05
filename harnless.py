@@ -76,8 +76,12 @@ IMAGE_MIME = {
     ".bmp": "image/bmp",
 }
 _REF_RE = re.compile(r"@\[((?:cwd|file|https?)://[^\]]+)\]")
+# Preferred shell for run_shell on Windows: "auto" (pwsh → powershell → cmd),
+# or force "pwsh" / "powershell" / "cmd". Set from --shell in main().
+SHELL_PREFERRED = "auto"
 SHELL_NOTE = (
-    " Commands run in cmd.exe; prefer cross-platform commands (e.g. dir, type, copy, del) over bash-specific syntax."
+    " Commands run in PowerShell (pwsh, falling back to powershell.exe); use PowerShell syntax "
+    "(e.g. Get-ChildItem, Select-String, Get-Content, Copy-Item) — bash/cmd syntax will not work."
     if os.name == "nt"
     else " Commands run in bash."
 )
@@ -113,6 +117,7 @@ ICONS = {
     "exit": "🏁",
     "error": "⚠️",
     "wait": "⏳",
+    "ok": "✅",
 }
 ASCII_ICONS = {
     "user": "you",
@@ -123,6 +128,7 @@ ASCII_ICONS = {
     "exit": "exit",
     "error": "err",
     "wait": "wait",
+    "ok": "ok",
 }
 
 
@@ -357,6 +363,8 @@ def tool_ask_user(args: dict) -> str:
     _print_question(question)
     for i, opt in enumerate(options, 1):
         print(OUTPUT_INDENT + colorize(f"  {i}) {opt}", "dim"))
+    if options:
+        print(OUTPUT_INDENT + colorize("  (or type your own answer)", "dim"))
     prompt = OUTPUT_INDENT + colorize(f"{icon('user')} answer> ", "user")
     answer = _prompt_line(prompt)
     if answer is None:
@@ -403,17 +411,81 @@ def tool_confirm(args: dict) -> str:
         print(OUTPUT_INDENT + colorize("  please answer yes or no", "error"))
 
 
+_SHELL_CACHE: dict[str, tuple] = {}
+
+
+def _resolve_shell(preferred: str = "auto") -> tuple:
+    """Resolve the shell run_shell should use.
+
+    Returns (argv_prefix, command_prefix):
+      argv_prefix: list [shell, flags...] to spawn directly, or None to use
+                   shell=True (cmd.exe on Windows, sh elsewhere).
+      command_prefix: text prepended to the user command (forces UTF-8 console
+                      output on PowerShell 5.1, which defaults to the ANSI code page).
+
+    On Windows the preference order is pwsh (PowerShell 7+) → powershell.exe
+    (5.1) → cmd.exe; `preferred` can force one of them (falling back to the
+    order when the forced shell is missing). Non-Windows always uses shell=True.
+    """
+    if os.name != "nt":
+        return (None, "")
+    if preferred in _SHELL_CACHE:
+        return _SHELL_CACHE[preferred]
+
+    def _pwsh():
+        p = shutil.which("pwsh")
+        return [p, "-NoProfile", "-NonInteractive", "-Command"] if p else None
+
+    def _ps():
+        p = shutil.which("powershell")
+        return [p, "-NoProfile", "-NonInteractive", "-Command"] if p else None
+
+    utf8 = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+    result = None
+    if preferred == "pwsh":
+        a = _pwsh()
+        result = (a, "") if a else None
+    elif preferred == "powershell":
+        a = _ps()
+        result = (a, utf8) if a else None
+    elif preferred == "cmd":
+        result = (None, "")
+    if result is None:  # auto, or a forced shell that is missing
+        a = _pwsh()
+        result = (a, "") if a else None
+        if result is None:
+            a = _ps()
+            result = (a, utf8) if a else (None, "")
+    _SHELL_CACHE[preferred] = result
+    return result
+
+
 def tool_run_shell(args: dict) -> str:
     command = args.get("command", "")
     if not command.strip():
         return "error: empty command"
+    argv_prefix, command_prefix = _resolve_shell(SHELL_PREFERRED)
+    if argv_prefix is not None:
+        # PowerShell -Command maps any non-zero native exit code to 1; append
+        # `exit $LASTEXITCODE` so the real exit code of the last native command
+        # is propagated (pure PowerShell statements leave it at 0).
+        cmd = argv_prefix + [command_prefix + command + "; exit $LASTEXITCODE"]
+        shell = False
+        # PowerShell output is UTF-8 (forced on 5.1, default on pwsh 7);
+        # decode as UTF-8 rather than the locale code page.
+        encoding = "utf-8"
+    else:
+        cmd = command
+        shell = True
+        encoding = None
     try:
         proc = subprocess.run(
-            command,
-            shell=True,
+            cmd,
+            shell=shell,
             cwd=CWD,
             capture_output=True,
             text=True,
+            encoding=encoding,
             timeout=int(args.get("timeout", 120)),
         )
         out = []
@@ -1623,7 +1695,7 @@ TOOLS = {
                         "options": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Optional suggested choices; the user can pick one by number or type their own answer",
+                            "description": "Optional suggested choices; the user can pick one by number, or type their own answer (the UI already offers that, so don't add a 'custom answer' option)",
                         },
                     },
                     "required": ["question"],
@@ -1698,10 +1770,12 @@ DISPATCH = {name: fn for name, (_, fn) in TOOLS.items()}
 
 MCP_PROTOCOL_VERSION = "2025-06-18"
 MCP_TIMEOUT = 60  # seconds per request
+MCP_HOME_CONFIG = os.path.join(os.path.expanduser("~"), ".harnless", "mcp.json")
 
 MCP_TOOLS = []      # OpenAI tool specs for MCP tools
 MCP_DISPATCH = {}   # tool name -> (MCPClient, tool name)
 MCP_CLIENTS = []    # all configured MCP clients (for /status)
+PENDING_MCP = []    # [(name, config)] servers with "enabled": false; enable via /tools
 
 DISABLED_TOOLS = set()  # tool names toggled off via /tools
 
@@ -1776,6 +1850,24 @@ def load_mcp_config(path: str) -> dict:
             cfg["url"] = _expand_env(cfg["url"])
         out[name] = cfg
     return out
+
+
+def _load_mcp_config_into(mcp_servers: dict, path: str) -> None:
+    """Load one MCP config file into mcp_servers (later definitions win)."""
+    try:
+        loaded = load_mcp_config(path)
+    except Exception as e:
+        print(colorize(f"{icon('error')} failed to load mcp config {path}: {e}", "error"))
+        return
+    for name, cfg in loaded.items():
+        if name in mcp_servers:
+            print(
+                colorize(
+                    f"{icon('error')} duplicate mcp server name '{name}'; later definition wins",
+                    "error",
+                )
+            )
+        mcp_servers[name] = cfg
 
 
 def _parse_mcp_stdio(spec: str):
@@ -1863,6 +1955,15 @@ class MCPClient:
         env = os.environ.copy()
         for k, v in (self.config.get("env") or {}).items():
             env[k] = v
+        shell = False
+        if os.name == "nt":
+            # Windows: PATH entries like npx/npm/uvx are .cmd shims, which
+            # CreateProcess (shell=False) cannot launch (WinError 2) — route
+            # them through cmd.exe. list2cmdline quotes the args, so this is
+            # safe even with spaces in arguments.
+            resolved = shutil.which(command)
+            if resolved and resolved.lower().endswith((".cmd", ".bat")):
+                shell = True
         self._proc = subprocess.Popen(
             args,
             stdin=subprocess.PIPE,
@@ -1871,6 +1972,7 @@ class MCPClient:
             cwd=CWD,
             env=env,
             text=True,
+            shell=shell,
         )
         self._out_q = queue.Queue()
         threading.Thread(target=self._drain_stdout, daemon=True).start()
@@ -2030,6 +2132,63 @@ class MCPClient:
         return _mcp_content_to_text(result)
 
 
+def _register_mcp_client(client) -> bool:
+    """Connect one MCP client and append its tools to MCP_TOOLS/MCP_DISPATCH.
+
+    Returns True if the server connected (its tools, if any, are registered),
+    False if the connection failed.
+    """
+    global MCP_CLIENTS
+    MCP_CLIENTS.append(client)
+    try:
+        client.connect()
+    except Exception as e:
+        print(
+            colorize(
+                f"{icon('error')} mcp server '{client.name}' failed to connect: {e}",
+                "error",
+            )
+        )
+        return False
+    try:
+        tools = client.list_tools()
+    except Exception as e:
+        print(
+            colorize(
+                f"{icon('error')} mcp server '{client.name}' tools/list failed: {e}",
+                "error",
+            )
+        )
+        client.close()
+        return True
+    for t in tools:
+        name = t.get("name")
+        if not name:
+            continue
+        if name in DISPATCH or name in MCP_DISPATCH:
+            print(
+                colorize(
+                    f"{icon('error')} mcp tool '{name}' (server '{client.name}') "
+                    f"collides with an existing tool; skipped",
+                    "error",
+                )
+            )
+            continue
+        spec = {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": t.get("description") or "",
+                "parameters": t.get("inputSchema")
+                or {"type": "object", "properties": {}},
+            },
+        }
+        MCP_TOOLS.append(spec)
+        MCP_DISPATCH[name] = (client, name)
+        client.tool_names.append(name)
+    return True
+
+
 def register_mcp_tools(clients: list) -> None:
     """Connect to MCP clients and register their tools into MCP_TOOLS/MCP_DISPATCH.
 
@@ -2039,54 +2198,26 @@ def register_mcp_tools(clients: list) -> None:
     global MCP_TOOLS, MCP_DISPATCH, MCP_CLIENTS
     MCP_TOOLS = []
     MCP_DISPATCH = {}
-    MCP_CLIENTS = list(clients)
+    MCP_CLIENTS = []
     for client in clients:
-        try:
-            client.connect()
-        except Exception as e:
-            print(
-                colorize(
-                    f"{icon('error')} mcp server '{client.name}' failed to connect: {e}",
-                    "error",
-                )
-            )
-            continue
-        try:
-            tools = client.list_tools()
-        except Exception as e:
-            print(
-                colorize(
-                    f"{icon('error')} mcp server '{client.name}' tools/list failed: {e}",
-                    "error",
-                )
-            )
-            client.close()
-            continue
-        for t in tools:
-            name = t.get("name")
-            if not name:
-                continue
-            if name in DISPATCH or name in MCP_DISPATCH:
-                print(
-                    colorize(
-                        f"{icon('error')} mcp tool '{name}' (server '{client.name}') "
-                        f"collides with an existing tool; skipped",
-                        "error",
-                    )
-                )
-                continue
-            spec = {
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": t.get("description") or "",
-                    "parameters": t.get("inputSchema")
-                    or {"type": "object", "properties": {}},
-                },
-            }
-            MCP_TOOLS.append(spec)
-            MCP_DISPATCH[name] = (client, name)
-            client.tool_names.append(name)
+        _register_mcp_client(client)
+
+
+def _enable_pending_mcp(name: str) -> tuple:
+    """Connect a pending (enabled:false) MCP server and register its tools.
+
+    Returns (ok, message). On failure the server stays pending so the user can
+    retry from /tools.
+    """
+    for i, (n, cfg) in enumerate(PENDING_MCP):
+        if n == name:
+            client = MCPClient(n, cfg)
+            ok = _register_mcp_client(client)
+            if ok:
+                PENDING_MCP.pop(i)
+                return True, f"{icon('ok')} mcp server '{n}' enabled ({len(client.tool_names)} tools)"
+            return False, f"{icon('error')} mcp server '{n}' failed to connect"
+    return False, f"{icon('error')} mcp server '{name}' is not pending"
 
 
 def get_system_prompt(cwd, additional) -> str:
@@ -3782,29 +3913,45 @@ def toggle_tools(names: list) -> list:
 def tools_menu(keys=None) -> bool:
     """Interactive tool toggle menu.
 
-    Up/down move the cursor, space toggles the highlighted tool, enter
-    applies the changes and quits, esc (or ctrl+c/ctrl+d) quits without
-    applying them. Returns True if changes were applied, False if cancelled.
+    Up/down move the cursor, space toggles the highlighted tool (or enables a
+    disabled-in-config mcp server), enter applies the changes and quits, esc
+    (or ctrl+c/ctrl+d) quits without applying them. Returns True if changes
+    were applied, False if cancelled.
     """
     specs = sorted(
         OPENAI_TOOLS_INTERACTIVE + MCP_TOOLS, key=lambda s: s["function"]["name"]
     )
-    names = [s["function"]["name"] for s in specs]
-    descs = [s["function"].get("description", "") for s in specs]
+    tool_names = [s["function"]["name"] for s in specs]
+    tool_descs = [s["function"].get("description", "") for s in specs]
+    pending_names = [n for n, _ in PENDING_MCP]
+    names = tool_names + pending_names
+    descs = tool_descs + [f"mcp server '{n}' (disabled in config)" for n in pending_names]
     if not names:
         return False
     disabled = set(DISABLED_TOOLS)
+    pending_on = set()
     cursor = 0
     width = shutil.get_terminal_size((80, 24)).columns
+    applied = False
+    enable_msgs = []
 
     def build_lines():
         lines = [colorize("tools — space: toggle, enter: apply, esc: cancel", "dim")]
-        for i, name in enumerate(names):
+        for i, name in enumerate(tool_names):
             mark = " " if name in disabled else "x"
             if i == cursor:
                 lines.append(colorize(f"> [{mark}] {name}", "tool"))
             else:
                 lines.append(f"  [{mark}] {name}")
+        if pending_names:
+            lines.append(colorize("  mcp servers (disabled in config):", "dim"))
+            for j, name in enumerate(pending_names):
+                i = len(tool_names) + j
+                mark = "x" if name in pending_on else " "
+                if i == cursor:
+                    lines.append(colorize(f"> [{mark}] {name}", "tool"))
+                else:
+                    lines.append(f"  [{mark}] {name}")
         desc = descs[cursor]
         if len(desc) > width - 1:
             desc = desc[: width - 4] + "..."
@@ -3836,18 +3983,29 @@ def tools_menu(keys=None) -> bool:
             elif token == "enter":
                 DISABLED_TOOLS.clear()
                 DISABLED_TOOLS.update(disabled)
-                return True
+                for name in pending_on:
+                    _, msg = _enable_pending_mcp(name)
+                    enable_msgs.append(msg)
+                applied = True
+                break
             elif token in ("esc", "ctrl_c", "ctrl_d"):
-                return False
+                break
             elif token == ("char", " "):
-                name = names[cursor]
-                if name in disabled:
-                    disabled.discard(name)
+                if cursor < len(tool_names):
+                    name = tool_names[cursor]
+                    if name in disabled:
+                        disabled.discard(name)
+                    else:
+                        disabled.add(name)
                 else:
-                    disabled.add(name)
+                    name = pending_names[cursor - len(tool_names)]
+                    if name in pending_on:
+                        pending_on.discard(name)
+                    else:
+                        pending_on.add(name)
             draw()
     except StopIteration:
-        return False
+        pass
     finally:
         close = getattr(keys, "close", None)
         if close is not None:
@@ -3855,6 +4013,9 @@ def tools_menu(keys=None) -> bool:
         if drawn:
             sys.stdout.write(f"\x1b[{drawn}B")
             sys.stdout.flush()
+    for msg in enable_msgs:
+        print(msg)
+    return applied
 
 
 def estimate_context_chars(messages: list, interactive: bool = False) -> int:
@@ -3910,6 +4071,9 @@ def format_status(messages: list, context_window: int = 0) -> str:
             names = ", ".join(c.tool_names) if c.tool_names else "no tools"
             mcp_lines.append(f"  {c.name} ({c.transport}): {names}")
         lines.append("mcp servers:\n" + "\n".join(mcp_lines))
+    if PENDING_MCP:
+        pend_lines = [f"  {n} (disabled in config; enable via /tools)" for n, _ in PENDING_MCP]
+        lines.append("mcp servers (disabled):\n" + "\n".join(pend_lines))
     return "\n".join(lines)
 
 
@@ -4122,7 +4286,7 @@ def run_agent(
 
 def main():
     global API_URL, API_KEY, MODEL, TEMPERATURE, MAX_SUBAGENT_DEPTH, VISION_ENABLED
-    global INTERRUPT_ENABLED
+    global INTERRUPT_ENABLED, SHELL_PREFERRED
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[reportAttributeAccessIssue]
@@ -4201,6 +4365,15 @@ def main():
         help="do not send image file references to the model (replace them with a text note); use with text-only models",
     )
     parser.add_argument(
+        "--shell",
+        choices=["auto", "pwsh", "powershell", "cmd"],
+        default="auto",
+        help=(
+            "shell for run_shell on Windows: auto (pwsh → powershell → cmd), "
+            "or force pwsh / powershell / cmd (default: auto; ignored off-Windows)"
+        ),
+    )
+    parser.add_argument(
         "--mcp-config",
         action="append",
         default=None,
@@ -4229,6 +4402,7 @@ def main():
     TEMPERATURE = args.temperature
     MAX_SUBAGENT_DEPTH = args.max_subagents
     VISION_ENABLED = not args.no_vision
+    SHELL_PREFERRED = args.shell
 
     context_window = args.context_window
     if context_window == 0 and args.prompt is None:
@@ -4238,21 +4412,10 @@ def main():
     set_emoji_enabled(not args.no_emoji and _stdout_can_encode_emoji())
 
     mcp_servers = {}
+    if os.path.exists(MCP_HOME_CONFIG):
+        _load_mcp_config_into(mcp_servers, MCP_HOME_CONFIG)
     for path in args.mcp_config or []:
-        try:
-            loaded = load_mcp_config(path)
-        except Exception as e:
-            print(colorize(f"{icon('error')} failed to load mcp config {path}: {e}", "error"))
-            continue
-        for name, cfg in loaded.items():
-            if name in mcp_servers:
-                print(
-                    colorize(
-                        f"{icon('error')} duplicate mcp server name '{name}'; later definition wins",
-                        "error",
-                    )
-                )
-            mcp_servers[name] = cfg
+        _load_mcp_config_into(mcp_servers, path)
     for spec in args.mcp_stdio or []:
         try:
             name, cfg = _parse_mcp_stdio(spec)
@@ -4268,12 +4431,20 @@ def main():
             continue
         mcp_servers[name] = cfg
 
+    # Servers with "enabled": false are kept pending; the user can enable them
+    # from the /tools menu (which connects them on demand).
+    for name in [n for n, cfg in mcp_servers.items() if not cfg.get("enabled", True)]:
+        cfg = mcp_servers.pop(name)
+        cfg.pop("enabled", None)
+        PENDING_MCP.append((name, cfg))
+
     if mcp_servers:
         mcp_clients = [MCPClient(name, cfg) for name, cfg in mcp_servers.items()]
         register_mcp_tools(mcp_clients)
 
+    if mcp_servers or PENDING_MCP:
         def _close_mcp():
-            for c in mcp_clients:
+            for c in MCP_CLIENTS:
                 try:
                     c.close()
                 except Exception:

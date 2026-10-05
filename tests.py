@@ -594,6 +594,77 @@ class TestRunShell(Base):
         out = self.sh("python -c \"import time; time.sleep(2)\"", timeout=1)
         self.assertEqual(out, "error: command timed out after 1s")
 
+    @unittest.skipUnless(sys.platform == "win32", "PowerShell only on Windows")
+    def test_uses_powershell_on_windows(self):
+        # Write-Output is PowerShell syntax; cmd.exe would fail to run it.
+        out = self.sh("Write-Output 'hello-ps'")
+        self.assertEqual(out, "exit code: 0\nhello-ps")
+
+    @unittest.skipUnless(sys.platform == "win32", "PowerShell only on Windows")
+    def test_powershell_utf8_output(self):
+        # Non-ASCII must survive the shell round-trip (UTF-8 on pwsh 7, forced on 5.1).
+        out = self.sh("Write-Output 'héllo'")
+        self.assertEqual(out, "exit code: 0\nhéllo")
+
+
+class TestResolveShell(Base):
+    def setUp(self):
+        super().setUp()
+        self._saved_cache = dict(h._SHELL_CACHE)
+        h._SHELL_CACHE.clear()
+
+    def tearDown(self):
+        h._SHELL_CACHE.clear()
+        h._SHELL_CACHE.update(self._saved_cache)
+        super().tearDown()
+
+    @staticmethod
+    def _which(found):
+        # found: dict name -> path (missing names simply absent => None)
+        return lambda name: found.get(name)
+
+    def test_non_windows_uses_shell_true(self):
+        with mock.patch.object(h.os, "name", "posix"):
+            self.assertEqual(h._resolve_shell("auto"), (None, ""))
+
+    def test_auto_prefers_pwsh(self):
+        with mock.patch.object(h.shutil, "which", side_effect=self._which({"pwsh": "C:/pwsh.exe", "powershell": "C:/powershell.exe"})):
+            argv, prefix = h._resolve_shell("auto")
+        self.assertEqual(argv, ["C:/pwsh.exe", "-NoProfile", "-NonInteractive", "-Command"])
+        self.assertEqual(prefix, "")
+
+    def test_auto_falls_back_to_powershell(self):
+        with mock.patch.object(h.shutil, "which", side_effect=self._which({"powershell": "C:/powershell.exe"})):
+            argv, prefix = h._resolve_shell("auto")
+        self.assertEqual(argv, ["C:/powershell.exe", "-NoProfile", "-NonInteractive", "-Command"])
+        self.assertIn("OutputEncoding", prefix)
+
+    def test_auto_falls_back_to_cmd(self):
+        with mock.patch.object(h.shutil, "which", side_effect=self._which({})):
+            self.assertEqual(h._resolve_shell("auto"), (None, ""))
+
+    def test_force_pwsh(self):
+        with mock.patch.object(h.shutil, "which", side_effect=self._which({"pwsh": "C:/pwsh.exe"})):
+            argv, prefix = h._resolve_shell("pwsh")
+        self.assertEqual(argv[0], "C:/pwsh.exe")
+        self.assertEqual(prefix, "")
+
+    def test_force_pwsh_missing_falls_back(self):
+        with mock.patch.object(h.shutil, "which", side_effect=self._which({"powershell": "C:/powershell.exe"})):
+            argv, prefix = h._resolve_shell("pwsh")
+        self.assertEqual(argv[0], "C:/powershell.exe")
+        self.assertIn("OutputEncoding", prefix)
+
+    def test_force_powershell(self):
+        with mock.patch.object(h.shutil, "which", side_effect=self._which({"powershell": "C:/powershell.exe"})):
+            argv, prefix = h._resolve_shell("powershell")
+        self.assertEqual(argv[0], "C:/powershell.exe")
+        self.assertIn("OutputEncoding", prefix)
+
+    def test_force_cmd(self):
+        with mock.patch.object(h.shutil, "which", side_effect=self._which({"pwsh": "C:/pwsh.exe"})):
+            self.assertEqual(h._resolve_shell("cmd"), (None, ""))
+
 
 class TestFetchUrl(unittest.TestCase):
     class _Resp:
@@ -2127,6 +2198,42 @@ class TestMcpConfig(Base):
             else:
                 os.environ["HARNLESS_TEST_URL"] = old
 
+    def test_home_config_path(self):
+        self.assertEqual(
+            h.MCP_HOME_CONFIG,
+            os.path.join(os.path.expanduser("~"), ".harnless", "mcp.json"),
+        )
+
+    def test_load_into(self):
+        path = os.path.join(self.tmp, "cfg.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"mcpServers": {"a": {"transport": "http", "url": "http://a"}}}, f)
+        servers = {}
+        h._load_mcp_config_into(servers, path)
+        self.assertEqual(servers, {"a": {"transport": "http", "url": "http://a"}})
+
+    def test_load_into_later_wins(self):
+        path = os.path.join(self.tmp, "cfg.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"mcpServers": {"a": {"transport": "http", "url": "http://a"}}}, f)
+        servers = {"a": {"transport": "http", "url": "http://old"}}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            h._load_mcp_config_into(servers, path)
+        self.assertEqual(servers["a"]["url"], "http://a")
+        self.assertIn("duplicate mcp server name 'a'", buf.getvalue())
+
+    def test_load_into_bad_file(self):
+        path = os.path.join(self.tmp, "bad.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        servers = {}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            h._load_mcp_config_into(servers, path)
+        self.assertEqual(servers, {})
+        self.assertIn("failed to load mcp config", buf.getvalue())
+
     def test_parse_stdio(self):
         name, cfg = h._parse_mcp_stdio("fs:npx -y server ./data")
         self.assertEqual(name, "fs")
@@ -2196,6 +2303,92 @@ class TestMcpRegister(Base):
         )
 
 
+class TestMcpPending(Base):
+    def setUp(self):
+        super().setUp()
+        self._saved = (h.MCP_TOOLS, h.MCP_DISPATCH, h.MCP_CLIENTS, h.PENDING_MCP)
+        h.MCP_TOOLS = []
+        h.MCP_DISPATCH = {}
+        h.MCP_CLIENTS = []
+        h.PENDING_MCP = []
+
+    def tearDown(self):
+        h.MCP_TOOLS, h.MCP_DISPATCH, h.MCP_CLIENTS, h.PENDING_MCP = self._saved
+        super().tearDown()
+
+    def test_register_mcp_client_connects(self):
+        server, port, _ = _fake_mcp_server("pw")
+        try:
+            c = h.MCPClient("s", {"transport": "http", "url": f"http://127.0.0.1:{port}/mcp"})
+            ok = h._register_mcp_client(c)
+            self.assertTrue(ok)
+            self.assertEqual([s["function"]["name"] for s in h.MCP_TOOLS], ["pw"])
+            self.assertIn("pw", h.MCP_DISPATCH)
+            self.assertEqual(h.MCP_CLIENTS, [c])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_register_mcp_client_connect_fail(self):
+        c = h.MCPClient("s", {"transport": "http", "url": "http://127.0.0.1:1/mcp"})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ok = h._register_mcp_client(c)
+        self.assertFalse(ok)
+        self.assertEqual(h.MCP_TOOLS, [])
+        self.assertEqual(h.MCP_CLIENTS, [c])
+
+    def test_enable_pending_mcp(self):
+        server, port, _ = _fake_mcp_server("pw")
+        try:
+            h.PENDING_MCP.append(("s", {"transport": "http", "url": f"http://127.0.0.1:{port}/mcp"}))
+            ok, msg = h._enable_pending_mcp("s")
+            self.assertTrue(ok)
+            self.assertEqual(h.PENDING_MCP, [])
+            self.assertEqual([s["function"]["name"] for s in h.MCP_TOOLS], ["pw"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_enable_pending_mcp_unknown(self):
+        ok, msg = h._enable_pending_mcp("nope")
+        self.assertFalse(ok)
+        self.assertIn("not pending", msg)
+
+    def test_enable_pending_mcp_stays_on_fail(self):
+        h.PENDING_MCP.append(("s", {"transport": "http", "url": "http://127.0.0.1:1/mcp"}))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ok, msg = h._enable_pending_mcp("s")
+        self.assertFalse(ok)
+        self.assertEqual(len(h.PENDING_MCP), 1)  # stays pending so the user can retry
+
+    def test_tools_menu_enables_pending(self):
+        server, port, _ = _fake_mcp_server("pw")
+        try:
+            h.PENDING_MCP.append(("pwserver", {"transport": "http", "url": f"http://127.0.0.1:{port}/mcp"}))
+            n_tools = len(h.OPENAI_TOOLS_INTERACTIVE) + len(h.MCP_TOOLS)
+            keys = ["down"] * n_tools + [("char", " "), "enter"]
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                applied = h.tools_menu(iter(keys))
+            self.assertTrue(applied)
+            self.assertEqual(h.PENDING_MCP, [])
+            self.assertIn("pw", [s["function"]["name"] for s in h.MCP_TOOLS])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_tools_menu_rendering_shows_pending(self):
+        h.PENDING_MCP.append(("pwserver", {"transport": "http", "url": "http://x/mcp"}))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            h.tools_menu(iter(["enter"]))
+        out = buf.getvalue()
+        self.assertIn("mcp servers (disabled in config):", out)
+        self.assertIn("[ ] pwserver", out)
+
+
 class TestMcpStdioIntegration(Base):
     def _write_server(self):
         server = os.path.join(self.tmp, "fake_mcp_server.py")
@@ -2226,6 +2419,87 @@ class TestMcpStdioIntegration(Base):
         names = [s["function"]["name"] for s in h.MCP_TOOLS]
         self.assertIn("echo", names)
         self.assertEqual(h.execute_tool("echo", '{"msg": "yo"}'), "echo: yo")
+
+
+class TestMcpStdioShellShim(Base):
+    """Windows: commands resolving to .cmd/.bat shims (npx, npm, uvx) must be
+    spawned with shell=True — CreateProcess (shell=False) can't launch them
+    and raises FileNotFoundError [WinError 2]."""
+
+    def _capture_popen(self, client):
+        import subprocess
+
+        calls = []
+        real = subprocess.Popen
+
+        def fake(args, **kw):
+            calls.append((args, kw))
+            raise RuntimeError("stop")
+
+        self.addCleanup(setattr, subprocess, "Popen", real)
+        subprocess.Popen = fake
+        try:
+            client.connect()
+        except RuntimeError:
+            pass
+        return calls
+
+    def test_cmd_shim_uses_shell(self):
+        if os.name != "nt":
+            self.skipTest("Windows-only")
+        shim = os.path.join(self.tmp, "shim.cmd")
+        with open(shim, "w") as f:
+            f.write("@echo off\n")
+        calls = self._capture_popen(
+            h.MCPClient("shim", {"transport": "stdio", "command": shim, "args": ["x"]})
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0][1].get("shell"))
+
+    def test_real_exe_no_shell(self):
+        calls = self._capture_popen(
+            h.MCPClient("py", {"transport": "stdio", "command": sys.executable, "args": []})
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(calls[0][1].get("shell"))
+
+
+def _fake_mcp_server(tool_name):
+    """Start a fake Streamable-HTTP MCP server that lists one tool. Returns (server, port, thread)."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            msg = json.loads(self.rfile.read(length))
+            method = msg.get("method")
+            rid = msg.get("id")
+            if method == "initialize":
+                result = {"protocolVersion": "2025-06-18", "capabilities": {}, "serverInfo": {"name": "fake", "version": "0"}}
+            elif method == "tools/list":
+                result = {"tools": [{"name": tool_name, "description": "fake", "inputSchema": {"type": "object", "properties": {}}}]}
+            elif rid is None:
+                self.send_response(202)
+                self.end_headers()
+                return
+            else:
+                result = {}
+            payload = json.dumps({"jsonrpc": "2.0", "id": rid, "result": result}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return server, port, t
 
 
 class TestMcpHttpIntegration(Base):
@@ -2329,6 +2603,120 @@ class TestMcpHttpIntegration(Base):
             )
             self.assertEqual(proc.returncode, 0)
             self.assertIn("[X] add", proc.stdout)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_cli_home_config_auto_loaded(self):
+        """Regression: ~/.harnless/mcp.json must be auto-loaded at startup."""
+        import subprocess
+
+        server, port, _ = _fake_mcp_server("add")
+        home = os.path.join(self.tmp, "home")
+        os.makedirs(os.path.join(home, ".harnless"))
+        with open(os.path.join(home, ".harnless", "mcp.json"), "w", encoding="utf-8") as f:
+            json.dump({"mcpServers": {"fake": {"transport": "http", "url": f"http://127.0.0.1:{port}/mcp"}}}, f)
+        env = dict(os.environ)
+        env["HOME"] = home
+        env["USERPROFILE"] = home
+        try:
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "harnless.py",
+                    "--no-color",
+                    "--context-window", "1000",
+                ],
+                input="/tools\n",
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=60,
+                env=env,
+            )
+            self.assertEqual(proc.returncode, 0)
+            self.assertIn("[X] add", proc.stdout)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_cli_flag_overrides_home_config(self):
+        """Regression: --mcp-config definitions must override the home config on name collision."""
+        import subprocess
+
+        server_a, port_a, _ = _fake_mcp_server("add")
+        server_b, port_b, _ = _fake_mcp_server("sub")
+        home = os.path.join(self.tmp, "home")
+        os.makedirs(os.path.join(home, ".harnless"))
+        with open(os.path.join(home, ".harnless", "mcp.json"), "w", encoding="utf-8") as f:
+            json.dump({"mcpServers": {"fake": {"transport": "http", "url": f"http://127.0.0.1:{port_a}/mcp"}}}, f)
+        cfg = os.path.join(self.tmp, "override.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({"mcpServers": {"fake": {"transport": "http", "url": f"http://127.0.0.1:{port_b}/mcp"}}}, f)
+        env = dict(os.environ)
+        env["HOME"] = home
+        env["USERPROFILE"] = home
+        try:
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "harnless.py",
+                    "--no-color",
+                    "--context-window", "1000",
+                    "--mcp-config", cfg,
+                ],
+                input="/tools\n",
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=60,
+                env=env,
+            )
+            self.assertEqual(proc.returncode, 0)
+            self.assertIn("[X] sub", proc.stdout)
+            self.assertNotIn("[X] add", proc.stdout)
+        finally:
+            server_a.shutdown()
+            server_a.server_close()
+            server_b.shutdown()
+            server_b.server_close()
+
+    def test_cli_enabled_false_not_connected(self):
+        """Regression: a server with enabled:false is not connected at startup."""
+        import subprocess
+
+        server, port, _ = _fake_mcp_server("pw")
+        home = os.path.join(self.tmp, "home")
+        os.makedirs(os.path.join(home, ".harnless"))
+        with open(os.path.join(home, ".harnless", "mcp.json"), "w", encoding="utf-8") as f:
+            json.dump(
+                {"mcpServers": {"fake": {"transport": "http", "url": f"http://127.0.0.1:{port}/mcp", "enabled": False}}},
+                f,
+            )
+        env = dict(os.environ)
+        env["HOME"] = home
+        env["USERPROFILE"] = home
+        try:
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "harnless.py",
+                    "--no-color",
+                    "--context-window", "1000",
+                ],
+                input="/status\n",
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=60,
+                env=env,
+            )
+            self.assertEqual(proc.returncode, 0)
+            self.assertIn("mcp servers (disabled)", proc.stdout)
+            self.assertIn("fake (disabled in config; enable via /tools)", proc.stdout)
+            tools_line = [l for l in proc.stdout.splitlines() if l.startswith("tools:")]
+            self.assertTrue(tools_line)
+            self.assertNotIn("pw", tools_line[0])
         finally:
             server.shutdown()
             server.server_close()
