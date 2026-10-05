@@ -21,12 +21,12 @@ import urllib.error
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 API_URL = "http://127.0.0.1:11434/v1/chat/completions"
 API_KEY = None
 MODEL = "local-model"
-TEMPERATURE = 0.2
-MAX_SUBAGENT_DEPTH = 3
+TEMPERATURE = 1.0
+MAX_SUBAGENT_DEPTH = 2
 _AGENT_DEPTH = 0
 OUTPUT_INDENT = ""
 CWD = os.getcwd()
@@ -3168,7 +3168,7 @@ def _open_request(req: urllib.request.Request, progress=None, on_socket=None):
 
 
 def chat(
-    messages: list, model: str, interactive: bool = False, temperature: float = 0.2
+    messages: list, model: str, interactive: bool = False, temperature: float = 1.0
 ) -> dict:
     payload = json.dumps(
         {
@@ -3196,7 +3196,7 @@ def _build_request(
     model: str,
     stream: bool,
     interactive: bool = False,
-    temperature: float = 0.2,
+    temperature: float = 1.0,
 ) -> urllib.request.Request:
     body = {
         "model": model,
@@ -3244,7 +3244,7 @@ def stream_chat(
     messages: list,
     model: str,
     interactive: bool = False,
-    temperature: float = 0.2,
+    temperature: float = 1.0,
     watcher=None,
     progress=None,
 ):
@@ -3693,7 +3693,7 @@ class MarkdownRenderer:
 
 
 def stream_once(
-    messages: list, model: str, interactive: bool = False, temperature: float = 0.2
+    messages: list, model: str, interactive: bool = False, temperature: float = 1.0
 ) -> tuple[dict, bool]:
     """Stream one chat turn, printing reasoning and content live.
 
@@ -3902,11 +3902,13 @@ def tools_menu(keys=None) -> bool:
     """Interactive tool toggle menu.
 
     Built-in tools are listed flat; mcp tools are grouped under their server
-    entry, where space toggles all of the server's tools at once (individual
-    tools can still be toggled on their own rows). A disabled-in-config mcp
-    server is enabled by toggling its row. Up/down move the cursor, enter
-    applies the changes and quits, esc (or ctrl+c/ctrl+d) quits without
-    applying them. Returns True if changes were applied, False if cancelled.
+    entry, collapsed by default — '+'/'=' expands the group under the cursor,
+    '-' collapses it. Space on a server row toggles all of its tools at once
+    (individual tools can be toggled on their own rows when expanded). A
+    disabled-in-config mcp server is enabled by toggling its row. Up/down
+    move the cursor (skipping collapsed rows), enter applies the changes and
+    quits, esc (or ctrl+c/ctrl+d) quits without applying them. Returns True
+    if changes were applied, False if cancelled.
     """
     builtin_specs = sorted(
         OPENAI_TOOLS_INTERACTIVE, key=lambda s: s["function"]["name"]
@@ -3920,7 +3922,7 @@ def tools_menu(keys=None) -> bool:
     for server in server_order:
         rows.append(("server", server))
         for t in sorted(mcp_by_server[server]):
-            rows.append(("tool", t))
+            rows.append(("mcp_tool", t))
     rows += [("pending", n) for n in pending_names]
     if not rows:
         return False
@@ -3929,6 +3931,11 @@ def tools_menu(keys=None) -> bool:
         descs[s["function"]["name"]] = s["function"].get("description", "")
     disabled = set(DISABLED_TOOLS)
     pending_on = set()
+    collapsed = set(server_order)  # mcp groups start collapsed
+    tool_server = {}
+    for server in server_order:
+        for t in mcp_by_server[server]:
+            tool_server[t] = server
     cursor = 0
     width = shutil.get_terminal_size((80, 24)).columns
     applied = False
@@ -3940,7 +3947,10 @@ def tools_menu(keys=None) -> bool:
         if kind == "pending":
             return f"mcp server '{name}' (disabled in config)"
         if kind == "server":
-            return f"mcp server '{name}' — {len(mcp_by_server[name])} tools (space toggles all)"
+            return (
+                f"mcp server '{name}' — {len(mcp_by_server[name])} tools "
+                "(space toggles all, +/- expand/collapse)"
+            )
         return descs.get(name, "")
 
     def server_mark(server):
@@ -3952,9 +3962,23 @@ def tools_menu(keys=None) -> bool:
             return " "
         return "-"
 
+    def visible_indices():
+        return [
+            i
+            for i, (kind, name) in enumerate(rows)
+            if not (kind == "mcp_tool" and tool_server[name] in collapsed)
+        ]
+
     def build_lines():
-        lines = [colorize("tools — space: toggle, enter: apply, esc: cancel", "dim")]
+        lines = [
+            colorize(
+                "tools — space: toggle, +/-: expand/collapse, enter: apply, esc: cancel",
+                "dim",
+            )
+        ]
         for i, (kind, name) in enumerate(rows):
+            if kind == "mcp_tool" and tool_server[name] in collapsed:
+                continue
             if i == n_builtin and server_order:
                 lines.append(colorize("  mcp servers:", "dim"))
             if i == n_builtin + n_server_rows and pending_names:
@@ -3965,10 +3989,11 @@ def tools_menu(keys=None) -> bool:
                 mark = "x" if name in pending_on else " "
             else:
                 mark = " " if name in disabled else "x"
+            indent = "    " if kind == "mcp_tool" else "  "
             if i == cursor:
-                lines.append(colorize(f"> [{mark}] {name}", "tool"))
+                lines.append(colorize(f">{indent[1:]}[{mark}] {name}", "tool"))
             else:
-                lines.append(f"  [{mark}] {name}")
+                lines.append(f"{indent}[{mark}] {name}")
         desc = row_desc(*rows[cursor])
         if len(desc) > width - 1:
             desc = desc[: width - 4] + "..."
@@ -3987,6 +4012,12 @@ def tools_menu(keys=None) -> bool:
         sys.stdout.flush()
         drawn = len(lines)
 
+    def move(step):
+        nonlocal cursor
+        vis = visible_indices()
+        pos = vis.index(cursor)
+        cursor = vis[max(0, min(len(vis) - 1, pos + step))]
+
     if keys is None:
         keys = _iter_keys_windows() if os.name == "nt" else _iter_keys_posix()
     draw()
@@ -3994,9 +4025,17 @@ def tools_menu(keys=None) -> bool:
         while True:
             token = next(keys)
             if token == "up":
-                cursor = max(0, cursor - 1)
+                move(-1)
             elif token == "down":
-                cursor = min(len(rows) - 1, cursor + 1)
+                move(1)
+            elif token in (("char", "+"), ("char", "=")):
+                kind, name = rows[cursor]
+                if kind == "server":
+                    collapsed.discard(name)
+            elif token == ("char", "-"):
+                kind, name = rows[cursor]
+                if kind == "server":
+                    collapsed.add(name)
             elif token == "enter":
                 DISABLED_TOOLS.clear()
                 DISABLED_TOOLS.update(disabled)
@@ -4208,7 +4247,7 @@ def run_agent(
     messages: list,
     model: str,
     interactive: bool = False,
-    temperature: float = 0.2,
+    temperature: float = 1.0,
     depth: int = 0,
 ) -> int:
     global _AGENT_DEPTH
@@ -4356,14 +4395,14 @@ def main():
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.2,
-        help="sampling temperature (default: 0.2; lower = more deterministic tool calls)",
+        default=1.0,
+        help="sampling temperature (default: 1.0; lower = more deterministic tool calls)",
     )
     parser.add_argument(
         "--max-subagents",
         type=int,
-        default=3,
-        help="maximum sub-agent nesting depth for the task tool (default: 3)",
+        default=2,
+        help="maximum sub-agent nesting depth for the task tool (default: 2)",
     )
     parser.add_argument(
         "--context-window",

@@ -45,7 +45,7 @@ python harnless.py --prompt "summarize the files in this directory"
 |---|---|
 | `/new` | Clear the session history |
 | `/clear-screen` | Clear the terminal |
-| `/tools` | Toggle tools on/off (interactive menu; MCP tools are grouped under their server — space on the server row toggles all of its tools) |
+| `/tools` | Toggle tools on/off (interactive menu; MCP tools are grouped under their server, collapsed by default — `+`/`=` expands, `-` collapses — and space on the server row toggles all of its tools) |
 | `/tools <name>` | Toggle a specific tool on/off (`mcp:<server>` toggles all of a server's tools) |
 | `/status` | Show context usage, model, enabled tools, and MCP servers |
 | `/exit` | Quit (alias: `/quit`) |
@@ -68,8 +68,8 @@ Other REPL behaviors:
 | `--api-key KEY` | Sent as `Authorization: Bearer <key>` (omit for unauthenticated local servers) |
 | `--model NAME` | Model name sent in the request |
 | `--system-prompt TEXT` | Replace the built-in system prompt |
-| `--temperature N` | Sampling temperature (default `0.2`) |
-| `--max-subagents N` | Max sub-agent nesting depth for the `task` tool (default `3`) |
+| `--temperature N` | Sampling temperature (default `1.0`) |
+| `--max-subagents N` | Max sub-agent nesting depth for the `task` tool (default `2`) |
 | `--shell MODE` | Windows shell for `run_shell`: `auto` / `pwsh` / `powershell` / `cmd` (default `auto`, ignored off-Windows) |
 | `--context-window N` | Context window size in tokens (shown in `/status`); probed from the API's `/models` endpoint if omitted |
 | `--version` | Print the version and exit |

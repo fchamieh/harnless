@@ -2963,13 +2963,56 @@ class TestToolsMenu(unittest.TestCase):
     def test_mcp_group_rendering(self):
         self._register("srv", [self._mcp_tool("t1", "d1"), self._mcp_tool("t2", "d2")])
         n_builtin = len(h.OPENAI_TOOLS_INTERACTIVE)
-        applied, out = self.menu(["down"] * n_builtin + ["enter"])
+        applied, out = self.menu(["down"] * n_builtin + [("char", "+"), "enter"])
         self.assertTrue(applied)
         self.assertIn("mcp servers:", out)
         self.assertIn("> [x] srv", out)
         self.assertIn("[x] t1", out)
         self.assertIn("[x] t2", out)
         self.assertIn("space toggles all", out)
+
+    def test_mcp_group_collapsed_by_default(self):
+        self._register("srv", [self._mcp_tool("t1", "d1"), self._mcp_tool("t2", "d2")])
+        n_builtin = len(h.OPENAI_TOOLS_INTERACTIVE)
+        applied, out = self.menu(["down"] * n_builtin + ["enter"])
+        self.assertTrue(applied)
+        self.assertIn("> [x] srv", out)
+        self.assertNotIn("[x] t1", out)
+        self.assertNotIn("[x] t2", out)
+        self.assertIn("+/- expand/collapse", out)
+
+    def test_expand_collapse_roundtrip(self):
+        self._register("srv", [self._mcp_tool("t1", "d1"), self._mcp_tool("t2", "d2")])
+        n_builtin = len(h.OPENAI_TOOLS_INTERACTIVE)
+        applied, out = self.menu(["down"] * n_builtin + [("char", "+"), "enter"])
+        self.assertTrue(applied)
+        self.assertIn("[x] t1", out)
+        applied, out = self.menu(
+            ["down"] * n_builtin + [("char", "+"), ("char", "-"), "enter"]
+        )
+        self.assertTrue(applied)
+        # the buffer accumulates every draw (incl. the expanded one), so
+        # check only the final draw
+        last = out.rsplit("tools —", 1)[-1]
+        self.assertNotIn("[x] t1", last)
+        self.assertNotIn("[x] t2", last)
+
+    def test_expand_equals_alias(self):
+        self._register("srv", [self._mcp_tool("t1", "d1")])
+        n_builtin = len(h.OPENAI_TOOLS_INTERACTIVE)
+        applied, out = self.menu(["down"] * n_builtin + [("char", "="), "enter"])
+        self.assertTrue(applied)
+        self.assertIn("[x] t1", out)
+
+    def test_navigation_skips_collapsed_rows(self):
+        self._register("srv", [self._mcp_tool("t1", "d1"), self._mcp_tool("t2", "d2")])
+        h.PENDING_MCP.append(("pend", {"transport": "http", "url": "http://x/mcp"}))
+        n_builtin = len(h.OPENAI_TOOLS_INTERACTIVE)
+        # visible rows: built-ins, 'srv' (collapsed), 'pend' — so n_builtin+1
+        # downs lands on the pending row, not on the hidden t1
+        applied, out = self.menu(["down"] * (n_builtin + 1) + ["enter"])
+        self.assertTrue(applied)
+        self.assertIn("> [ ] pend", out)
 
     def test_server_row_toggles_all_off(self):
         self._register("srv", [self._mcp_tool("t1"), self._mcp_tool("t2")])
@@ -2997,8 +3040,10 @@ class TestToolsMenu(unittest.TestCase):
     def test_individual_mcp_tool_toggle(self):
         self._register("srv", [self._mcp_tool("t1"), self._mcp_tool("t2")])
         n_builtin = len(h.OPENAI_TOOLS_INTERACTIVE)
-        # rows: built-ins, then the 'srv' server row, then its tools
-        applied, _ = self.menu(["down"] * (n_builtin + 1) + [("char", " "), "enter"])
+        # rows: built-ins, then the 'srv' server row (expand it), then its tools
+        applied, _ = self.menu(
+            ["down"] * n_builtin + [("char", "+"), "down", ("char", " "), "enter"]
+        )
         self.assertTrue(applied)
         self.assertEqual(h.DISABLED_TOOLS, {"t1"})
 
