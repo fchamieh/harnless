@@ -21,7 +21,7 @@ import urllib.error
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 API_URL = "http://127.0.0.1:11434/v1/chat/completions"
 API_KEY = None
 MODEL = "local-model"
@@ -379,36 +379,6 @@ def tool_ask_user(args: dict) -> str:
         if 1 <= idx <= len(options):
             return f"user selected: {options[idx - 1]}"
     return f"user answered: {answer}"
-
-
-def tool_confirm(args: dict) -> str:
-    question = (args.get("question") or "Proceed?").strip()
-    default = args.get("default")
-    if default is not None:
-        default = bool(default)
-    print()
-    _print_question(question)
-    if default is True:
-        suffix = " [Y/n]"
-    elif default is False:
-        suffix = " [y/N]"
-    else:
-        suffix = " [y/n]"
-    while True:
-        prompt = OUTPUT_INDENT + colorize(f"{icon('user')} confirm{suffix}> ", "user")
-        answer = _prompt_line(prompt)
-        if answer is None:
-            return "user cancelled (no confirmation)"
-        low = answer.lower()
-        if not low:
-            if default is None:
-                return "user did not confirm"
-            return "user confirmed: yes" if default else "user confirmed: no"
-        if low in ("y", "yes", "true", "1"):
-            return "user confirmed: yes"
-        if low in ("n", "no", "false", "0"):
-            return "user confirmed: no"
-        print(OUTPUT_INDENT + colorize("  please answer yes or no", "error"))
 
 
 _SHELL_CACHE: dict[str, tuple] = {}
@@ -1704,35 +1674,6 @@ TOOLS = {
         },
         tool_ask_user,
     ),
-    "confirm": (
-        {
-            "type": "function",
-            "function": {
-                "name": "confirm",
-                "description": (
-                    "Ask the user for a yes/no confirmation and block until they answer. Use it to get "
-                    "explicit approval before a consequential or file-system-modifying action (writing, "
-                    "patching, moving, copying, deleting), as required. Returns 'user confirmed: yes' or "
-                    "'user confirmed: no' (or 'user cancelled')."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "question": {
-                            "type": "string",
-                            "description": "What to confirm, e.g. 'Apply this plan?' (default: 'Proceed?')",
-                        },
-                        "default": {
-                            "type": "boolean",
-                            "description": "Answer used when the user just presses enter (omit to require an explicit yes/no)",
-                        },
-                    },
-                    "required": ["question"],
-                },
-            },
-        },
-        tool_confirm,
-    ),
     "exit": (
         {
             "type": "function",
@@ -2231,10 +2172,10 @@ def get_system_prompt(cwd, additional) -> str:
         "and use patch_file with exact matches for edits. "
         "If patch_file reports multiple matches, re-read the area with line numbers and retry using offset/lines. "
         "Before taking any action that modifies the file system (writing, patching, moving, copying, or deleting files), "
-        "plan the change when required and use the confirm tool to get the user's explicit approval before acting; "
-        "only proceed once the user has confirmed. Read-only exploration does not require approval. "
-        "Use the ask_user tool whenever you need feedback, a decision, clarification, or missing information, "
-        "and the confirm tool for yes/no approval; both block until the user responds. "
+        "plan the change when required and use the ask_user tool to get the user's explicit approval before acting; "
+        "only proceed once the user has approved. Read-only exploration does not require approval. "
+        "Use the ask_user tool whenever you need feedback, a decision, clarification, missing information, "
+        "or yes/no approval; it blocks until the user responds. "
         "For multi-step work, track progress with the todo tool: add all the steps up front in a single 'add' call, mark each in_progress then done as you go. "
         "When you hit an error and determine the root cause, record a one-line note with the memory tool, prefixed 'gotcha: ' (e.g. 'gotcha: tests must run from the repo root'), so you don't repeat it. "
         "Use the memory tool for durable facts (user preferences, project conventions) that should survive across sessions. "

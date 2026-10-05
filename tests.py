@@ -3279,7 +3279,7 @@ class TestAskUser(Base):
     def test_registered_in_both_lists(self):
         all_names = [s["function"]["name"] for s in h.OPENAI_TOOLS]
         interactive_names = [s["function"]["name"] for s in h.OPENAI_TOOLS_INTERACTIVE]
-        for name in ("ask_user", "confirm"):
+        for name in ("ask_user",):
             self.assertIn(name, all_names)
             self.assertIn(name, interactive_names)
             self.assertIn(name, h.DISPATCH)
@@ -3287,7 +3287,6 @@ class TestAskUser(Base):
     def test_system_prompt_mentions_interaction_tools(self):
         prompt = h.get_system_prompt("/x", "")
         self.assertIn("ask_user", prompt)
-        self.assertIn("confirm", prompt)
 
     def test_empty_question(self):
         self.assertEqual(h.tool_ask_user({}), "error: empty question")
@@ -3327,37 +3326,6 @@ class TestAskUser(Base):
         self._raise(EOFError)
         self.assertEqual(
             h.tool_ask_user({"question": "q"}), "user cancelled (no answer)"
-        )
-
-    def test_confirm_yes(self):
-        self._respond("y")
-        self.assertEqual(h.tool_confirm({"question": "ok?"}), "user confirmed: yes")
-
-    def test_confirm_no(self):
-        self._respond("no")
-        self.assertEqual(h.tool_confirm({"question": "ok?"}), "user confirmed: no")
-
-    def test_confirm_default_on_empty(self):
-        self._respond("")
-        self.assertEqual(
-            h.tool_confirm({"question": "ok?", "default": True}),
-            "user confirmed: yes",
-        )
-
-    def test_confirm_empty_without_default(self):
-        self._respond("")
-        self.assertEqual(
-            h.tool_confirm({"question": "ok?"}), "user did not confirm"
-        )
-
-    def test_confirm_reprompts_on_invalid(self):
-        self._respond("maybe", "yes")
-        self.assertEqual(h.tool_confirm({"question": "ok?"}), "user confirmed: yes")
-
-    def test_confirm_cancel(self):
-        self._raise(KeyboardInterrupt)
-        self.assertEqual(
-            h.tool_confirm({"question": "ok?"}), "user cancelled (no confirmation)"
         )
 
 

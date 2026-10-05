@@ -89,7 +89,7 @@ A server entry may set `"enabled": false` to skip connecting it at startup (it c
 
 Built-in tools: `get_cwd`, `run_shell`, `mkdir`, `read_file`, `write_file`, `patch_file`,
 `grep`, `glob`, `list_dir`, `delete_file`, `move_file`, `copy_file`, `fetch_url`, `todo`,
-`memory`, `task`, `ask_user`, `confirm`, `exit`.
+`memory`, `task`, `ask_user`, `exit`.
 
 All file paths are relative to the working directory and sandboxed to it. An `AGENTS.md`
 in the working directory (case-insensitive) is auto-loaded and appended to the system prompt.
