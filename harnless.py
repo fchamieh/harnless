@@ -21,7 +21,7 @@ import urllib.error
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-VERSION = "1.3.2"
+VERSION = "1.4.1"
 API_URL = "http://127.0.0.1:11434/v1/chat/completions"
 API_KEY = None
 MODEL = "local-model"
@@ -35,6 +35,11 @@ VISION_ENABLED = True
 # (set in main()); two ESC presses within this window cancel the stream.
 INTERRUPT_ENABLED = False
 DOUBLE_ESC_WINDOW = 2.0
+# Auto-send mode (REPL only): True (default) — Enter submits the line;
+# False — Enter inserts a newline and Ctrl+Enter submits (Ctrl+D also
+# submits a non-empty line, which is the reliable send key on POSIX where
+# Ctrl+Enter is not distinguishable from Enter). Toggled with /auto-send.
+AUTO_SEND = True
 # Show a "sending context" progress line while waiting for the LLM's first
 # token, for large requests only (estimated token count, chars/4, including
 # the tool schemas). The line appears CONTEXT_PROGRESS_DELAY seconds in,
@@ -391,7 +396,9 @@ def _resolve_shell(preferred: str = "auto") -> tuple:
       argv_prefix: list [shell, flags...] to spawn directly, or None to use
                    shell=True (cmd.exe on Windows, sh elsewhere).
       command_prefix: text prepended to the user command (forces UTF-8 console
-                      output on PowerShell 5.1, which defaults to the ANSI code page).
+                      output on all PowerShell — both 5.1 and pwsh 7 may emit
+                      the ANSI code page on redirected stdout, e.g. cp1256 on
+                      an Arabic-locale Windows with pwsh 7.6).
 
     On Windows the preference order is pwsh (PowerShell 7+) → powershell.exe
     (5.1) → cmd.exe; `preferred` can force one of them (falling back to the
@@ -414,7 +421,7 @@ def _resolve_shell(preferred: str = "auto") -> tuple:
     result = None
     if preferred == "pwsh":
         a = _pwsh()
-        result = (a, "") if a else None
+        result = (a, utf8) if a else None
     elif preferred == "powershell":
         a = _ps()
         result = (a, utf8) if a else None
@@ -422,7 +429,7 @@ def _resolve_shell(preferred: str = "auto") -> tuple:
         result = (None, "")
     if result is None:  # auto, or a forced shell that is missing
         a = _pwsh()
-        result = (a, "") if a else None
+        result = (a, utf8) if a else None
         if result is None:
             a = _ps()
             result = (a, utf8) if a else (None, "")
@@ -441,8 +448,8 @@ def tool_run_shell(args: dict) -> str:
         # is propagated (pure PowerShell statements leave it at 0).
         cmd = argv_prefix + [command_prefix + command + "; exit $LASTEXITCODE"]
         shell = False
-        # PowerShell output is UTF-8 (forced on 5.1, default on pwsh 7);
-        # decode as UTF-8 rather than the locale code page.
+        # PowerShell output is UTF-8 (forced via the command prefix on both
+        # pwsh 7 and 5.1); decode as UTF-8 rather than the locale code page.
         encoding = "utf-8"
     else:
         cmd = command
@@ -456,6 +463,10 @@ def tool_run_shell(args: dict) -> str:
             capture_output=True,
             text=True,
             encoding=encoding,
+            # A stray non-UTF-8 byte (e.g. a native command writing in the
+            # ANSI code page) must not crash the reader thread and wipe the
+            # whole output; degrade to U+FFFD instead.
+            errors="replace",
             timeout=int(args.get("timeout", 120)),
         )
         out = []
@@ -2427,13 +2438,29 @@ _WINDOWS_EXT_MAP = {
 }
 
 
+def _windows_ctrl_held() -> bool:
+    """Best-effort: True if Ctrl is held right now (GetAsyncKeyState sign bit).
+
+    msvcrt.getwch() cannot distinguish Enter from Ctrl+Enter (both arrive
+    as '\\r'), so when a '\\r' is read we check the live key state. The user
+    is normally still holding Ctrl when the event is processed; a very fast
+    tap may read back as plain Enter.
+    """
+    import ctypes
+
+    try:
+        return bool(ctypes.windll.user32.GetAsyncKeyState(0x11) & 0x8000)
+    except Exception:
+        return False
+
+
 def _windows_key_token(getwch):
     """Read one key via getwch and return its token."""
     ch = getwch()
     if ch in ("\x00", "\xe0"):
         return _WINDOWS_EXT_MAP.get(getwch(), "ignore")
     if ch == "\r":
-        return "enter"
+        return "ctrl_enter" if _windows_ctrl_held() else "enter"
     if ch == "\n":
         return "newline"
     if ch == "\x08":
@@ -2493,6 +2520,10 @@ def _parse_csi_seq(read_char):
         "H": "home",
         "F": "end",
         "3~": "delete",
+        # Ctrl+Enter as emitted by terminals that can send it (in raw mode
+        # plain Enter and Ctrl+Enter are both just '\\r'):
+        "13;5u": "ctrl_enter",  # kitty keyboard protocol
+        "27;5;13~": "ctrl_enter",  # xterm modifyOtherKeys level 2
     }.get(params, "ignore")
 
 
@@ -2542,6 +2573,10 @@ def _iter_keys_posix():
                 seq = read_char()
                 if seq == "[":
                     yield _parse_csi_seq(read_char)
+                elif seq == "\r":
+                    # Some terminals (e.g. tmux with a custom binding) emit
+                    # ESC \r for Ctrl+Enter.
+                    yield "ctrl_enter"
                 else:
                     yield "ignore"
             elif ch == "\r":
@@ -2613,6 +2648,10 @@ def _iter_keys_posix_poll(stop_event):
                 seq = read_char()
                 if seq == "[":
                     yield _parse_csi_seq(read_char)
+                elif seq == "\r":
+                    # Some terminals (e.g. tmux with a custom binding) emit
+                    # ESC \r for Ctrl+Enter.
+                    yield "ctrl_enter"
                 else:
                     yield "ignore"
             elif ch == "\r":
@@ -2871,26 +2910,51 @@ class ContextProgress:
         return OUTPUT_INDENT + colorize(text, "dim")
 
 
+def _edit_cur(row: int, total: int, width: int) -> tuple:
+    """Cursor cell (row, col) after `total` display columns have been written
+    into a run that starts at physical `row`, column 0.
+
+    Soft wrap is *pending*: measured on Windows (CONOUT$ via
+    GetConsoleScreenBufferInfo) a run that exactly fills a row leaves the
+    cursor on that row's **last** column, and the next row is only entered
+    when the next character is written — `ESC[nA/B/C/D` and `CR` act on that
+    cell and clear the pending flag without moving the cursor, and `ESC[2K`
+    erases that row. So the position of a character that lands exactly on a
+    wrap boundary is the last cell of the row before it, not column 0 of the
+    row after it (which is where the cursor would have to move to *first*).
+    """
+    if total <= 0:
+        return row, 0
+    # Rows the run occupies: a line that soft-wraps without ending on a column
+    # boundary still takes the next row, while a run that ends exactly on a
+    # boundary is only *pending* there, so it counts once.
+    rows = (total + width - 1) // width
+    col = width - 1 if total % width == 0 else total % width
+    return row + rows - 1, col
+
+
+def _edit_rows(text: str, prompt_w: int, width: int) -> int:
+    """How many physical rows `prompt + text` paints once soft-wrapped."""
+    rows = 0
+    for i, ln in enumerate(text.split("\n")):
+        total = (prompt_w if i == 0 else 0) + display_width(ln)
+        rows += max(1, (total + width - 1) // width)  # an empty line is a row too
+    return max(1, rows)
+
+
 def _edit_phys_pos(text: str, prompt_w: int, pos: int, width: int) -> tuple:
-    """Physical (row, col) of the cursor at character position `pos` in
-    `text`, assuming `text` is printed after a prompt of display width
-    `prompt_w` in a terminal `width` columns wide (soft-wrapping). `pos` may
-    be len(text) (end of text)."""
+    """Terminal cursor cell (row, col) for character position `pos` in `text`,
+    printed after a prompt of display width `prompt_w` in a terminal `width`
+    columns wide (see `_edit_cur` for the wrap model). `pos` may be len(text)
+    (end of text)."""
     lines = text.split("\n")
     row = 0
     for i, ln in enumerate(lines):
         start = prompt_w if i == 0 else 0
         if pos <= len(ln):
-            total = start + display_width(ln[:pos])
-            at_end = i == len(lines) - 1 and pos == len(ln)
-            if at_end and total > 0 and total % width == 0:
-                # The text ends exactly on a column boundary: the terminal
-                # has not wrapped yet, so the cursor sits at the last column.
-                return row + total // width - 1, width - 1
-            return row + total // width, total % width
-        # Physical rows this logical line occupies: ceiling division (a line
-        # that soft-wraps but doesn't end on a column boundary still takes the
-        # next row), and an empty line still counts as one row.
+            return _edit_cur(row, start + display_width(ln[:pos]), width)
+        # Next logical line: the printed newline drops the cursor to column 0
+        # of the row after the rows this line occupied.
         total = start + display_width(ln)
         row += max(1, (total + width - 1) // width)
         pos -= len(ln) + 1
@@ -2899,71 +2963,103 @@ def _edit_phys_pos(text: str, prompt_w: int, pos: int, width: int) -> tuple:
 
 def _edit_line(prompt: str, keys) -> str:
     """Run a minimal line editor over a key-token iterator. Returns the line
-    (may contain newlines inserted via the "newline" token, e.g. Ctrl+J)."""
+    (may contain newlines inserted via the "newline" token, e.g. Ctrl+J, or
+    via Enter when auto-send is off). Enter submits when AUTO_SEND is on;
+    when it is off, Enter inserts a newline and Ctrl+Enter (or Ctrl+D) sends."""
     buf = []
     pos = 0
     hist_idx = len(HISTORY)
 
-    prev_text = ""
-    prev_width = 0
+    prev_rows = 0        # physical rows the previous render painted
+    prev_cur_row = 0     # which of those rows the cursor ended on
     prev_rendered = False
 
-    def render():
-        nonlocal prev_text, prev_width, prev_rendered
+    def render(commit=False):
+        nonlocal prev_rows, prev_cur_row, prev_rendered
         line = "".join(buf)
         width = terminal_width()
         prompt_w = display_width(_ANSI_RE.sub("", prompt))
+        # An explicit CR: in raw mode a bare LF only moves down, which would
+        # leave every row after a newline shifted right by the column it fell on.
+        text = line.replace("\n", "\r\n")
         out = ""
         if prev_rendered:
-            # Move the cursor back to the first physical line of the previous
-            # render and clear each physical line it occupied (the text may
-            # soft-wrap past the terminal width). Uses cursor moves (no
-            # newlines) so the screen never scrolls while editing.
-            prev_row, _ = _edit_phys_pos(prev_text, prompt_w, len(prev_text), prev_width)
-            if prev_row:
-                out += f"\x1b[{prev_row}A"
+            # Walk back to the first physical row of the previous render and
+            # clear every row it painted (cursor moves only, no newlines, so
+            # the screen never scrolls while editing). The walk-back starts
+            # from where the cursor actually *is* — the edit row whenever the
+            # previous render repositioned it, the last row otherwise. Walking
+            # back by the previous text's *end* row instead overshoots as soon
+            # as the cursor sits above that row: each render then starts one
+            # row too high, the block creeps up over the output above it, and
+            # its old tail rows are left behind as duplicates.
+            if prev_cur_row:
+                out += f"\x1b[{prev_cur_row}A"
             out += "\r"
-            for i in range(prev_row + 1):
+            for i in range(prev_rows):
                 out += "\x1b[2K"
-                if i < prev_row:
+                if i < prev_rows - 1:
                     out += "\x1b[B"
-            if prev_row:
-                out += f"\x1b[{prev_row}A"
-        out += prompt + line
-        if pos < len(line):
+            if prev_rows > 1:
+                out += f"\x1b[{prev_rows - 1}A"
+        rows = _edit_rows(line, prompt_w, width)
+        out += prompt + text
+        cur_row = rows - 1
+        if commit:
+            # Redrawn from the block's first row, so the caller's newline lands
+            # on the fresh row right below it.
+            out += "\r\n"
+        elif pos < len(line):
             # Position the cursor at the edit position with cursor moves (not
             # by re-printing, which would re-draw every line after the first
-            # newline). Positions are physical (row, col), so soft-wrapped
-            # lines are handled too.
+            # newline). Cells are physical (row, col), so soft-wrapped lines
+            # are handled too.
             trow, tcol = _edit_phys_pos(line, prompt_w, pos, width)
             erow, ecol = _edit_phys_pos(line, prompt_w, len(line), width)
-            drow = trow - erow
-            dcol = tcol - ecol
-            if drow:
-                out += f"\x1b[{drow}A" if drow > 0 else f"\x1b[{-drow}B"
-            if dcol:
-                out += f"\x1b[{dcol}C" if dcol > 0 else f"\x1b[{-dcol}D"
+            # After printing, the cursor is at the end of the text (erow,
+            # ecol). The target is always at or above it (trow <= erow), so
+            # move UP by the row difference (the column is preserved across
+            # the up-move), then adjust the column toward the target. Moving
+            # DOWN here would push the cursor into the blank rows below the
+            # text, and each re-render would start from that drifted position
+            # and re-print the previous line on every keystroke (it only went
+            # unnoticed at the bottom of the screen, where a down-move is a
+            # no-op).
+            if erow > trow:
+                out += f"\x1b[{erow - trow}A"
+            if tcol != ecol:
+                out += f"\x1b[{tcol - ecol}C" if tcol > ecol else f"\x1b[{ecol - tcol}D"
+            cur_row = trow
         sys.stdout.write(out)
         sys.stdout.flush()
-        prev_text = line
-        prev_width = width
+        prev_rows = rows
+        prev_cur_row = cur_row
         prev_rendered = True
 
-    def newline():
-        sys.stdout.write("\r\n")
-        sys.stdout.flush()
+    def commit():
+        """Leave the line on screen the way the user sees it and drop the cursor
+        onto a fresh row below it. Needed because the cursor can be parked in
+        the middle of a wrapped/multi-line block: without the redraw the tail
+        rows stay painted and the next output prints over them."""
+        render(commit=True)
 
     render()
     while True:
         token = next(keys)
         if token == "enter":
+            if AUTO_SEND:
+                break
+            # Auto-send off: Enter inserts a newline; Ctrl+Enter sends.
+            buf.insert(pos, "\n")
+            pos += 1
+        elif token == "ctrl_enter":
             break
         elif token == "ctrl_c":
-            newline()
+            commit()
             raise KeyboardInterrupt
         elif token == "ctrl_d":
             if not buf:
-                newline()
+                commit()
                 raise EOFError
             break
         elif token == "backspace":
@@ -3013,7 +3109,7 @@ def _edit_line(prompt: str, keys) -> str:
                 buf.insert(pos, ch)
                 pos += 1
         render()
-    newline()
+    commit()
     return "".join(buf)
 
 
@@ -4036,7 +4132,7 @@ def tools_menu(keys=None) -> bool:
                 kind, name = rows[cursor]
                 if kind == "server":
                     collapsed.add(name)
-            elif token == "enter":
+            elif token in ("enter", "ctrl_enter"):
                 DISABLED_TOOLS.clear()
                 DISABLED_TOOLS.update(disabled)
                 for name in pending_on:
@@ -4143,9 +4239,28 @@ REPL_COMMANDS = [
     ("/clear-screen", "clear the terminal screen"),
     ("/status", "show context usage, api url, and tools"),
     ("/tools", "interactive tool menu: up/down move, space toggle, enter apply, esc cancel"),
+    ("/auto-send", "on: Enter submits (default); off: Enter inserts a newline, Ctrl+Enter sends"),
     ("/help", "show this help"),
     ("/exit", "quit (alias: /quit)"),
 ]
+
+
+def set_auto_send(arg: str) -> str:
+    """Apply an /auto-send argument; return the status line to print.
+
+    Returns '' for an unknown argument (the caller prints a usage error).
+    """
+    global AUTO_SEND
+    v = arg.strip().lower()
+    if v in ("on", "true", "yes", "1"):
+        AUTO_SEND = True
+        return "auto-send on — Enter submits, Ctrl+J inserts a newline"
+    if v in ("off", "false", "no", "0"):
+        AUTO_SEND = False
+        return "auto-send off — Enter inserts a newline, Ctrl+Enter (or Ctrl+D) submits"
+    if not v:
+        return f"auto-send: {'on' if AUTO_SEND else 'off'}"
+    return ""
 
 
 def commands_menu(keys=None) -> str | None:
@@ -4198,7 +4313,7 @@ def commands_menu(keys=None) -> str | None:
                 cursor = max(0, cursor - 1)
             elif token == "down":
                 cursor = min(len(names) - 1, cursor + 1)
-            elif token == "enter":
+            elif token in ("enter", "ctrl_enter"):
                 return names[cursor]
             elif token in ("esc", "ctrl_c", "ctrl_d"):
                 return None
@@ -4226,7 +4341,9 @@ def format_help() -> str:
     """Build the /help report: list of REPL commands and file references."""
     lines = [f"{name:<16} {desc}" for name, desc in REPL_COMMANDS]
     lines.append(f"{'/tools <name>':<16} toggle a tool on/off ('mcp:<server>' toggles all of a server's tools)")
-    lines.append("Ctrl+J          insert a newline (multi-line input); Enter submits")
+    lines.append("Ctrl+J          insert a newline (multi-line input)")
+    lines.append("Enter           submit (auto-send on) — insert a newline (auto-send off)")
+    lines.append("Ctrl+Enter      submit (auto-send off; Ctrl+D also sends)")
     lines.append(f"{'esc esc':<16} interrupt generation (press twice within 2 s)")
     return (
         "\n".join(lines)
@@ -4554,6 +4671,7 @@ def main():
         "type / for a command menu, /help for all commands, /exit to quit\n"
         "attach files with @[cwd://rel/path], @[file:///abs/path] or @[http(s)://host/file]\n"
         "use up/down arrows to recall previous input, Ctrl+J inserts a newline (multi-line prompt)\n"
+        "Enter submits — /auto-send off switches to Ctrl+Enter to send\n"
     )
     if INTERRUPT_ENABLED:
         banner += "press esc twice (within 2 s) to interrupt generation\n"
@@ -4595,6 +4713,13 @@ def main():
                         print(colorize(f"{icon('error')} unknown tool: {name}", "error"))
                     else:
                         print(colorize(f"{name}: {state}", "dim"))
+            continue
+        if user_input == "/auto-send" or user_input.startswith("/auto-send "):
+            msg = set_auto_send(user_input[len("/auto-send"):])
+            if msg:
+                print(colorize(msg, "dim"))
+            else:
+                print(colorize("usage: /auto-send on|off", "error"))
             continue
         if user_input == "/help":
             print(colorize(format_help(), "dim"))

@@ -631,7 +631,9 @@ class TestResolveShell(Base):
         with mock.patch.object(h.shutil, "which", side_effect=self._which({"pwsh": "C:/pwsh.exe", "powershell": "C:/powershell.exe"})):
             argv, prefix = h._resolve_shell("auto")
         self.assertEqual(argv, ["C:/pwsh.exe", "-NoProfile", "-NonInteractive", "-Command"])
-        self.assertEqual(prefix, "")
+        # pwsh 7 can also emit the ANSI code page on redirected stdout, so
+        # the UTF-8-forcing prefix is applied to it as well.
+        self.assertIn("OutputEncoding", prefix)
 
     def test_auto_falls_back_to_powershell(self):
         with mock.patch.object(h.shutil, "which", side_effect=self._which({"powershell": "C:/powershell.exe"})):
@@ -647,7 +649,7 @@ class TestResolveShell(Base):
         with mock.patch.object(h.shutil, "which", side_effect=self._which({"pwsh": "C:/pwsh.exe"})):
             argv, prefix = h._resolve_shell("pwsh")
         self.assertEqual(argv[0], "C:/pwsh.exe")
-        self.assertEqual(prefix, "")
+        self.assertIn("OutputEncoding", prefix)
 
     def test_force_pwsh_missing_falls_back(self):
         with mock.patch.object(h.shutil, "which", side_effect=self._which({"powershell": "C:/powershell.exe"})):
@@ -1695,6 +1697,106 @@ class TestStreamAccumulation(unittest.TestCase):
         self.assertIs(result, msg)
 
 
+def _wrap_rows(text, width, prompt="you> "):
+    """Wrap `text` the way a terminal does, for comparing against a rendered
+    screen: the prompt shares the first row, every logical line is cut into
+    width-column pieces, and a line ending exactly on the width needs no extra
+    row (the wrap is pending). Independent of the code under test."""
+    rows = []
+    for i, ln in enumerate(text.split("\n")):
+        s = (prompt if i == 0 else "") + ln
+        rows += [s[j:j + width] for j in range(0, len(s), width)] or [""]
+    return rows
+
+
+class _MiniTerm:
+    """A tiny terminal model used to verify the line editor's ANSI redraws
+    produce the correct screen (no stale/duplicate lines, cursor in the right
+    place). It understands the subset of escapes the editor emits: cursor
+    moves (A/B/C/D), clear-line (2K), CR, LF (with scroll at the bottom), and
+    printable characters. Cursor moves are clamped to the grid, as a real
+    terminal's are.
+
+    Soft wrap is *pending*, as in real terminals (measured on Windows with
+    CONOUT$ + GetConsoleScreenBufferInfo): the character that fills a row
+    leaves the cursor on that row's **last** column and the row below is only
+    entered when the *next* character is written. A cursor move (or CR) acts on
+    that cell and cancels the pending wrap without moving anywhere, which is
+    what the editor's relative moves rely on."""
+
+    def __init__(self, rows=24, cols=80):
+        self.rows = rows
+        self.cols = cols
+        self.grid = [[" "] * cols for _ in range(rows)]
+        self.r = 0
+        self.c = 0
+        self.pending = False
+
+    def _scroll(self):
+        del self.grid[0]
+        self.grid.append([" "] * self.cols)
+        self.r = self.rows - 1
+
+    def _down(self, col=None):
+        """Go to the next row (scrolling at the bottom); optionally set its column."""
+        self.r += 1
+        if col is not None:
+            self.c = col
+        if self.r >= self.rows:
+            self._scroll()
+
+    def write(self, s: str) -> "_MiniTerm":
+        i = 0
+        n = len(s)
+        while i < n:
+            ch = s[i]
+            if ch == "\x1b" and i + 1 < n and s[i + 1] == "[":
+                j = i + 2
+                params = ""
+                while j < n and (s[j].isdigit() or s[j] == ";"):
+                    params += s[j]
+                    j += 1
+                if j < n:
+                    letter = s[j]
+                    val = int(params) if params else 1
+                    if letter == "A":
+                        self.r = max(0, self.r - val)
+                    elif letter == "B":
+                        self.r = min(self.rows - 1, self.r + val)
+                    elif letter == "C":
+                        self.c = min(self.cols - 1, self.c + val)
+                    elif letter == "D":
+                        self.c = max(0, self.c - val)
+                    elif letter == "K" and val == 2:
+                        self.grid[self.r] = [" "] * self.cols
+                    if letter in "ABCD":
+                        self.pending = False
+                    i = j + 1
+                    continue
+                i = j
+                continue
+            if ch == "\r":
+                self.c = 0
+                self.pending = False
+            elif ch == "\n":
+                self._down()  # LF alone keeps the column; the editor emits \r\n
+            else:
+                if self.pending:  # the wrap the previous character deferred
+                    self._down(0)
+                    self.pending = False
+                self.grid[self.r][self.c] = ch
+                self.c += 1
+                if self.c >= self.cols:
+                    self.c = self.cols - 1
+                    self.pending = True
+            i += 1
+        return self
+
+    def lines(self):
+        """Non-empty, right-stripped visible lines."""
+        return ["".join(row).rstrip() for row in self.grid if "".join(row).strip()]
+
+
 class TestLineEditor(Base):
     def setUp(self):
         super().setUp()
@@ -1723,7 +1825,9 @@ class TestLineEditor(Base):
         keys = [("char", "a"), "newline", ("char", "b"), "enter"]
         line, out = self.edit(keys)
         self.assertEqual(line, "a\nb")
-        self.assertIn("you> a\nb", out)
+        # The newline is written as an explicit CRLF: in raw mode a bare LF only
+        # moves down, which would leave the row shifted right by the column.
+        self.assertIn("you> a\r\nb", out)
 
     def test_multiline_render_does_not_reprint_lines(self):
         keys = [("char", "a"), "newline", ("char", "b"), "enter"]
@@ -1732,14 +1836,135 @@ class TestLineEditor(Base):
         # The final render must draw the text once and leave the cursor at the
         # end; the cursor is positioned with ANSI moves, not by re-printing the
         # text (which would re-draw the lines after the newline on every key).
-        self.assertTrue(out.endswith("you> a\nb\r\n"))
-        self.assertNotIn("you> a\nb\ryou> a", out)
+        self.assertTrue(out.endswith("you> a\r\nb\r\n"))
+        self.assertNotIn("you> a\r\nb\ryou> a", out)
 
     def _narrow_edit(self, keys, width=10):
         real = h.terminal_width
         h.terminal_width = lambda: width
         self.addCleanup(setattr, h, "terminal_width", real)
         return self.edit(keys)
+
+    def _drive(self, keys, width=10, start=4, prompt="you> "):
+        """Play `keys` through a mini terminal, render by render.
+
+        Returns one snapshot per render the editor emitted (index 0 is the
+        first, empty render; the last is the commit redraw): the buffer it was
+        showing, the whole screen as visible rows, and the cursor cell. The
+        buffer/pos pair is mirrored *here*, with the editing rules restated
+        independently of the code under test, so a test can compare each render
+        with the wrapped text that should have been painted."""
+        old_width, old_auto = h.terminal_width, h.AUTO_SEND
+        h.terminal_width = lambda: width
+        h.AUTO_SEND = True
+        buf, pos = [], 0
+
+        def apply(token):
+            nonlocal pos
+            if isinstance(token, tuple) and token[0] == "char":
+                buf.insert(pos, token[1])
+                pos += 1
+            elif token == "left":
+                pos = max(0, pos - 1)
+            elif token == "right":
+                pos = min(len(buf), pos + 1)
+            elif token == "home":
+                pos = 0
+            elif token == "end":
+                pos = len(buf)
+            elif token == "backspace":
+                if pos:
+                    del buf[pos - 1]
+                    pos -= 1
+            elif token == "delete":
+                if pos < len(buf):
+                    del buf[pos]
+            elif token == "newline":
+                buf.insert(pos, "\n")
+                pos += 1
+            elif token == "ctrl_u":
+                del buf[:pos]
+                pos = 0
+
+        class _Recorder:
+            def __init__(self):
+                self.parts = []
+
+            def write(self, s):
+                self.parts.append(s)
+
+            def flush(self):
+                pass
+
+        rec = _Recorder()
+        expected = [(0, "")]  # the prompt is rendered before the first key
+        if not keys or keys[-1] not in ("enter", "ctrl_enter", "ctrl_d"):
+            keys = list(keys) + ["enter"]  # the editor only exits on a send key
+
+        def feed():
+            prev = None
+            for k in keys:
+                if prev is not None:
+                    # The editor has just applied `prev`, rendered, and is
+                    # asking for the next key.
+                    apply(prev)
+                    expected.append((pos, "".join(buf)))
+                yield k
+                prev = k
+
+        try:
+            from contextlib import redirect_stdout
+            with redirect_stdout(rec):
+                line = h._edit_line(prompt, feed())
+        finally:
+            h.terminal_width, h.AUTO_SEND = old_width, old_auto
+
+        committed = bool(keys) and keys[-1] in ("enter", "ctrl_enter", "ctrl_d")
+        if committed:
+            expected.append((pos, "".join(buf)))  # the commit redraw
+        if len(rec.parts) != len(expected):
+            self.fail(f"{len(rec.parts)} renders for {len(expected)} key states")
+
+        term = _MiniTerm(rows=24, cols=width)
+        term.r = start
+        snaps = []
+        last = len(expected) - 1
+        for i, ((p, buffer), chunk) in enumerate(zip(expected, rec.parts)):
+            term.write(chunk)
+            snaps.append({
+                "buffer": buffer,
+                "pos": p,
+                "rows": ["".join(r).rstrip() for r in term.grid],
+                "r": term.r,
+                "c": term.c,
+                "commit": i == last and committed,
+            })
+        self.assertEqual(line, "".join(buf))
+        return snaps
+
+    def _assert_anchored(self, snaps, width=10, start=4, prompt="you> "):
+        """Every render must paint the buffer on the same rows: the block may
+        not drift up or down, and no row outside it may hold text (the reported
+        bug: the cursor walk-back overshot and the block crept one row per
+        keystroke, reprinting over the output above and duplicating its tail)."""
+        for s in snaps:
+            want = _wrap_rows(s["buffer"], width, prompt)
+            tag = f"buffer {s['buffer']!r} pos {s['pos']}"
+            self.assertEqual(
+                s["rows"][start:start + len(want)],
+                [row.rstrip() for row in want],
+                f"{tag}: the block is not where the first render put it",
+            )
+            outside = [i for i, row in enumerate(s["rows"])
+                       if row.strip() and not start <= i < start + len(want)]
+            self.assertEqual(outside, [], f"{tag}: stale text on rows {outside}")
+            if s["commit"]:
+                # The submitted line ends on its last row; the cursor drops onto
+                # the fresh row right below it, so the next output can't print
+                # over the line.
+                self.assertEqual(s["r"], start + len(want), f"{tag}: cursor after commit")
+            else:
+                self.assertTrue(start <= s["r"] < start + len(want), f"{tag}: cursor row {s['r']}")
 
     def test_soft_wrap_clears_all_physical_lines(self):
         # Width 10, prompt "you> " (5 cols): 12 chars wrap to 2 physical lines.
@@ -1757,25 +1982,66 @@ class TestLineEditor(Base):
         line, out = self._narrow_edit(keys)
         self.assertEqual(line, "0123456789ab")
         # Moving from char 5 to char 4 crosses the wrap: the cursor goes from
-        # row 1 col 7 to row 0 col 9 (one line down-to-up, two cols right).
-        self.assertIn("\x1b[1B\x1b[2C", out)
+        # the end (row 1 col 7) up to row 0 col 9 (one line UP, two cols
+        # right). A down-move here was the reported "re-print the previous
+        # line on every keypress" bug.
+        self.assertIn("\x1b[1A\x1b[2C", out)
+        self.assertNotIn("\x1b[1B\x1b[2C", out)
+
+    def test_wrapped_line_stays_anchored_while_arrowing_left(self):
+        # Reported bug: 32 chars in a 10-column terminal make a 4-row block.
+        # Arrowing left was fine until the caret crossed onto a row above the
+        # block's last one; from there every keystroke reprinted the whole
+        # block one row higher and left its old tail rows behind as duplicates.
+        snaps = self._drive([("char", c) for c in "abcdefghijklmnopqrstuvwxyz012345"]
+                            + ["left"] * 32)
+        self._assert_anchored(snaps)
+
+    def test_wrapped_line_stays_anchored_with_typing_and_arrows(self):
+        keys = ([("char", c) for c in "abcdefghijklmnopqrstuvwxyz012345"]
+                + ["left"] * 20
+                + [("char", c) for c in "XY"]
+                + ["home", "right", "right", "left", "backspace", "end", "left", "delete"])
+        snaps = self._drive(keys + ["enter"])
+        self.assertEqual(snaps[-1]["buffer"], "bcdefghijklXYmnopqrstuvwxyz01234")
+        self._assert_anchored(snaps)
+
+    def test_multiline_block_stays_anchored_across_lines(self):
+        # A real newline plus a soft wrap: 3 rows. Arrowing between the rows and
+        # editing there must not shift the block either.
+        keys = ([("char", c) for c in "01234567"]        # rows 0-1
+                + ["newline", ("char", "x"), ("char", "y")]  # row 2
+                + ["left"] * 7
+                + [("char", "Z"), "left", ("char", "W"), "backspace", "home", "end"])
+        snaps = self._drive(keys + ["enter"])
+        self.assertEqual(snaps[-1]["buffer"], "0123Z4567\nxy")
+        self._assert_anchored(snaps)
 
     def test_soft_wrap_boundary_cursor(self):
-        # Prompt (5) + 6 chars: the end sits at row 1 col 1; one left puts the
-        # cursor exactly on the wrap boundary (total col 10), i.e. row 1 col 0.
-        keys = [("char", c) for c in "012345"] + ["left"] + ["enter"]
-        line, out = self._narrow_edit(keys)
-        self.assertEqual(line, "012345")
-        self.assertTrue(out.endswith("\x1b[1D\r\n"))
+        # Prompt (5) + 6 chars: the caret at the end sits at row 1 col 1. One
+        # left moves it to character position 5, whose cell is on the wrap
+        # boundary — a terminal draws that in row 0's LAST column (the wrap is
+        # pending there), so the editor moves up one row and 8 columns right.
+        snaps = self._drive([("char", c) for c in "012345"] + ["left"] + ["enter"])
+        self._assert_anchored(snaps)
+        self.assertEqual((snaps[-2]["r"], snaps[-2]["c"]), (4, 9))
+        # ...and a character typed there lands at the wrap point: the caret sat
+        # at the end of row 0, so the text breaks exactly there.
+        snaps = self._drive([("char", c) for c in "012345"] + ["left", ("char", "X")])
+        self._assert_anchored(snaps)
+        self.assertEqual(snaps[-2]["buffer"], "01234X5")
+        self.assertEqual(snaps[-2]["rows"][4:7], ["you> 01234", "X5", ""])
 
-    def test_soft_wrap_exact_boundary_no_premature_wrap(self):
-        # Prompt (5) + 5 chars fills the row exactly: the terminal has not
-        # wrapped yet, so the cursor stays at row 0 col 9 and a left-arrow
-        # needs no row move.
-        keys = [("char", c) for c in "01234"] + ["left"] + ["enter"]
-        line, out = self._narrow_edit(keys)
-        self.assertEqual(line, "01234")
-        self.assertTrue(out.endswith("\x1b[2Kyou> 01234\r\n"))
+    def test_soft_wrap_exact_boundary_cursor(self):
+        # Prompt (5) + 5 chars fills row 0 exactly. A terminal cannot draw the
+        # caret in column 10, so it stays in the last cell of row 0 (pending
+        # wrap): the caret cell of position 5 and of position 4 is the same, and
+        # a left-arrow from the end moves nothing at all.
+        snaps = self._drive([("char", c) for c in "01234"] + ["left"] * 2 + ["enter"])
+        self._assert_anchored(snaps)
+        # (row, col) after typing the 5th char, then after the 1st and 2nd left.
+        self.assertEqual([(s["r"], s["c"]) for s in snaps[5:7]], [(4, 9), (4, 9)])
+        self.assertEqual((snaps[7]["r"], snaps[7]["c"]), (4, 8))
 
     def test_soft_wrap_then_newline_clears_all_rows(self):
         # Width 10, prompt "you> " (5 cols): 8 chars wrap to rows 0-1, and a
@@ -1786,9 +2052,71 @@ class TestLineEditor(Base):
         line, out = self._narrow_edit(keys)
         self.assertEqual(line, "01234567\nx")
         self.assertIn(
-            "\x1b[2A\r\x1b[2K\x1b[B\x1b[2K\x1b[B\x1b[2K\x1b[2Ayou> 01234567\nx", out
+            "\x1b[2A\r\x1b[2K\x1b[B\x1b[2K\x1b[B\x1b[2K\x1b[2Ayou> 01234567\r\nx", out
         )
-        self.assertTrue(out.endswith("you> 01234567\nx\r\n"))
+        self.assertTrue(out.endswith("you> 01234567\r\nx\r\n"))
+
+    def test_commit_with_caret_mid_block_leaves_no_stale_rows(self):
+        # Submitting with the caret parked mid-block must redraw the line from
+        # its first row and land the cursor on the row below the block, or the
+        # agent's reply would print over the leftover rows of the input.
+        snaps = self._drive([("char", c) for c in "0123456789ab"] + ["left"] * 9 + ["enter"])
+        self._assert_anchored(snaps)
+        last = snaps[-1]
+        self.assertEqual(last["rows"][4:6], ["you> 01234", "56789ab"])
+        self.assertEqual(last["r"], 6)
+        self.assertEqual([i for i, row in enumerate(last["rows"]) if row.strip()], [4, 5])
+
+    def test_multiline_cursor_does_not_reprint_previous_line(self):
+        # Reported bug: with a multi-line buffer, arrowing left from the last
+        # line onto an earlier line used to emit a cursor-DOWN move (the row
+        # delta was inverted), so the cursor drifted one row below the text
+        # and every following keypress re-printed the previous line. Play the
+        # whole session through a terminal model and assert the final screen
+        # shows the buffer exactly once, with no duplicated line.
+        keys = (
+            [("char", c) for c in "01234567"]            # wraps to rows 0-1 (width 10)
+            + ["newline", ("char", "x"), ("char", "y")]  # + newline -> "xy" on row 2
+            + ["left", "left", "left"]                   # cursor up onto row 1
+            + [("char", "Z"), "left"]                    # more keys while on row 1
+            + ["enter"]
+        )
+        line, out = self._narrow_edit(keys, width=10)
+        self.assertEqual(line, "01234567Z\nxy")
+        term = _MiniTerm(rows=24, cols=10).write(out)
+        self.assertEqual(term.lines(), ["you> 01234", "567Z", "xy"])
+
+    def test_edit_rows_counts_physical_rows(self):
+        # Rows the prompt + text paints: ceiling division per logical line (a
+        # line that soft-wraps without ending on a boundary still takes the next
+        # row), an empty line still counts as one row.
+        self.assertEqual(h._edit_rows("", 5, 10), 1)
+        self.assertEqual(h._edit_rows("01234", 5, 10), 1)         # fills row 0 exactly
+        self.assertEqual(h._edit_rows("012345", 5, 10), 2)
+        self.assertEqual(h._edit_rows("0123456789ab", 5, 10), 2)  # 17 cols
+        self.assertEqual(h._edit_rows("0123456789ab", 5, 10), 2)
+        self.assertEqual(h._edit_rows("0123456789ab\nx", 5, 10), 3)
+        self.assertEqual(h._edit_rows("abc\n", 5, 10), 2)
+
+    def test_edit_cur_pending_boundary(self):
+        self.assertEqual(h._edit_cur(0, 0, 10), (0, 0))
+        self.assertEqual(h._edit_cur(0, 9, 10), (0, 9))
+        self.assertEqual(h._edit_cur(0, 10, 10), (0, 9))   # filled: caret still on row 0
+        self.assertEqual(h._edit_cur(0, 11, 10), (1, 1))
+        self.assertEqual(h._edit_cur(0, 20, 10), (1, 9))   # two filled rows
+        self.assertEqual(h._edit_cur(0, 21, 10), (2, 1))
+        self.assertEqual(h._edit_cur(3, 7, 10), (3, 7))
+
+    def test_edit_phys_pos_pending_wrap(self):
+        self.assertEqual(h._edit_phys_pos("0123456789ab", 5, 12, 10), (1, 7))
+        self.assertEqual(h._edit_phys_pos("01234", 5, 5, 10), (0, 9))
+        self.assertEqual(h._edit_phys_pos("012345", 5, 5, 10), (0, 9))    # on the boundary
+        self.assertEqual(h._edit_phys_pos("012345", 5, 6, 10), (1, 1))
+        self.assertEqual(h._edit_phys_pos("0123456789", 5, 10, 10), (1, 5))
+        # After a newline the column base is 0 again, on the row after the rows
+        # the wrapped line occupied.
+        self.assertEqual(h._edit_phys_pos("01234567\nxy", 5, 9, 10), (2, 0))
+        self.assertEqual(h._edit_phys_pos("01234567\nxy", 5, 11, 10), (2, 2))
 
     def test_newline_in_middle_of_line(self):
         keys = [("char", "a"), ("char", "b"), "left", "newline", "enter"]
@@ -1932,6 +2260,73 @@ class TestLineEditor(Base):
         self.assertEqual(calls, [])
 
 
+class TestAutoSend(Base):
+    def setUp(self):
+        super().setUp()
+        self._old_auto_send = h.AUTO_SEND
+        h.AUTO_SEND = True
+        self.addCleanup(setattr, h, "AUTO_SEND", self._old_auto_send)
+        self._old_history = h.HISTORY
+        h.HISTORY = []
+        self.addCleanup(setattr, h, "HISTORY", self._old_history)
+
+    def edit(self, keys):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            line = h._edit_line("you> ", iter(keys))
+        return line, buf.getvalue()
+
+    def test_default_is_on(self):
+        self.assertTrue(h.AUTO_SEND)
+
+    def test_enter_submits_when_on(self):
+        self.assertEqual(self.edit([("char", "a"), "enter"])[0], "a")
+
+    def test_ctrl_enter_submits_when_on(self):
+        self.assertEqual(self.edit([("char", "a"), "ctrl_enter"])[0], "a")
+
+    def test_enter_inserts_newline_when_off(self):
+        h.AUTO_SEND = False
+        line, _ = self.edit([("char", "a"), "enter", ("char", "b"), "ctrl_enter"])
+        self.assertEqual(line, "a\nb")
+
+    def test_ctrl_enter_submits_when_off(self):
+        h.AUTO_SEND = False
+        self.assertEqual(self.edit([("char", "a"), "ctrl_enter"])[0], "a")
+
+    def test_ctrl_d_still_sends_when_off(self):
+        h.AUTO_SEND = False
+        self.assertEqual(self.edit([("char", "a"), "ctrl_d"])[0], "a")
+
+    def test_newline_token_still_inserts_newline_when_off(self):
+        h.AUTO_SEND = False
+        line, _ = self.edit([("char", "a"), "newline", ("char", "b"), "ctrl_enter"])
+        self.assertEqual(line, "a\nb")
+
+    def test_set_auto_send_off(self):
+        msg = h.set_auto_send("off")
+        self.assertFalse(h.AUTO_SEND)
+        self.assertIn("auto-send off", msg)
+
+    def test_set_auto_send_on(self):
+        h.AUTO_SEND = False
+        msg = h.set_auto_send("ON")
+        self.assertTrue(h.AUTO_SEND)
+        self.assertIn("auto-send on", msg)
+
+    def test_set_auto_send_no_arg_reports_state(self):
+        h.AUTO_SEND = False
+        self.assertEqual(h.set_auto_send(""), "auto-send: off")
+        self.assertEqual(h.set_auto_send("   "), "auto-send: off")
+        h.AUTO_SEND = True
+        self.assertEqual(h.set_auto_send(""), "auto-send: on")
+
+    def test_set_auto_send_bogus(self):
+        self.assertEqual(h.set_auto_send("maybe"), "")
+
+
 class TestWindowsKeyMap(unittest.TestCase):
     def first(self, chars):
         class FakeMsvcrt:
@@ -1962,6 +2357,14 @@ class TestWindowsKeyMap(unittest.TestCase):
         self.assertEqual(self.first(["a"]), ("char", "a"))
         self.assertEqual(self.first(["\x1b"]), "esc")
 
+    def test_cr_is_enter_when_ctrl_not_held(self):
+        with mock.patch.object(h, "_windows_ctrl_held", return_value=False):
+            self.assertEqual(self.first(["\r"]), "enter")
+
+    def test_cr_is_ctrl_enter_when_ctrl_held(self):
+        with mock.patch.object(h, "_windows_ctrl_held", return_value=True):
+            self.assertEqual(self.first(["\r"]), "ctrl_enter")
+
 
 class TestCsiSequences(unittest.TestCase):
     def feed(self, seq):
@@ -1980,6 +2383,10 @@ class TestCsiSequences(unittest.TestCase):
     def test_home_end(self):
         self.assertEqual(self.feed("H"), "home")
         self.assertEqual(self.feed("F"), "end")
+
+    def test_ctrl_enter_sequences(self):
+        self.assertEqual(self.feed("13;5u"), "ctrl_enter")
+        self.assertEqual(self.feed("27;5;13~"), "ctrl_enter")
 
     def test_unknown_ignored(self):
         self.assertEqual(self.feed("2~"), "ignore")
@@ -3059,6 +3466,10 @@ class TestCommandsMenu(unittest.TestCase):
 
     def test_enter_selects_first(self):
         selected, _ = self.menu(["enter"])
+        self.assertEqual(selected, h.REPL_COMMANDS[0][0])
+
+    def test_ctrl_enter_selects(self):
+        selected, _ = self.menu(["ctrl_enter"])
         self.assertEqual(selected, h.REPL_COMMANDS[0][0])
 
     def test_down_moves_cursor(self):
