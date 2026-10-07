@@ -21,7 +21,7 @@ import urllib.error
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-VERSION = "1.4.3"
+VERSION = "1.4.4"
 API_URL = "http://127.0.0.1:11434/v1/chat/completions"
 API_KEY = None
 MODEL = "local-model"
@@ -558,8 +558,28 @@ def tool_write_file(args: dict) -> str:
     return f"inserted {len(content_lines)} line(s) before line {offset} in {path}"
 
 
+def _iter_files(root: str):
+    """Yield the files to scan for grep/glob.
+
+    `root` itself when it is a file, otherwise every file under it, skipping
+    .git/node_modules/__pycache__. A missing path yields nothing (callers
+    check existence first so they can report it explicitly).
+    """
+    if os.path.isfile(root):
+        yield root
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [
+            d for d in dirnames if d not in (".git", "node_modules", "__pycache__")
+        ]
+        for name in filenames:
+            yield os.path.join(dirpath, name)
+
+
 def tool_grep(args: dict) -> str:
     root = safe_resolve(args["path"])
+    if not os.path.exists(root):
+        return f"error: path not found: {args['path']}"
     pattern = re.compile(args["pattern"], re.IGNORECASE)
     context = max(0, int(args.get("context", 0)))
     limit = _limit_arg(args, "limit", GREP_MATCH_LIMIT, MAX_COUNT_LIMIT)
@@ -579,49 +599,44 @@ def tool_grep(args: dict) -> str:
             stat, "narrow the pattern or file_pattern, or raise limit"
         )
 
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [
-            d for d in dirnames if d not in (".git", "node_modules", "__pycache__")
-        ]
-        for name in filenames:
-            fp = os.path.join(dirpath, name)
-            rel = _rel_to_cwd(fp, roots)
-            if file_re is not None and not (
-                file_re.search(rel) or file_re.search(os.path.basename(rel))
-            ):
-                continue
-            try:
-                lines = _read_lines(fp)
-            except (OSError, UnicodeDecodeError):
-                continue
-            hit_idx = [i for i, line in enumerate(lines) if pattern.search(line)]
-            if not hit_idx:
-                continue
-            entries = []
-            if context > 0:
-                hits = set(hit_idx)
-                shown = []
-                for i in hit_idx:
-                    for j in range(
-                        max(0, i - context), min(len(lines), i + context + 1)
-                    ):
-                        if j not in shown:
-                            shown.append(j)
-                for k, j in enumerate(shown):
-                    if k and j > shown[k - 1] + 1:
-                        entries.append("--")
-                    prefix = ">" if j in hits else " "
-                    entries.append(
-                        f"{prefix} {rel}:{j + 1}: {_clip_line(lines[j], GREP_LINE_LIMIT)}"
-                    )
-            else:
-                for i in hit_idx:
-                    entries.append(f"{rel}:{i + 1}: {_clip_line(lines[i], GREP_LINE_LIMIT)}")
-            for entry in entries:
-                if len(matches) >= limit or used + len(entry) > GREP_TEXT_LIMIT:
-                    return capped()
-                matches.append(entry)
-                used += len(entry)
+    for fp in _iter_files(root):
+        rel = _rel_to_cwd(fp, roots)
+        if file_re is not None and not (
+            file_re.search(rel) or file_re.search(os.path.basename(rel))
+        ):
+            continue
+        try:
+            lines = _read_lines(fp)
+        except (OSError, UnicodeDecodeError):
+            continue
+        hit_idx = [i for i, line in enumerate(lines) if pattern.search(line)]
+        if not hit_idx:
+            continue
+        entries = []
+        if context > 0:
+            hits = set(hit_idx)
+            shown = []
+            for i in hit_idx:
+                for j in range(
+                    max(0, i - context), min(len(lines), i + context + 1)
+                ):
+                    if j not in shown:
+                        shown.append(j)
+            for k, j in enumerate(shown):
+                if k and j > shown[k - 1] + 1:
+                    entries.append("--")
+                prefix = ">" if j in hits else " "
+                entries.append(
+                    f"{prefix} {rel}:{j + 1}: {_clip_line(lines[j], GREP_LINE_LIMIT)}"
+                )
+        else:
+            for i in hit_idx:
+                entries.append(f"{rel}:{i + 1}: {_clip_line(lines[i], GREP_LINE_LIMIT)}")
+        for entry in entries:
+            if len(matches) >= limit or used + len(entry) > GREP_TEXT_LIMIT:
+                return capped()
+            matches.append(entry)
+            used += len(entry)
     return "\n".join(matches) if matches else "no matches"
 
 
@@ -677,18 +692,16 @@ def tool_patch_file(args: dict) -> str:
 
 def tool_glob(args: dict) -> str:
     root = safe_resolve(args["path"])
+    if not os.path.exists(root):
+        return f"error: path not found: {args['path']}"
     pattern = args["pattern"]
     regex = _glob_to_regex(pattern)
     results = []
     roots = _cwd_roots()
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [
-            d for d in dirnames if d not in (".git", "node_modules", "__pycache__")
-        ]
-        for name in filenames:
-            rel = _rel_to_cwd(os.path.join(dirpath, name), roots)
-            if regex.search(rel):
-                results.append(rel)
+    for fp in _iter_files(root):
+        rel = _rel_to_cwd(fp, roots)
+        if regex.search(rel):
+            results.append(rel)
     if not results:
         return "no files matched"
     limit = _limit_arg(args, "limit", LIST_LIMIT, MAX_COUNT_LIMIT)
@@ -1303,13 +1316,13 @@ TOOLS = {
             "type": "function",
             "function": {
                 "name": "grep",
-                "description": "Recursively search file contents inside a relative directory path using a regex pattern.",
+                "description": "Search file contents with a regex pattern. path may be a directory (searched recursively) or a single file.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "Relative directory path to search, e.g. ./x/y/z",
+                            "description": "Relative path to search: a directory (searched recursively) or a single file, e.g. ./x/y/z",
                         },
                         "pattern": {
                             "type": "string",
@@ -1382,13 +1395,13 @@ TOOLS = {
             "type": "function",
             "function": {
                 "name": "glob",
-                "description": "Find files under a relative directory path by glob pattern (e.g. **/*.py) or regex.",
+                "description": "Find files by glob pattern (e.g. **/*.py) or regex. path may be a directory (searched recursively) or a single file.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "Relative directory path to search, e.g. ./x/y/z",
+                            "description": "Relative path to search: a directory (searched recursively) or a single file, e.g. ./x/y/z",
                         },
                         "pattern": {
                             "type": "string",

@@ -432,6 +432,26 @@ class TestGrep(Base):
         self.assertIn(f"output capped at {h.GREP_TEXT_LIMIT} chars", out)
         self.assertLess(len(out), h.GREP_TEXT_LIMIT + 200)
 
+    def test_path_is_file(self):
+        self.w("st/g1.txt", "l1\nAAA mid\nl3\n")
+        self.w("st/g2.txt", "AAA too\n")
+        out = self.grep("AAA", path=os.path.join(self.tmp, "st", "g1.txt").replace("\\", "/"))
+        self.assertEqual(out, "_test_tmp/st/g1.txt:2: AAA mid")
+
+    def test_path_is_file_filtered_by_file_pattern(self):
+        self.w("st/g1.txt", "AAA\n")
+        out = self.grep(
+            "AAA",
+            path=os.path.join(self.tmp, "st", "g1.txt").replace("\\", "/"),
+            file_pattern="*.md",
+        )
+        self.assertEqual(out, "no matches")
+
+    def test_missing_path(self):
+        self.w("st/g1.txt", "AAA\n")
+        out = self.grep("AAA", path=os.path.join(self.tmp, "st", "nope.txt").replace("\\", "/"))
+        self.assertEqual(out, "error: path not found: ./_test_tmp/st/nope.txt")
+
 
 class TestGlob(Base):
     def glob(self, pattern, **kw):
@@ -481,6 +501,22 @@ class TestGlob(Base):
         out = self.glob("**/*.py", limit=4)
         self.assertEqual(len(out.split("\n")), 5)
         self.assertIn("[truncated: 10 files, showing first 4;", out)
+
+    def test_path_is_file(self):
+        self.w("a.txt", "x")
+        self.w("b.md", "x")
+        out = self.glob("*.txt", path=os.path.join(self.tmp, "a.txt").replace("\\", "/"))
+        self.assertEqual(out, "_test_tmp/a.txt")
+
+    def test_path_is_file_no_match(self):
+        self.w("a.txt", "x")
+        out = self.glob("*.md", path=os.path.join(self.tmp, "a.txt").replace("\\", "/"))
+        self.assertEqual(out, "no files matched")
+
+    def test_missing_path(self):
+        self.w("a.txt", "x")
+        out = self.glob("*.txt", path=os.path.join(self.tmp, "nope").replace("\\", "/"))
+        self.assertEqual(out, "error: path not found: ./_test_tmp/nope")
 
 
 class TestDirOps(Base):
