@@ -2965,10 +2965,18 @@ def _edit_line(prompt: str, keys) -> str:
     """Run a minimal line editor over a key-token iterator. Returns the line
     (may contain newlines inserted via the "newline" token, e.g. Ctrl+J, or
     via Enter when auto-send is off). Enter submits when AUTO_SEND is on;
-    when it is off, Enter inserts a newline and Ctrl+Enter (or Ctrl+D) sends."""
+    when it is off, Enter inserts a newline and Ctrl+Enter (or Ctrl+D) sends.
+
+    Up/down first move the caret line-by-line within a multi-line buffer
+    (column preserved, clamped to the target line). From the first line, up
+    recalls history while saving the current line as a draft; the first down
+    restores it (buffer and caret). Editing a recalled entry discards the
+    draft, so subsequent downs walk history forward as usual."""
     buf = []
     pos = 0
     hist_idx = len(HISTORY)
+    draft = None  # (buf, pos) of the line being edited when a history recall
+    # started, so the first down press returns to it (with its caret)
 
     prev_rows = 0        # physical rows the previous render painted
     prev_cur_row = 0     # which of those rows the cursor ended on
@@ -3050,6 +3058,7 @@ def _edit_line(prompt: str, keys) -> str:
             if AUTO_SEND:
                 break
             # Auto-send off: Enter inserts a newline; Ctrl+Enter sends.
+            draft = None
             buf.insert(pos, "\n")
             pos += 1
         elif token == "ctrl_enter":
@@ -3064,12 +3073,15 @@ def _edit_line(prompt: str, keys) -> str:
             break
         elif token == "backspace":
             if pos > 0:
+                draft = None
                 del buf[pos - 1]
                 pos -= 1
         elif token == "delete":
             if pos < len(buf):
+                draft = None
                 del buf[pos]
         elif token == "ctrl_u":
+            draft = None
             buf = buf[pos:]
             pos = 0
         elif token == "left":
@@ -3081,19 +3093,52 @@ def _edit_line(prompt: str, keys) -> str:
         elif token == "end":
             pos = len(buf)
         elif token == "up":
-            if hist_idx > 0:
+            line = "".join(buf)
+            if line.rfind("\n", 0, pos) >= 0:
+                # Multi-line input: move the caret up within the buffer first
+                # (column preserved, clamped to the line above) instead of
+                # jumping to history and losing the draft.
+                line_start = line.rfind("\n", 0, pos) + 1
+                prev_start = line.rfind("\n", 0, line_start - 1) + 1
+                pos = prev_start + min(pos - line_start, line_start - prev_start - 1)
+            elif hist_idx > 0:
+                # Caret on the first line: recall the previous history entry.
+                # Leaving the *current* line for history (the first up) saves
+                # it as the draft, so the first down press restores it; from
+                # an empty line nothing is saved, so downs walk history
+                # forward as usual (the last one clears the line).
+                if hist_idx == len(HISTORY) and buf:
+                    draft = (list(buf), pos)
                 hist_idx -= 1
                 buf = list(HISTORY[hist_idx])
                 pos = len(buf)
         elif token == "down":
-            if hist_idx < len(HISTORY):
-                hist_idx += 1
-                buf = list(HISTORY[hist_idx]) if hist_idx < len(HISTORY) else []
-                pos = len(buf)
+            if draft is not None:
+                # First down after a history recall: restore the saved line
+                # (buffer and caret).
+                buf, pos = draft
+                draft = None
+                hist_idx = len(HISTORY)
+            else:
+                line = "".join(buf)
+                if line.rfind("\n", pos) >= 0:
+                    # Multi-line input with the caret above the last line:
+                    # move down within the buffer (column preserved, clamped).
+                    line_start = line.rfind("\n", 0, pos) + 1
+                    next_start = line.find("\n", pos) + 1
+                    next_end = line.find("\n", next_start)
+                    next_len = (len(line) if next_end < 0 else next_end) - next_start
+                    pos = next_start + min(pos - line_start, next_len)
+                elif hist_idx < len(HISTORY):
+                    hist_idx += 1
+                    buf = list(HISTORY[hist_idx]) if hist_idx < len(HISTORY) else []
+                    pos = len(buf)
         elif token == "newline":
+            draft = None
             buf.insert(pos, "\n")
             pos += 1
         elif isinstance(token, tuple) and token[0] == "char":
+            draft = None
             ch = token[1]
             if ch == "/" and not buf:
                 # Slash on an empty line opens the command menu; a selection

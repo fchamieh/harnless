@@ -2161,6 +2161,87 @@ class TestLineEditor(Base):
         h.HISTORY = ["only"]
         self.assertEqual(self.edit(["up", "up", "enter"])[0], "only")
 
+    def test_up_moves_caret_within_multiline_before_history(self):
+        # A multi-line draft: up moves the caret up line-by-line (column
+        # preserved) and does not touch the buffer until the caret reaches
+        # the first line and up is pressed once more.
+        h.HISTORY = ["cmd1", "cmd2"]
+        keys = (
+            [("char", "a"), "newline", ("char", "b"), "newline", ("char", "c")]
+            + ["up", "up"]  # caret walks from line 3 to line 1 (column kept)
+            + [("char", "X"), "enter"]  # types at the end of the first line
+        )
+        self.assertEqual(self.edit(keys)[0], "aX\nb\nc")
+
+    def test_up_column_clamped_to_line_above(self):
+        # Caret at column 4 of "bbbb": up lands at the end of the shorter
+        # line "a", not beyond it.
+        keys = [
+            ("char", "a"), "newline",
+            ("char", "b"), ("char", "b"), ("char", "b"), ("char", "b"),
+            "up", ("char", "X"), "enter",
+        ]
+        self.assertEqual(self.edit(keys)[0], "aX\nbbbb")
+
+    def test_up_from_first_line_recalls_history_down_restores_draft(self):
+        # Up from the first line shows the previous command, but keeps the
+        # draft: the first down returns to it, with the caret where it was.
+        h.HISTORY = ["cmd1", "cmd2"]
+        keys = (
+            [("char", "a"), "newline", ("char", "b"), "newline", ("char", "c")]
+            + ["up", "up"]  # caret to the first line (end of "a")
+            + ["up"]  # recalls "cmd2" (draft saved, caret at end of line 1)
+            + ["down"]  # back to the draft, caret where it was
+            + [("char", "X"), "enter"]
+        )
+        self.assertEqual(self.edit(keys)[0], "aX\nb\nc")
+
+    def test_down_restores_draft_after_browsing_further_up(self):
+        # Browsing up through several entries, then a single down returns to
+        # the saved draft (not to the entry just above it).
+        h.HISTORY = ["cmd1", "cmd2"]
+        keys = (
+            [("char", "a"), "newline", ("char", "b")]
+            + ["up"]  # caret to the first line (end of "a")
+            + ["up", "up"]  # recalls "cmd2", then "cmd1"
+            + ["down"]  # a single down returns to the saved draft
+            + [("char", "X"), "enter"]
+        )
+        self.assertEqual(self.edit(keys)[0], "aX\nb")
+
+    def test_editing_history_entry_discards_draft(self):
+        # Editing the recalled entry discards the draft; down then walks
+        # history forward as usual (clearing the line at the end).
+        h.HISTORY = ["cmd1", "cmd2"]
+        keys = (
+            [("char", "a"), "newline", ("char", "b")]
+            + ["up"]  # caret to the first line
+            + ["up", "up"]  # recalls "cmd2", then "cmd1"
+            + [("char", "X")]  # edits the recalled entry -> "cmd1X" (draft gone)
+            + ["down", "down"]  # walks history forward: "cmd2", then empty
+            + ["enter"]
+        )
+        self.assertEqual(self.edit(keys)[0], "")
+
+    def test_down_moves_caret_within_multiline(self):
+        # Symmetric to up: with the caret above the last line, down moves it
+        # down within the buffer instead of touching history.
+        keys = (
+            [("char", "a"), "newline", ("char", "b"), "newline", ("char", "c")]
+            + ["home"]  # caret at line 1 col 0
+            + ["down"]  # to line 2 col 0
+            + [("char", "X"), "enter"]
+        )
+        self.assertEqual(self.edit(keys)[0], "a\nXb\nc")
+
+    def test_up_down_multiline_without_history(self):
+        # No history: up/down just move the caret within the draft.
+        keys = (
+            [("char", "a"), "newline", ("char", "b")]
+            + ["up", "down", "enter"]
+        )
+        self.assertEqual(self.edit(keys)[0], "a\nb")
+
     def test_ctrl_c_raises(self):
         with self.assertRaises(KeyboardInterrupt):
             self.edit([("char", "a"), "ctrl_c"])
