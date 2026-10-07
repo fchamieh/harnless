@@ -21,7 +21,7 @@ import urllib.error
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-VERSION = "1.4.2"
+VERSION = "1.4.3"
 API_URL = "http://127.0.0.1:11434/v1/chat/completions"
 API_KEY = None
 MODEL = "local-model"
@@ -70,8 +70,12 @@ SUBAGENT_SUMMARY_LIMIT = 20_000  # task: sub-agent final summary (chars)
 TODO_BLOCK_LIMIT = 8_000  # todo render + reminder injection (chars)
 MEMORY_BLOCK_LIMIT = 12_000  # memory notes injected into the system prompt (chars)
 AGENTS_MD_LIMIT = 20_000  # AGENTS.md appended to the system prompt (chars)
-# Server-reported token usage per conversation, keyed by id(messages).
+# Server-reported token usage per conversation, keyed by conversation id
+# (MAIN_CONV_ID for the top-level conversation, unique counters for
+# sub-agents — see _record_usage).
 USAGE_BY_CONV: dict[int, dict] = {}
+MAIN_CONV_ID = 0
+_NEXT_CONV_ID = 1  # monotonically increasing usage keys for sub-agent runs
 IMAGE_MIME = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
@@ -886,9 +890,11 @@ def tool_task(args: dict) -> str:
         {"role": "system", "content": system},
         {"role": "user", "content": task},
     ]
-    global OUTPUT_INDENT, TODO_LAST_INJECTED
+    global OUTPUT_INDENT, TODO_LAST_INJECTED, _NEXT_CONV_ID
     old_indent = OUTPUT_INDENT
     old_todo_state = TODO_LAST_INJECTED
+    conv_id = _NEXT_CONV_ID
+    _NEXT_CONV_ID += 1
     OUTPUT_INDENT = old_indent + "  "
     try:
         code = run_agent(
@@ -897,10 +903,14 @@ def tool_task(args: dict) -> str:
             interactive=False,
             temperature=TEMPERATURE,
             depth=_AGENT_DEPTH + 1,
+            conv_id=conv_id,
         )
     finally:
         OUTPUT_INDENT = old_indent
         TODO_LAST_INJECTED = old_todo_state
+        # The sub-agent's messages list is freed on return; drop its usage
+        # entry so the address can't be recycled and resurrect stale usage.
+        USAGE_BY_CONV.pop(conv_id, None)
     final = ""
     for m in reversed(messages):
         if m.get("role") == "assistant" and (m.get("content") or "").strip():
@@ -3243,14 +3253,18 @@ def probe_context_window() -> int:
     )
 
 
-def _record_usage(messages: list, usage) -> None:
+def _record_usage(messages: list, usage, conv_id: int = None) -> None:
     """Remember the server-reported token usage for a conversation.
 
-    Keyed by id(messages) so each conversation (including sub-agents)
-    tracks its own; /status looks it up to show exact prompt tokens.
+    Keyed by an explicit conversation id when given (MAIN_CONV_ID for the
+    top-level conversation, a unique counter per sub-agent run), else by
+    id(messages). Explicit ids matter: id() is a memory address, and a
+    freed sub-agent messages list can be reallocated at the same address,
+    which would make /status resurrect stale sub-agent usage. Sub-agent
+    entries are deleted when the sub-agent finishes (tool_task).
     """
     if isinstance(usage, dict) and usage.get("prompt_tokens"):
-        USAGE_BY_CONV[id(messages)] = usage
+        USAGE_BY_CONV[conv_id if conv_id is not None else id(messages)] = usage
 
 
 class _UploadProgress:
@@ -3323,7 +3337,11 @@ def _open_request(req: urllib.request.Request, progress=None, on_socket=None):
 
 
 def chat(
-    messages: list, model: str, interactive: bool = False, temperature: float = 1.0
+    messages: list,
+    model: str,
+    interactive: bool = False,
+    temperature: float = 1.0,
+    conv_id: int = None,
 ) -> dict:
     payload = json.dumps(
         {
@@ -3342,7 +3360,7 @@ def chat(
             data = json.loads(resp.read().decode("utf-8"))
     finally:
         spinner.stop()
-    _record_usage(messages, data.get("usage"))
+    _record_usage(messages, data.get("usage"), conv_id)
     return data
 
 
@@ -3402,6 +3420,7 @@ def stream_chat(
     temperature: float = 1.0,
     watcher=None,
     progress=None,
+    conv_id: int = None,
 ):
     """Yield deltas from a streaming chat response until [DONE].
 
@@ -3436,7 +3455,7 @@ def stream_chat(
                 if parsed == "[DONE]":
                     break
                 if "usage" in parsed:
-                    _record_usage(messages, parsed["usage"])
+                    _record_usage(messages, parsed["usage"], conv_id)
                     continue
                 yield parsed
         except (OSError, http.client.HTTPException):
@@ -3848,7 +3867,11 @@ class MarkdownRenderer:
 
 
 def stream_once(
-    messages: list, model: str, interactive: bool = False, temperature: float = 1.0
+    messages: list,
+    model: str,
+    interactive: bool = False,
+    temperature: float = 1.0,
+    conv_id: int = None,
 ) -> tuple[dict, bool]:
     """Stream one chat turn, printing reasoning and content live.
 
@@ -3878,6 +3901,7 @@ def stream_once(
             temperature=temperature,
             watcher=watcher,
             progress=spinner if spinner.active else None,
+            conv_id=conv_id,
         ):
             spinner.stop()
             streamed = True
@@ -4255,12 +4279,12 @@ def estimate_context_tokens(messages: list, interactive: bool = False) -> int:
     return estimate_context_chars(messages, interactive) // 4
 
 
-def format_status(messages: list, context_window: int = 0) -> str:
+def format_status(messages: list, context_window: int = 0, conv_id: int = None) -> str:
     """Build the /status report: context usage, API URL, tool names, MCP servers."""
     tools = _active_tools(True)
     total_chars = estimate_context_chars(messages, interactive=True)
     approx_tokens = total_chars // 4
-    usage = USAGE_BY_CONV.get(id(messages))
+    usage = USAGE_BY_CONV.get(conv_id if conv_id is not None else id(messages))
     prompt_tokens = (
         int(usage["prompt_tokens"])
         if isinstance(usage, dict) and usage.get("prompt_tokens")
@@ -4425,6 +4449,7 @@ def run_agent(
     interactive: bool = False,
     temperature: float = 1.0,
     depth: int = 0,
+    conv_id: int = None,
 ) -> int:
     global _AGENT_DEPTH
     _AGENT_DEPTH = depth
@@ -4433,7 +4458,11 @@ def run_agent(
         streamed = False
         try:
             message, streamed = stream_once(
-                messages, model, interactive=interactive, temperature=temperature
+                messages,
+                model,
+                interactive=interactive,
+                temperature=temperature,
+                conv_id=conv_id,
             )
             if not streamed:
                 message = None
@@ -4460,7 +4489,11 @@ def run_agent(
         if message is None:
             try:
                 data = chat(
-                    messages, model, interactive=interactive, temperature=temperature
+                    messages,
+                    model,
+                    interactive=interactive,
+                    temperature=temperature,
+                    conv_id=conv_id,
                 )
             except urllib.error.URLError as e:
                 print(
@@ -4719,7 +4752,10 @@ def main():
     if args.prompt is not None:
         print(colorize(f"harnless {VERSION} one-shot in {CWD} (api: {API_URL})", "dim"))
         messages.append(build_user_message(args.prompt))
-        sys.exit(run_agent(messages, args.model, temperature=args.temperature))
+        sys.exit(
+            run_agent(messages, args.model, temperature=args.temperature,
+                      conv_id=MAIN_CONV_ID)
+        )
 
     _history_load()
 
@@ -4754,7 +4790,12 @@ def main():
             os.system("cls" if os.name == "nt" else "clear")
             continue
         if user_input == "/status":
-            print(colorize(format_status(messages, context_window), "dim"))
+            print(
+                colorize(
+                    format_status(messages, context_window, conv_id=MAIN_CONV_ID),
+                    "dim",
+                )
+            )
             continue
         if user_input == "/tools" or user_input.startswith("/tools "):
             rest = user_input[len("/tools"):].strip()
@@ -4785,7 +4826,11 @@ def main():
             continue
         messages.append(build_user_message(user_input))
         run_agent(
-            messages, args.model, interactive=True, temperature=args.temperature
+            messages,
+            args.model,
+            interactive=True,
+            temperature=args.temperature,
+            conv_id=MAIN_CONV_ID,
         )
 
 

@@ -1305,16 +1305,22 @@ class TestSubagents(unittest.TestCase):
         self._old_indent = h.OUTPUT_INDENT
         self._old_model = h.MODEL
         self._old_temp = h.TEMPERATURE
+        self._old_usage = dict(h.USAGE_BY_CONV)
+        self._old_next_conv = h._NEXT_CONV_ID
         h._AGENT_DEPTH = 0
         h.MAX_SUBAGENT_DEPTH = 3
         h.OUTPUT_INDENT = ""
         h.MODEL = "test-model"
         h.TEMPERATURE = 0.2
+        h.USAGE_BY_CONV.clear()
         self.addCleanup(setattr, h, "_AGENT_DEPTH", self._old_depth)
         self.addCleanup(setattr, h, "MAX_SUBAGENT_DEPTH", self._old_max)
         self.addCleanup(setattr, h, "OUTPUT_INDENT", self._old_indent)
         self.addCleanup(setattr, h, "MODEL", self._old_model)
         self.addCleanup(setattr, h, "TEMPERATURE", self._old_temp)
+        self.addCleanup(h.USAGE_BY_CONV.clear)
+        self.addCleanup(h.USAGE_BY_CONV.update, self._old_usage)
+        self.addCleanup(setattr, h, "_NEXT_CONV_ID", self._old_next_conv)
 
     def test_task_registered_in_both_tool_lists(self):
         all_names = [s["function"]["name"] for s in h.OPENAI_TOOLS]
@@ -1333,7 +1339,7 @@ class TestSubagents(unittest.TestCase):
         self.assertTrue(out.startswith("error: sub-agent depth limit reached"))
 
     def test_task_summary_capped(self):
-        def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0):
+        def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None):
             messages.append({"role": "assistant", "content": "s" * 30_000})
             return 0
 
@@ -1350,7 +1356,7 @@ class TestSubagents(unittest.TestCase):
     def test_task_runs_nested_agent(self):
         calls = []
 
-        def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0):
+        def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None):
             calls.append({
                 "messages": list(messages), "model": model,
                 "interactive": interactive, "temperature": temperature, "depth": depth,
@@ -1374,7 +1380,7 @@ class TestSubagents(unittest.TestCase):
         self.assertEqual(h.OUTPUT_INDENT, "")
 
     def test_task_indent_restored_on_error(self):
-        def boom(messages, model, interactive=False, temperature=0.2, depth=0):
+        def boom(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None):
             raise RuntimeError("nope")
 
         old = h.run_agent
@@ -1385,7 +1391,7 @@ class TestSubagents(unittest.TestCase):
         self.assertEqual(h.OUTPUT_INDENT, "")
 
     def test_task_no_final_content(self):
-        def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0):
+        def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None):
             messages.append({"role": "assistant", "content": ""})
             return 2
 
@@ -1394,8 +1400,37 @@ class TestSubagents(unittest.TestCase):
         self.addCleanup(setattr, h, "run_agent", old)
         self.assertEqual(h.tool_task({"task": "do X"}), "exit code: 2")
 
+    def test_task_cleans_up_subagent_usage(self):
+        def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None):
+            # Simulate the sub-agent's API call recording usage under its
+            # own conversation id.
+            h._record_usage(messages, {"prompt_tokens": 999999}, conv_id)
+            messages.append({"role": "assistant", "content": "done"})
+            return 0
+
+        old = h.run_agent
+        h.run_agent = fake_run_agent
+        self.addCleanup(setattr, h, "run_agent", old)
+        h.tool_task({"task": "do X"})
+        # The sub-agent's usage entry must not survive the run: its
+        # messages list is freed, and a recycled address would resurrect
+        # the stale entry in /status.
+        self.assertEqual(h.USAGE_BY_CONV, {})
+
+    def test_task_usage_cleaned_up_on_error(self):
+        def boom(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None):
+            h._record_usage(messages, {"prompt_tokens": 424242}, conv_id)
+            raise RuntimeError("nope")
+
+        old = h.run_agent
+        h.run_agent = boom
+        self.addCleanup(setattr, h, "run_agent", old)
+        with self.assertRaises(RuntimeError):
+            h.tool_task({"task": "do X"})
+        self.assertEqual(h.USAGE_BY_CONV, {})
+
     def test_run_agent_exit_returns_code(self):
-        def fake_stream_once(messages, model, interactive=False, temperature=0.2):
+        def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
             return ({"role": "assistant", "content": "", "tool_calls": [
                 {"id": "c1", "type": "function",
                  "function": {"name": "exit", "arguments": '{"code": 7, "message": "done"}'}}]}, True)
@@ -3752,7 +3787,7 @@ class TestTodo(Base):
         self.assertEqual(len(messages), 2)  # re-added list injects again
 
     def test_run_agent_injects_reminder(self):
-        def fake_stream_once(messages, model, interactive=False, temperature=0.2):
+        def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
             if len(messages) == 1:
                 return ({"role": "assistant", "content": "", "tool_calls": [
                     {"id": "c1", "type": "function",
@@ -4174,6 +4209,63 @@ class TestUsageTracking(unittest.TestCase):
         h._record_usage(msgs, {"prompt_tokens": 0})
         self.assertNotIn(id(msgs), h.USAGE_BY_CONV)
 
+    def test_record_usage_stores_by_conv_id(self):
+        msgs = [{"role": "user", "content": "hi"}]
+        h._record_usage(msgs, {"prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105}, conv_id=7)
+        self.assertEqual(h.USAGE_BY_CONV[7]["prompt_tokens"], 100)
+        self.assertNotIn(id(msgs), h.USAGE_BY_CONV)
+
+    def test_format_status_by_conv_id(self):
+        msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]
+        h._record_usage(msgs, {"prompt_tokens": 170000, "completion_tokens": 10, "total_tokens": 170010}, conv_id=5)
+        out = h.format_status(msgs, context_window=200000, conv_id=5)
+        self.assertIn("context: 170000 tokens (server-reported) in 2 messages", out)
+        # An address-keyed lookup must not find the conv-id entry.
+        out2 = h.format_status(msgs, context_window=200000)
+        self.assertIn("(estimated", out2)
+
+    def test_chat_records_usage_by_conv_id(self):
+        data = {
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 55, "completion_tokens": 2, "total_tokens": 57},
+        }
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps(data).encode("utf-8")
+
+        with mock.patch.object(h.urllib.request, "urlopen", return_value=FakeResp()):
+            msgs = [{"role": "user", "content": "hi"}]
+            h.chat(msgs, "m", conv_id=3)
+        self.assertEqual(h.USAGE_BY_CONV[3]["prompt_tokens"], 55)
+        self.assertNotIn(id(msgs), h.USAGE_BY_CONV)
+
+    def test_stream_chat_records_usage_by_conv_id(self):
+        lines = [
+            b'data: {"choices":[{"delta":{"content":"hi"}}]}\n',
+            b'data: {"choices":[],"usage":{"prompt_tokens":170000,"completion_tokens":1,"total_tokens":170001}}\n',
+            b"data: [DONE]\n",
+        ]
+
+        class FakeResp:
+            def __enter__(self):
+                return iter(lines)
+
+            def __exit__(self, *a):
+                return False
+
+        with mock.patch.object(h.urllib.request, "urlopen", return_value=FakeResp()):
+            msgs = [{"role": "user", "content": "hi"}]
+            list(h.stream_chat(msgs, "m", conv_id=4))
+        self.assertEqual(h.USAGE_BY_CONV[4]["prompt_tokens"], 170000)
+        self.assertNotIn(id(msgs), h.USAGE_BY_CONV)
+
     def test_parse_sse_line_usage_chunk_empty_choices(self):
         line = 'data: {"id":"x","choices":[],"usage":{"prompt_tokens":170000,"completion_tokens":10,"total_tokens":170010}}'
         self.assertEqual(
@@ -4439,7 +4531,7 @@ class TestInterrupt(Base):
             def attach_socket(self, sock):
                 pass
 
-        def fake_stream_chat(messages, model, interactive=False, temperature=0.2, watcher=None, progress=None):
+        def fake_stream_chat(messages, model, interactive=False, temperature=0.2, watcher=None, progress=None, conv_id=None):
             yield {"content": "partial"}
 
         old_enabled = h.INTERRUPT_ENABLED
@@ -4475,7 +4567,7 @@ class TestInterrupt(Base):
             def attach_socket(self, sock):
                 pass
 
-        def fake_stream_chat(messages, model, interactive=False, temperature=0.2, watcher=None, progress=None):
+        def fake_stream_chat(messages, model, interactive=False, temperature=0.2, watcher=None, progress=None, conv_id=None):
             yield from ()
 
         old_enabled = h.INTERRUPT_ENABLED
@@ -4495,7 +4587,7 @@ class TestInterrupt(Base):
         self.assertIn("(interrupted)", buf.getvalue())
 
     def test_run_agent_interrupt_keeps_partial_strips_tool_calls(self):
-        def fake_stream_once(messages, model, interactive=False, temperature=0.2):
+        def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
             raise h.StreamInterrupted(
                 {
                     "role": "assistant",
@@ -4521,7 +4613,7 @@ class TestInterrupt(Base):
         self.assertEqual(messages[-1], {"role": "assistant", "content": "partial answer"})
 
     def test_run_agent_interrupt_empty_appends_nothing(self):
-        def fake_stream_once(messages, model, interactive=False, temperature=0.2):
+        def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
             raise h.StreamInterrupted({"role": "assistant"})
 
         old = h.stream_once
@@ -4539,7 +4631,7 @@ class TestInterrupt(Base):
         reject assistant messages without content/tool_calls, which would
         break every later request in the conversation."""
 
-        def fake_stream_once(messages, model, interactive=False, temperature=0.2):
+        def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
             raise h.StreamInterrupted(
                 {"role": "assistant", "reasoning_content": "still thinking"}
             )
@@ -4558,7 +4650,7 @@ class TestInterrupt(Base):
         """Stripping the half-formed tool calls leaves a content-less
         partial (reasoning only), which is dropped too."""
 
-        def fake_stream_once(messages, model, interactive=False, temperature=0.2):
+        def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
             raise h.StreamInterrupted(
                 {
                     "role": "assistant",
@@ -4584,7 +4676,7 @@ class TestInterrupt(Base):
         self.assertEqual(len(messages), 1)
 
     def test_run_agent_interrupt_content_and_reasoning_kept(self):
-        def fake_stream_once(messages, model, interactive=False, temperature=0.2):
+        def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
             raise h.StreamInterrupted(
                 {
                     "role": "assistant",
