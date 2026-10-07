@@ -850,9 +850,12 @@ def tool_fetch_url(args: dict) -> str:
 
 SUBAGENT_NOTE = (
     "You are a sub-agent delegated a specific task. Work autonomously using the tools. "
-    "When the task is complete, write a concise final summary of what you did and the result, "
-    "then call the exit tool with code 0. If the task cannot be completed, explain why in your "
-    "final message and call the exit tool with a non-zero code."
+    "The parent only sees your final summary: make it self-contained and concise — key "
+    "findings, file paths with line numbers, decisions, and caveats — omitting intermediate "
+    "detail (aim for under 50 lines unless the task asks for more). "
+    "When the task is complete, write that final summary, then call the exit tool with code 0. "
+    "If the task cannot be completed, explain why in your final message and call the exit tool "
+    "with a non-zero code."
 )
 
 
@@ -1635,11 +1638,17 @@ TOOLS = {
             "function": {
                 "name": "task",
                 "description": (
-                    "Delegate a self-contained task to a sub-agent. The sub-agent runs in a "
-                    "fresh context with the same tools (it can delegate further, up to the "
-                    "depth limit) and returns its final summary as the result. Use it for work "
-                    "that would flood your context with intermediate output, e.g. exploring a "
-                    "large codebase, running many commands, or verifying a change."
+                    "Delegate a self-contained task to a sub-agent with a fresh, isolated "
+                    "context. It runs with the same tools (it can delegate further, up to the "
+                    "depth limit) and returns only its final summary — all intermediate output "
+                    "(file reads, command output) stays in the sub-agent and is discarded, so "
+                    "your context stays clean. Use it proactively for: exploring an unfamiliar "
+                    "codebase, answering 'how does X work' questions, researching to create a "
+                    "plan, and any work that would produce lots of intermediate output. The "
+                    "sub-agent cannot see this conversation: the task string must be complete "
+                    "and self-contained — include relevant paths, constraints, and the exact "
+                    "output you want (e.g. 'return key findings with file:line references, "
+                    "under 50 lines')."
                 ),
                 "parameters": {
                     "type": "object",
@@ -2197,6 +2206,11 @@ def get_system_prompt(cwd, additional) -> str:
         "For multi-step work, track progress with the todo tool: add all the steps up front in a single 'add' call, mark each in_progress then done as you go. "
         "When you hit an error and determine the root cause, record a one-line note with the memory tool, prefixed 'gotcha: ' (e.g. 'gotcha: tests must run from the repo root'), so you don't repeat it. "
         "Use the memory tool for durable facts (user preferences, project conventions) that should survive across sessions. "
+        "Delegate generously with the task tool to protect your context: the sub-agent runs in a fresh context and returns only its final summary. "
+        "Use it for codebase exploration, research to create plans, 'how does this work' questions, and any work producing lots of intermediate output — "
+        "do the exploration in a sub-agent, then plan from its summary. "
+        "Write self-contained tasks: the sub-agent cannot see this conversation, so include the relevant paths, constraints, and the exact output you want "
+        "(e.g. 'return key findings with file:line references, under 50 lines'). "
         "Format responses in Markdown (headings, lists, tables, fenced code blocks); the terminal renders it. "
         "{additional}"
     ).format(cwd=cwd, additional=additional)
