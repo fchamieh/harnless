@@ -680,7 +680,62 @@ class TestRunShell(Base):
 
     def test_timeout(self):
         out = self.sh("python -c \"import time; time.sleep(2)\"", timeout=1)
-        self.assertEqual(out, "error: command timed out after 1s")
+        self.assertTrue(out.startswith("error: command timed out after 1s"), out)
+        self.assertIn("killed", out)
+
+    def test_timeout_kills_the_whole_process_tree(self):
+        """run_shell used to kill only the shell wrapper (subprocess.run's
+        direct child) and then drain the pipes with no deadline: the real work —
+        a grandchild — kept running, held the pipes open, and the harness waited
+        for *it* instead of returning, leaving a runaway for the user to kill.
+        The grandchild here drops a marker if it survives; the spawner outlives
+        the timeout, so a regression shows up as either the marker or a hang."""
+        started = self.p("orphan_started")
+        marker = self.p("orphan_survived")
+        child = self.p("slow_child.py")
+        spawner = self.p("spawner.py")
+        self.w(
+            "slow_child.py",
+            "import pathlib, sys, time\n"
+            f"pathlib.Path({started!r}).write_text('spawned')\n"
+            "time.sleep(6)\n"
+            f"pathlib.Path({marker!r}).write_text('the grandchild outlived the timeout')\n",
+        )
+        self.w(
+            "spawner.py",
+            "import subprocess, sys, time\n"
+            f"subprocess.Popen([sys.executable, {child!r}])\n"
+            "time.sleep(25)\n",
+        )
+        start = time.monotonic()
+        out = self.sh(f"python '{spawner}'", timeout=3)
+        elapsed = time.monotonic() - start
+        self.assertTrue(out.startswith("error: command timed out after 3s"), out)
+        self.assertLess(elapsed, 15, f"run_shell hung for {elapsed:.1f}s: {out}")
+        time.sleep(5)  # long enough for a surviving grandchild to write its marker
+        self.assertTrue(os.path.exists(started), "the grandchild was never spawned")
+        self.assertFalse(os.path.exists(marker), "the grandchild survived the timeout")
+
+    def test_timeout_reports_partial_output(self):
+        """Whatever the killed command printed is still worth having."""
+        out = self.sh(
+            "python -c \"print('half a build log', flush=True); import time; time.sleep(3)\"",
+            timeout=1,
+        )
+        self.assertIn("[partial output]", out)
+        self.assertIn("half a build log", out)
+
+    def test_timeout_argument_validation(self):
+        self.assertEqual(h._shell_timeout({}), (h.SHELL_TIMEOUT_DEFAULT, None))
+        self.assertEqual(h._shell_timeout({"timeout": 5}), (5, None))
+        self.assertEqual(h._shell_timeout({"timeout": 2.7}), (2, None))
+        self.assertEqual(h._shell_timeout({"timeout": 10**6}), (h.SHELL_TIMEOUT_CEILING, None))
+        self.assertEqual(h._shell_timeout({"timeout": 0})[1], "error: timeout must be >= 1")
+        self.assertEqual(
+            h._shell_timeout({"timeout": "abc"})[1], "error: timeout must be a number of seconds"
+        )
+        self.assertTrue(self.sh("Write-Output 'x'", timeout=0).startswith("error: timeout"))
+        self.assertTrue(self.sh("Write-Output 'x'", timeout="soon").startswith("error: timeout"))
 
     @unittest.skipUnless(sys.platform == "win32", "PowerShell only on Windows")
     def test_uses_powershell_on_windows(self):

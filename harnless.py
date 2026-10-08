@@ -11,6 +11,7 @@ import os
 import queue
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -21,7 +22,7 @@ import urllib.error
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 API_URL = "http://127.0.0.1:11434/v1/chat/completions"
 API_KEY = None
 MODEL = "local-model"
@@ -122,11 +123,26 @@ _REF_RE = re.compile(r"@\[((?:cwd|file|https?)://[^\]]+)\]")
 # Preferred shell for run_shell on Windows: "auto" (pwsh → powershell → cmd),
 # or force "pwsh" / "powershell" / "cmd". Set from --shell in main().
 SHELL_PREFERRED = "auto"
+# run_shell timeouts. The direct child is only the shell *wrapper*: the real
+# work (a test runner, a compiler, a dev server) runs as its grandchild and
+# inherits the output pipes. Killing the wrapper alone leaves that orphan
+# holding the pipes open, so the harness's output drain waits for it instead of
+# returning — a "timed out after 120s" that never came back, and a runaway the
+# user had to kill by hand. Hence: kill the whole tree, then drain with a
+# deadline of its own.
+SHELL_TIMEOUT_DEFAULT = 120  # seconds a command may run before it is killed
+SHELL_TIMEOUT_MIN = 1
+SHELL_TIMEOUT_CEILING = 3_600  # a tool call that never returns stalls the turn
+KILL_DRAIN_TIMEOUT = 5  # seconds spent collecting output after the kill
+TASKKILL_TIMEOUT = 15  # seconds to let taskkill itself tear the tree down
 SHELL_NOTE = (
     " Commands run in PowerShell (pwsh, falling back to powershell.exe); use PowerShell syntax "
     "(e.g. Get-ChildItem, Select-String, Get-Content, Copy-Item) — bash/cmd syntax will not work."
     if os.name == "nt"
     else " Commands run in bash."
+) + (
+    " The call waits for everything still holding the output pipes, so do not leave "
+    "background processes running: at the timeout the command and its whole process tree are killed."
 )
 
 ANSI = {
@@ -511,10 +527,112 @@ def _resolve_shell(preferred: str = "auto") -> tuple:
     return result
 
 
+def _taskkill_cmd() -> list:
+    """taskkill.exe as a command prefix on Windows ([] where it is missing);
+    POSIX kills whole process groups instead — see _kill_tree."""
+    if os.name != "nt":
+        return []
+    path = shutil.which("taskkill")
+    if not path:
+        path = os.path.join(
+            os.environ.get("WINDIR") or r"C:\Windows", "System32", "taskkill.exe"
+        )
+    return [path, "/PID"] if os.path.exists(path) else []
+
+
+_TASKKILL = _taskkill_cmd()
+
+
+def _kill_tree(proc) -> None:
+    """Stop a timed-out command *and everything it started*.
+
+    proc.kill() reaches only the shell wrapper. Its children — the actual
+    compile/test/serve — inherited the output pipes and keep running, and the
+    harness then waits on those pipes: that was the "timeout" that never came
+    back and the runaway the user had to kill by hand.
+    """
+    if _TASKKILL and proc.pid:
+        try:
+            subprocess.run(
+                _TASKKILL + [str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                timeout=TASKKILL_TIMEOUT,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            return
+        except (OSError, subprocess.SubprocessError):
+            pass  # taskkill failed or is missing: last resort below
+    elif os.name != "nt":
+        try:
+            # The command is spawned in its own process group, so the shell and
+            # everything it forked go together.
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def _drain_killed(proc, exc) -> tuple:
+    """The output a killed command had already produced.
+
+    On Windows the reader threads hold it until communicate() collects it (the
+    TimeoutExpired fields are empty there); on POSIX the exception already
+    carries it. The drain is bounded: a pipe still held by something the tree
+    kill missed must not hang the harness.
+    """
+    exc_out = getattr(exc, "stdout", None)
+    exc_err = getattr(exc, "stderr", None)
+    if isinstance(getattr(exc, "output", None), tuple):
+        exc_out, exc_err = exc.output
+    try:
+        out, err = proc.communicate(timeout=KILL_DRAIN_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        out, err = None, None  # give up on the pipes rather than wait forever
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+    except (OSError, ValueError):
+        out, err = None, None
+    try:
+        proc.wait(timeout=KILL_DRAIN_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        pass  # already killed: stop caring instead of hanging on it
+    return (out or exc_out or ""), (err or exc_err or "")
+
+
+def _shell_timeout(args: dict) -> tuple:
+    """run_shell's timeout as (seconds, error_message).
+
+    Explicit about a bad value (as fetch_url is) and capped at
+    SHELL_TIMEOUT_CEILING: a tool call that never returns stalls the turn.
+    """
+    raw = args.get("timeout")
+    if raw is None:
+        raw = SHELL_TIMEOUT_DEFAULT
+    try:
+        timeout = int(float(raw))
+    except (TypeError, ValueError):
+        return 0, "error: timeout must be a number of seconds"
+    if timeout < SHELL_TIMEOUT_MIN:
+        return 0, f"error: timeout must be >= {SHELL_TIMEOUT_MIN}"
+    return min(timeout, SHELL_TIMEOUT_CEILING), None
+
+
 def tool_run_shell(args: dict) -> str:
     command = args.get("command", "")
     if not command.strip():
         return "error: empty command"
+    timeout, bad_timeout = _shell_timeout(args)
+    if bad_timeout:
+        return bad_timeout
+    limit = _limit_arg(args, "max_output", SHELL_OUTPUT_LIMIT, TOOL_RESULT_LIMIT)
     argv_prefix, command_prefix = _resolve_shell(SHELL_PREFERRED)
     if argv_prefix is not None:
         # PowerShell -Command maps any non-zero native exit code to 1; append
@@ -529,35 +647,67 @@ def tool_run_shell(args: dict) -> str:
         cmd = command
         shell = True
         encoding = None
+    spawn = {
+        "shell": shell,
+        "cwd": CWD,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": encoding,
+        # A stray non-UTF-8 byte (e.g. a native command writing in the
+        # ANSI code page) must not crash the reader thread and wipe the
+        # whole output; degrade to U+FFFD instead.
+        "errors": "replace",
+    }
+    if os.name != "nt":
+        # Its own process group, so _kill_tree can signal the shell *and*
+        # everything it forked (taskkill /T plays that role on Windows).
+        spawn["start_new_session"] = True
     try:
-        proc = subprocess.run(
-            cmd,
-            shell=shell,
-            cwd=CWD,
-            capture_output=True,
-            text=True,
-            encoding=encoding,
-            # A stray non-UTF-8 byte (e.g. a native command writing in the
-            # ANSI code page) must not crash the reader thread and wipe the
-            # whole output; degrade to U+FFFD instead.
-            errors="replace",
-            timeout=int(args.get("timeout", 120)),
-        )
-        out = []
-        if proc.stdout:
-            out.append(proc.stdout.rstrip())
-        if proc.stderr:
-            out.append(f"[stderr]\n{proc.stderr.rstrip()}")
-        result = "\n".join(out) if out else "(no output)"
-        limit = _limit_arg(args, "max_output", SHELL_OUTPUT_LIMIT, TOOL_RESULT_LIMIT)
-        result = _truncate(
-            result,
-            limit,
-            hint="re-run with a larger max_output, or redirect to a file and read it with read_file",
-        )
-        return f"exit code: {proc.returncode}\n{result}"
-    except subprocess.TimeoutExpired:
-        return f"error: command timed out after {args.get('timeout', 120)}s"
+        # Popen rather than run(timeout=...): run() kills only the direct child
+        # and then drains the pipes with no deadline of its own.
+        proc = subprocess.Popen(cmd, **spawn)
+    except (OSError, ValueError) as e:
+        return f"error: could not run the command: {e}"
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        _kill_tree(proc)
+        stdout, stderr = _drain_killed(proc, e)
+        parts = [
+            f"error: command timed out after {timeout}s — it was killed, "
+            "along with everything it started"
+        ]
+        chunks = []
+        if stdout.strip():
+            chunks.append(stdout.rstrip())
+        if stderr.strip():
+            chunks.append(f"[stderr]\n{stderr.rstrip()}")
+        if chunks:
+            parts.append(
+                "[partial output]\n"
+                + _truncate(
+                    "\n".join(chunks),
+                    limit,
+                    hint=(
+                        "re-run with a larger timeout, or redirect to a file and "
+                        "read it with read_file"
+                    ),
+                )
+            )
+        return "\n".join(parts)
+    out = []
+    if stdout:
+        out.append(stdout.rstrip())
+    if stderr:
+        out.append(f"[stderr]\n{stderr.rstrip()}")
+    result = "\n".join(out) if out else "(no output)"
+    result = _truncate(
+        result,
+        limit,
+        hint="re-run with a larger max_output, or redirect to a file and read it with read_file",
+    )
+    return f"exit code: {proc.returncode}\n{result}"
 
 
 def tool_mkdir(args: dict) -> str:
@@ -1360,7 +1510,11 @@ TOOLS = {
                         },
                         "timeout": {
                             "type": "integer",
-                            "description": "Timeout in seconds (default 120)",
+                            "description": (
+                                f"Timeout in seconds (default {SHELL_TIMEOUT_DEFAULT}, max "
+                                f"{SHELL_TIMEOUT_CEILING}); on expiry the command and everything "
+                                "it started are killed and whatever it printed so far is returned"
+                            ),
                         },
                         "max_output": {
                             "type": "integer",

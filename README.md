@@ -98,6 +98,10 @@ in the working directory (case-insensitive) is auto-loaded and appended to the s
 `grep` and `glob` match with **exact case** by default — pass `case_sensitive: false` to ignore
 case (`grep` applies it to both the search pattern and `file_pattern`).
 
+`run_shell` waits for the command **and everything it started**. At `timeout` (default 120s,
+max 3600s) the whole process tree is killed and whatever it printed so far is returned as
+`[partial output]` — no orphaned test runners, no drain that never finishes.
+
 ## Building standalone executables
 
 `build.py` compiles `harnless.py` into a self-contained binary with [Nuitka](https://nuitka.net).
