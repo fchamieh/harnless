@@ -177,6 +177,16 @@ class TestCwdPathHelpers(unittest.TestCase):
         self.assertTrue(regex.match("src/main.py"))
         self.assertFalse(regex.match("src/other.py"))
 
+    def test_glob_to_regex_is_case_sensitive_by_default(self):
+        self.assertIsNone(h._glob_to_regex("**/*.PY").match("src/main.py"))
+        self.assertIsNone(h._glob_to_regex(r"src/(main|util)\.PY").match("src/main.py"))
+
+    def test_glob_to_regex_case_insensitive(self):
+        self.assertTrue(h._glob_to_regex("**/*.py", case_sensitive=False).match("src/MAIN.PY"))
+        self.assertTrue(
+            h._glob_to_regex(r"src/(main|util)\.py", case_sensitive=False).match("src/MAIN.py")
+        )
+
 
 class TestReadFile(Base):
     def setUp(self):
@@ -373,9 +383,35 @@ class TestGrep(Base):
         self.w("st/g1.txt", "nothing here\n")
         self.assertEqual(self.grep("AAA"), "no matches")
 
-    def test_case_insensitive(self):
+    def test_case_sensitive_by_default(self):
+        self.w("st/g1.txt", "AAA\naaa\nAAA again\n")
+        self.assertEqual(self.grep("AAA"),
+                         "_test_tmp/st/g1.txt:1: AAA\n_test_tmp/st/g1.txt:3: AAA again")
+        self.assertEqual(self.grep("aaa"), "_test_tmp/st/g1.txt:2: aaa")
+
+    def test_case_insensitive_opt_in(self):
+        self.w("st/g1.txt", "AAA\naaa\n")
+        self.assertEqual(self.grep("aaa", case_sensitive=False),
+                         "_test_tmp/st/g1.txt:1: AAA\n_test_tmp/st/g1.txt:2: aaa")
+
+    def test_case_insensitive_via_inline_flag(self):
+        self.w("st/g1.txt", "AAA\naaa\n")
+        self.assertEqual(self.grep("(?i)aaa"),
+                         "_test_tmp/st/g1.txt:1: AAA\n_test_tmp/st/g1.txt:2: aaa")
+
+    def test_case_knob_accepts_model_strings(self):
+        self.w("st/g1.txt", "Foo\nfoo\n")
+        self.assertEqual(self.grep("Foo", case_sensitive="false"),
+                         "_test_tmp/st/g1.txt:1: Foo\n_test_tmp/st/g1.txt:2: foo")
+        self.assertEqual(self.grep("Foo", case_sensitive="1"), "_test_tmp/st/g1.txt:1: Foo")
+        # an unrecognisable value falls back to the case-sensitive default
+        self.assertEqual(self.grep("Foo", case_sensitive="maybe"), "_test_tmp/st/g1.txt:1: Foo")
+
+    def test_file_pattern_follows_case_knob(self):
         self.w("st/g1.txt", "AAA\n")
-        self.assertEqual(self.grep("aaa"), "_test_tmp/st/g1.txt:1: AAA")
+        self.assertEqual(self.grep("AAA", file_pattern="*.TXT"), "no matches")
+        self.assertEqual(self.grep("AAA", file_pattern="*.TXT", case_sensitive=False),
+                         "_test_tmp/st/g1.txt:1: AAA")
 
     def test_context(self):
         self.w("st/g1.txt", "l1\nAAA mid\nl3\nl9\nl10\nAAA end\n")
@@ -476,6 +512,22 @@ class TestGlob(Base):
     def test_no_match(self):
         self.w("a.txt", "x")
         self.assertEqual(self.glob("*.py"), "no files matched")
+
+    def test_case_sensitive_by_default(self):
+        self.w("a.txt", "x")
+        self.assertEqual(self.glob("*.TXT"), "no files matched")
+        self.assertEqual(self.glob("*.txt"), "_test_tmp/a.txt")
+
+    def test_case_insensitive_opt_in(self):
+        self.w("a.txt", "x")
+        self.assertEqual(self.glob("*.TXT", case_sensitive=False), "_test_tmp/a.txt")
+        self.assertEqual(self.glob("**/*.TXT", case_sensitive="no"), "_test_tmp/a.txt")
+
+    def test_regex_pattern_follows_case_knob(self):
+        self.w("src/Main.py", "x")
+        self.assertEqual(self.glob(r"src/(main|util)\.py"), "no files matched")
+        self.assertEqual(self.glob(r"src/(main|util)\.py", case_sensitive=False),
+                         "_test_tmp/src/Main.py")
 
     def test_pycache_skipped(self):
         os.makedirs(os.path.join(self.tmp, "__pycache__"), exist_ok=True)
@@ -816,6 +868,20 @@ class TestOutputCaps(unittest.TestCase):
         self.assertEqual(h._limit_arg({"limit": "abc"}, "limit", 200, 5000), 200)
         self.assertEqual(h._limit_arg({"limit": None}, "limit", 200, 5000), 200)
 
+    def test_bool_arg_default_and_strings(self):
+        self.assertEqual(h._bool_arg({}, "case_sensitive", True), True)
+        self.assertEqual(h._bool_arg({"case_sensitive": False}, "case_sensitive", True), False)
+        self.assertEqual(h._bool_arg({"case_sensitive": True}, "case_sensitive", False), True)
+        for truthy in ("true", "True", "yes", "Y", "on", "1", " t "):
+            self.assertEqual(h._bool_arg({"case_sensitive": truthy}, "case_sensitive", False),
+                             True, truthy)
+        for falsy in ("false", "NO", "n", "off", "0", "", " f"):
+            self.assertEqual(h._bool_arg({"case_sensitive": falsy}, "case_sensitive", True),
+                             False, falsy)
+        # a value that means nothing falls back to the default
+        self.assertEqual(h._bool_arg({"case_sensitive": "sort of"}, "case_sensitive", True), True)
+        self.assertEqual(h._bool_arg({"case_sensitive": None}, "case_sensitive", True), True)
+
     def test_truncate_helper(self):
         out = h._truncate("z" * 100, 50, hint="narrow it")
         self.assertTrue(out.startswith("z" * 50))
@@ -877,6 +943,16 @@ class TestOutputCaps(unittest.TestCase):
         for name, arg in expected.items():
             props = h.TOOLS[name][0]["function"]["parameters"]["properties"]
             self.assertIn(arg, props, f"{name} schema should expose {arg}")
+
+    def test_case_knobs_are_exposed_in_schemas(self):
+        for name in ("grep", "glob"):
+            props = h.TOOLS[name][0]["function"]["parameters"]["properties"]
+            self.assertIn("case_sensitive", props, f"{name} schema should expose case_sensitive")
+            knob = props["case_sensitive"]
+            self.assertEqual(knob["type"], "boolean")
+            self.assertIn("default true", knob["description"])
+        self.assertNotIn("case_sensitive",
+                         h.TOOLS["list_dir"][0]["function"]["parameters"]["properties"])
 
     def test_cap_constants_are_ordered(self):
         # The backstop must sit above every per-tool cap, otherwise a tool that

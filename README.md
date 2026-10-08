@@ -95,6 +95,9 @@ Built-in tools: `get_cwd`, `run_shell`, `mkdir`, `read_file`, `write_file`, `pat
 All file paths are relative to the working directory and sandboxed to it. An `AGENTS.md`
 in the working directory (case-insensitive) is auto-loaded and appended to the system prompt.
 
+`grep` and `glob` match with **exact case** by default — pass `case_sensitive: false` to ignore
+case (`grep` applies it to both the search pattern and `file_pattern`).
+
 ## Building standalone executables
 
 `build.py` compiles `harnless.py` into a self-contained binary with [Nuitka](https://nuitka.net).

@@ -21,7 +21,7 @@ import urllib.error
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-VERSION = "1.4.5"
+VERSION = "1.5.0"
 API_URL = "http://127.0.0.1:11434/v1/chat/completions"
 API_KEY = None
 MODEL = "local-model"
@@ -277,19 +277,46 @@ def safe_resolve(rel_path: str) -> str:
     return full
 
 
-def _glob_to_regex(pattern: str):
+def _bool_arg(args: dict, key: str, default: bool) -> bool:
+    """Read a boolean-style tool argument, tolerating what models often send.
+
+    A model frequently sends "true"/"yes"/"1" instead of a JSON true, so those
+    strings are accepted; a missing or unrecognisable value falls back to
+    `default`.
+    """
+    raw = args.get(key)
+    if raw is None:
+        return default
+    if isinstance(raw, str):
+        text = raw.strip().lower()
+        if text in ("true", "t", "yes", "y", "on", "1"):
+            return True
+        if text in ("false", "f", "no", "n", "off", "0", ""):
+            return False
+        return default
+    return bool(raw)
+
+
+def _case_flags(case_sensitive: bool) -> int:
+    """re flags for a search knob: exact case by default, IGNORECASE when opted out."""
+    return 0 if case_sensitive else re.IGNORECASE
+
+
+def _glob_to_regex(pattern: str, case_sensitive: bool = True):
     """Compile a glob pattern (or a raw regex) for matching CWD-relative paths.
 
     `**/` matches zero or more directories, so `**/*.py` also matches files sitting
     directly in the searched directory; plain `*`/`?` match across path separators
     because patterns are matched against the whole relative path. A pattern
-    containing regex metacharacters is used as a regex.
+    containing regex metacharacters is used as a regex. Matching is case-sensitive
+    unless `case_sensitive` is False.
     """
+    flags = _case_flags(case_sensitive)
     if any(c in pattern for c in "[](){}|\\^$"):
-        return re.compile(pattern)
+        return re.compile(pattern, flags)
     translated = pattern.replace("**/", "\x00")  # placeholder, so it isn't re-translated
     translated = translated.replace("?", ".").replace("*", ".*")
-    return re.compile("^" + translated.replace("\x00", "(?:.*/)?") + "$")
+    return re.compile("^" + translated.replace("\x00", "(?:.*/)?") + "$", flags)
 
 
 # ---------------------------------------------------------------- output caps
@@ -598,11 +625,14 @@ def tool_grep(args: dict) -> str:
     root = safe_resolve(args["path"])
     if not os.path.exists(root):
         return f"error: path not found: {args['path']}"
-    pattern = re.compile(args["pattern"], re.IGNORECASE)
+    case_sensitive = _bool_arg(args, "case_sensitive", True)
+    pattern = re.compile(args["pattern"], _case_flags(case_sensitive))
     context = max(0, int(args.get("context", 0)))
     limit = _limit_arg(args, "limit", GREP_MATCH_LIMIT, MAX_COUNT_LIMIT)
     file_pattern = args.get("file_pattern")
-    file_re = _glob_to_regex(file_pattern) if file_pattern else None
+    file_re = (
+        _glob_to_regex(file_pattern, case_sensitive) if file_pattern else None
+    )
     matches = []
     used = 0
     roots = _cwd_roots()
@@ -713,7 +743,8 @@ def tool_glob(args: dict) -> str:
     if not os.path.exists(root):
         return f"error: path not found: {args['path']}"
     pattern = args["pattern"]
-    regex = _glob_to_regex(pattern)
+    case_sensitive = _bool_arg(args, "case_sensitive", True)
+    regex = _glob_to_regex(pattern, case_sensitive)
     results = []
     roots = _cwd_roots()
     for fp in _iter_files(root):
@@ -1370,7 +1401,7 @@ TOOLS = {
             "type": "function",
             "function": {
                 "name": "grep",
-                "description": "Search file contents with a regex pattern. path may be a directory (searched recursively) or a single file.",
+                "description": "Search file contents with a regex pattern (case-sensitive by default; case_sensitive=false ignores case). path may be a directory (searched recursively) or a single file.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1380,7 +1411,14 @@ TOOLS = {
                         },
                         "pattern": {
                             "type": "string",
-                            "description": "Regex pattern to search",
+                            "description": "Regex pattern to search (exact case unless case_sensitive is false; an inline (?i) also works)",
+                        },
+                        "case_sensitive": {
+                            "type": "boolean",
+                            "description": (
+                                "Match pattern (and file_pattern) with exact case (default true); "
+                                "set false to ignore case"
+                            ),
                         },
                         "context": {
                             "type": "integer",
@@ -1388,7 +1426,7 @@ TOOLS = {
                         },
                         "file_pattern": {
                             "type": "string",
-                            "description": "Optional glob (e.g. *.py) or regex matched against relative file paths to restrict files scanned",
+                            "description": "Optional glob (e.g. *.py) or regex matched against relative file paths to restrict files scanned (obeys case_sensitive)",
                         },
                         "limit": {
                             "type": "integer",
@@ -1449,7 +1487,7 @@ TOOLS = {
             "type": "function",
             "function": {
                 "name": "glob",
-                "description": "Find files by glob pattern (e.g. **/*.py) or regex. path may be a directory (searched recursively) or a single file.",
+                "description": "Find files by glob pattern (e.g. **/*.py) or regex, matched against relative file paths with exact case by default (case_sensitive=false ignores case). path may be a directory (searched recursively) or a single file.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1460,6 +1498,13 @@ TOOLS = {
                         "pattern": {
                             "type": "string",
                             "description": "Glob pattern (e.g. **/*.ts) or regex matched against relative file paths",
+                        },
+                        "case_sensitive": {
+                            "type": "boolean",
+                            "description": (
+                                "Match pattern with exact case (default true); "
+                                "set false to match paths ignoring case"
+                            ),
                         },
                         "limit": {
                             "type": "integer",
