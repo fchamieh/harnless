@@ -14,7 +14,7 @@ Pure Python standard library — **no dependencies, no venv, no build step**.
 - **File & shell tools** — read/write/patch/search files and run shell commands (PowerShell on Windows, bash on POSIX)
 - **Sub-agents** — the `task` tool delegates self-contained work to a nested agent (configurable depth)
 - **State tools** — `todo` (task list) and `memory` (persistent notes) survive across turns
-- **Streaming** — token-by-token output with Markdown rendering; press `ESC` twice to interrupt a running generation
+- **Streaming** — token-by-token output with Markdown rendering; press `ESC` twice to interrupt a running generation (it stops sub-agents and their parents too)
 - **MCP support** — plug in external tools via [Model Context Protocol](https://modelcontextprotocol.io) servers (stdio or HTTP)
 - **Standalone binaries** — build a self-contained executable for Windows, Linux, or macOS with Nuitka
 
@@ -69,7 +69,8 @@ Other REPL behaviors:
 | `--model NAME` | Model name sent in the request |
 | `--system-prompt TEXT` | Replace the built-in system prompt |
 | `--temperature N` | Sampling temperature (default `1.0`) |
-| `--max-subagents N` | Max sub-agent nesting depth for the `task` tool (default `2`) |
+| `--max-subagents N` | Max sub-agent nesting depth for the `task` tool (default `2`; `0` disables sub-agents, max `10`) |
+| `--max-subagent-steps N` | Model turns a single sub-agent may take before its run is stopped (default `40`; `0` = unlimited; top-level agents are never capped) |
 | `--shell MODE` | Windows shell for `run_shell`: `auto` / `pwsh` / `powershell` / `cmd` (default `auto`, ignored off-Windows) |
 | `--context-window N` | Context window size in tokens (shown in `/status`); probed from the API's `/models` endpoint if omitted |
 | `--version` | Print the version and exit |

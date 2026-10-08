@@ -21,12 +21,21 @@ import urllib.error
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-VERSION = "1.4.4"
+VERSION = "1.4.5"
 API_URL = "http://127.0.0.1:11434/v1/chat/completions"
 API_KEY = None
 MODEL = "local-model"
 TEMPERATURE = 1.0
 MAX_SUBAGENT_DEPTH = 2
+SUBAGENT_DEPTH_CEILING = 10  # sanity clamp for --max-subagents
+# Runaway guard: how many model turns (API calls) a single sub-agent may take
+# before its run is stopped; 0 disables the guard. Only sub-agents are capped —
+# a top-level agent is steered by the user, who can always double-ESC it.
+SUBAGENT_STEP_LIMIT = 40
+SUBAGENT_STEPS_CEILING = 1_000  # sanity clamp for --max-subagent-steps
+SUBAGENT_STEP_LIMIT_CODE = 4  # exit code reported to the parent when the guard fires
+# Current sub-agent nesting level: depth 0 = top-level agent. Scoped to each
+# run_agent call (set on entry, restored on exit — see run_agent).
 _AGENT_DEPTH = 0
 OUTPUT_INDENT = ""
 CWD = os.getcwd()
@@ -301,6 +310,15 @@ def _limit_arg(args: dict, key: str, default: int, ceiling: int) -> int:
     except (TypeError, ValueError):
         return default
     return max(1, min(value, ceiling))
+
+
+def _clamp_int(value: int, low: int, high: int) -> int:
+    """Clamp a CLI-supplied integer into [low, high].
+
+    Guards the harness-side knobs (`--max-subagents`, `--max-subagent-steps`)
+    so a nonsensical value can't produce a negative limit or an unbounded loop.
+    """
+    return max(low, min(value, high))
 
 
 def _cap_note(stat: str, hint: str) -> str:
@@ -874,6 +892,12 @@ SUBAGENT_NOTE = (
     "If the task cannot be completed, explain why in your final message and call the exit tool "
     "with a non-zero code."
 )
+# Result a delegating agent gets when its sub-agent was interrupted. The note
+# is carried further up the delegation chain as-is instead of being re-wrapped
+# at every level.
+SUBAGENT_INTERRUPT_PREFIX = (
+    "(sub-agent interrupted by the user; the output below is partial)"
+)
 
 
 def tool_task(args: dict) -> str:
@@ -886,8 +910,9 @@ def tool_task(args: dict) -> str:
         return "error: empty task"
     if _AGENT_DEPTH >= MAX_SUBAGENT_DEPTH:
         return (
-            f"error: sub-agent depth limit reached ({MAX_SUBAGENT_DEPTH}); "
-            "do the work yourself"
+            "error: sub-agent depth limit reached — nesting is capped at "
+            f"{MAX_SUBAGENT_DEPTH} level(s) and this call would be level "
+            f"{_AGENT_DEPTH + 1}; do the work yourself"
         )
     system = get_system_prompt(CWD, SUBAGENT_NOTE)
     agents_md = load_agents_md()
@@ -909,15 +934,29 @@ def tool_task(args: dict) -> str:
     conv_id = _NEXT_CONV_ID
     _NEXT_CONV_ID += 1
     OUTPUT_INDENT = old_indent + "  "
+    interrupted = False
+    interrupt_note = ""
+    step_limited = False
     try:
-        code = run_agent(
-            messages,
-            MODEL,
-            interactive=False,
-            temperature=TEMPERATURE,
-            depth=_AGENT_DEPTH + 1,
-            conv_id=conv_id,
-        )
+        try:
+            code = run_agent(
+                messages,
+                MODEL,
+                interactive=False,
+                temperature=TEMPERATURE,
+                depth=_AGENT_DEPTH + 1,
+                conv_id=conv_id,
+            )
+        except StreamInterrupted as e:
+            # The user interrupted the sub-agent (or something it delegated).
+            # Keep whatever it managed to say, then bubble the stop up: a
+            # double ESC means "stop", not "carry on with half the work".
+            interrupted = True
+            interrupt_note = ((e.message or {}).get("content") or "").strip()
+            code = 0
+        except SubagentStepLimit:
+            step_limited = True
+            code = SUBAGENT_STEP_LIMIT_CODE
     finally:
         OUTPUT_INDENT = old_indent
         TODO_LAST_INJECTED = old_todo_state
@@ -929,14 +968,29 @@ def tool_task(args: dict) -> str:
         if m.get("role") == "assistant" and (m.get("content") or "").strip():
             final = m["content"].strip()
             break
+    if interrupt_note:
+        final = interrupt_note
+    if step_limited:
+        final = (
+            final
+            + "\n\n(sub-agent stopped: it reached its step limit of "
+            f"{SUBAGENT_STEP_LIMIT} model turns; this summary may be incomplete)"
+        ).strip()
     if final:
         final = _truncate(
             final,
             SUBAGENT_SUMMARY_LIMIT,
             hint="delegate a narrower task, or ask the sub-agent for a shorter summary",
         )
-        return f"exit code: {code}\n{final}"
-    return f"exit code: {code}"
+    if interrupted:
+        if final.startswith(SUBAGENT_INTERRUPT_PREFIX):
+            body = final[len(SUBAGENT_INTERRUPT_PREFIX):]  # wrapped already, deeper up
+        else:
+            body = f"\n{final}" if final else ""
+        raise SubagentInterrupted(
+            {"role": "assistant", "content": SUBAGENT_INTERRUPT_PREFIX + body}
+        )
+    return f"exit code: {code}\n{final}" if final else f"exit code: {code}"
 
 
 # ---------------------------------------------------------------- state tools
@@ -2742,6 +2796,26 @@ class StreamInterrupted(Exception):
         self.message = message  # the partial assistant message
 
 
+class SubagentInterrupted(StreamInterrupted):
+    """A `task` tool call was interrupted, so the stop must bubble up.
+
+    Raised by `tool_task` when the user interrupts a sub-agent: every agent in
+    the delegation chain stops too, instead of the parent carrying on with the
+    half-finished sub-agent as if it had succeeded. `message["content"]` carries
+    the note (and any partial output) the delegating agent gets as the tool
+    result.
+    """
+
+
+class SubagentStepLimit(Exception):
+    """A sub-agent used up its allowed model turns (`SUBAGENT_STEP_LIMIT`).
+
+    A signal rather than a return code: an exit code would be indistinguishable
+    from a code the sub-agent's own `exit` call chose. Only `tool_task` ever
+    sees it — sub-agents are the only capped runs.
+    """
+
+
 def _response_socket(resp):
     """Best-effort: the underlying socket of a urllib response (for shutdown).
 
@@ -3999,7 +4073,9 @@ def execute_tool(name: str, raw_args: str) -> str:
     else:
         try:
             result = str(fn(args))
-        except ExitSignal:
+        except (ExitSignal, StreamInterrupted):
+            # Control-flow, not a tool failure: `exit` ends the agent's loop,
+            # an interrupt ends the whole delegation chain.
             raise
         except Exception as e:
             return f"error: {type(e).__name__}: {e}"
@@ -4464,9 +4540,51 @@ def run_agent(
     depth: int = 0,
     conv_id: int = None,
 ) -> int:
+    """Run the agent loop; returns the exit code of the model's `exit` call.
+
+    `_AGENT_DEPTH` is scoped to this call: it is set to `depth` for the
+    duration of the run (0 = top-level agent, 1 = sub-agent, 2 = a sub-agent
+    of a sub-agent) and restored on the way out — on a return *or* an
+    exception. Leaving it behind lets depth ratchet up inside a single turn:
+    after one run nested to level 2, the delegating agent — and every later
+    `task` call in the same turn, top-level ones included — would still be
+    sitting at level 2 and wrongly told the nesting limit was reached.
+    """
     global _AGENT_DEPTH
-    _AGENT_DEPTH = depth
+    previous_depth = _AGENT_DEPTH
+    _AGENT_DEPTH = max(0, depth)
+    try:
+        return _agent_loop(messages, model, interactive, temperature, conv_id)
+    finally:
+        _AGENT_DEPTH = previous_depth
+
+
+def _agent_loop(
+    messages: list,
+    model: str,
+    interactive: bool = False,
+    temperature: float = 1.0,
+    conv_id: int = None,
+) -> int:
+    """The agent loop: stream a turn, run its tool calls, repeat until the
+    model answers without tool calls, calls `exit`, or is interrupted."""
+    # A sub-agent must not loop forever: uncapped, a model that keeps calling
+    # tools burns its context (and the summary it hands back) unattended. A
+    # top-level agent is user-steered and double-ESC-able, so it stays uncapped.
+    is_subagent = _AGENT_DEPTH > 0
+    steps = 0
     while True:
+        if is_subagent and SUBAGENT_STEP_LIMIT and steps >= SUBAGENT_STEP_LIMIT:
+            print(
+                OUTPUT_INDENT
+                + colorize(
+                    f"{icon('exit')} sub-agent stopped: step limit "
+                    f"({SUBAGENT_STEP_LIMIT}) reached",
+                    "error",
+                )
+            )
+            raise SubagentStepLimit(f"sub-agent exceeded {SUBAGENT_STEP_LIMIT} model turns")
+        steps += 1
         message = None
         streamed = False
         try:
@@ -4490,6 +4608,11 @@ def run_agent(
             message.pop("tool_calls", None)
             if message.get("content"):
                 messages.append(message)
+            if is_subagent:
+                # Hand the stop to whoever delegated us: tool_task turns it
+                # into a stopped-sub-agent result and re-raises, so the whole
+                # chain halts instead of resuming with half the work done.
+                raise
             return 0
         except (urllib.error.URLError, ConnectionError, OSError) as e:
             print(
@@ -4534,7 +4657,7 @@ def run_agent(
 
         if message.get("content") and not streamed:
             print_assistant(message["content"])
-        for tc in tool_calls:
+        for index, tc in enumerate(tool_calls):
             name = tc["function"]["name"]
             raw_args = tc["function"].get("arguments", "")
             arg_preview = raw_args[:200]
@@ -4550,6 +4673,27 @@ def run_agent(
                         OUTPUT_INDENT + colorize(f"{icon('exit')} {e.message}", "tool")
                     )
                 return e.code
+            except StreamInterrupted as e:
+                # A tool (the task tool) was interrupted. Answer this call and
+                # every remaining one in the batch — a server rejects an
+                # assistant message whose tool calls were never answered — then
+                # stop this agent's turn, or propagate the stop up to whoever
+                # delegated us (tool_task re-raises it).
+                note = ((e.message or {}).get("content") or "").strip()
+                if not note:
+                    note = "interrupted by user"
+                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": note})
+                for pending in tool_calls[index + 1:]:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": pending["id"],
+                            "content": "interrupted by user",
+                        }
+                    )
+                if is_subagent:
+                    raise
+                return 0
             print(
                 OUTPUT_INDENT
                 + colorize(
@@ -4569,7 +4713,7 @@ def run_agent(
 
 def main():
     global API_URL, API_KEY, MODEL, TEMPERATURE, MAX_SUBAGENT_DEPTH, VISION_ENABLED
-    global INTERRUPT_ENABLED, SHELL_PREFERRED
+    global INTERRUPT_ENABLED, SHELL_PREFERRED, SUBAGENT_STEP_LIMIT
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[reportAttributeAccessIssue]
@@ -4624,7 +4768,15 @@ def main():
         "--max-subagents",
         type=int,
         default=2,
-        help="maximum sub-agent nesting depth for the task tool (default: 2)",
+        help="maximum sub-agent nesting depth for the task tool (default: 2; "
+        f"0 disables sub-agents, max {SUBAGENT_DEPTH_CEILING})",
+    )
+    parser.add_argument(
+        "--max-subagent-steps",
+        type=int,
+        default=40,
+        help="model turns a single sub-agent may take before its run is "
+        "stopped (default: 40; 0 = unlimited; top-level agents are never capped)",
     )
     parser.add_argument(
         "--context-window",
@@ -4683,7 +4835,8 @@ def main():
     API_KEY = args.api_key
     MODEL = args.model
     TEMPERATURE = args.temperature
-    MAX_SUBAGENT_DEPTH = args.max_subagents
+    MAX_SUBAGENT_DEPTH = _clamp_int(args.max_subagents, 0, SUBAGENT_DEPTH_CEILING)
+    SUBAGENT_STEP_LIMIT = _clamp_int(args.max_subagent_steps, 0, SUBAGENT_STEPS_CEILING)
     VISION_ENABLED = not args.no_vision
     SHELL_PREFERRED = args.shell
 

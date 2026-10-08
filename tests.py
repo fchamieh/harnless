@@ -1343,20 +1343,74 @@ class TestSubagents(unittest.TestCase):
         self._old_temp = h.TEMPERATURE
         self._old_usage = dict(h.USAGE_BY_CONV)
         self._old_next_conv = h._NEXT_CONV_ID
+        self._old_steps = h.SUBAGENT_STEP_LIMIT
+        self._old_chat = h.chat
         h._AGENT_DEPTH = 0
         h.MAX_SUBAGENT_DEPTH = 3
         h.OUTPUT_INDENT = ""
         h.MODEL = "test-model"
         h.TEMPERATURE = 0.2
+        h.SUBAGENT_STEP_LIMIT = 0  # guard off unless a test asks for it
         h.USAGE_BY_CONV.clear()
+
+        def no_live_api(*args, **kwargs):
+            raise AssertionError("tests must not reach a live LLM server")
+
+        h.chat = no_live_api  # a non-streaming fallback would hit the real API
         self.addCleanup(setattr, h, "_AGENT_DEPTH", self._old_depth)
         self.addCleanup(setattr, h, "MAX_SUBAGENT_DEPTH", self._old_max)
         self.addCleanup(setattr, h, "OUTPUT_INDENT", self._old_indent)
         self.addCleanup(setattr, h, "MODEL", self._old_model)
         self.addCleanup(setattr, h, "TEMPERATURE", self._old_temp)
+        self.addCleanup(setattr, h, "SUBAGENT_STEP_LIMIT", self._old_steps)
+        self.addCleanup(setattr, h, "chat", self._old_chat)
         self.addCleanup(h.USAGE_BY_CONV.clear)
         self.addCleanup(h.USAGE_BY_CONV.update, self._old_usage)
         self.addCleanup(setattr, h, "_NEXT_CONV_ID", self._old_next_conv)
+
+    def _call(self, name, args, call_id=None):
+        return {
+            "id": call_id or f"call-{name}",
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args)},
+        }
+
+    def _tool_turn(self, name, args, call_id=None):
+        """An assistant turn that asks for exactly one tool call."""
+        return {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [self._call(name, args, call_id)],
+        }
+
+    def _scripted(self, decide):
+        """Install a scripted stream_once; decide(messages, depth, turn) -> (msg, streamed).
+
+        Drives the *real* run_agent/_agent_loop, so depth scoping and the
+        sub-agent plumbing are exercised for real. `turn` counts model turns
+        per nesting level. Never returns streamed=False: that would make
+        run_agent fall back to chat(), which these tests must not reach.
+        """
+        seen = {}
+        calls = []
+
+        def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
+            depth = h._AGENT_DEPTH
+            calls.append(depth)
+            turn = seen.get(depth, 0)
+            seen[depth] = turn + 1
+            return decide(messages, depth, turn)
+
+        old = h.stream_once
+        h.stream_once = fake_stream_once
+        self.addCleanup(setattr, h, "stream_once", old)
+        messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "go"}]
+        return messages, calls
+
+    def _fake_run_agent(self, behavior):
+        old = h.run_agent
+        h.run_agent = behavior
+        self.addCleanup(setattr, h, "run_agent", old)
 
     def test_task_registered_in_both_tool_lists(self):
         all_names = [s["function"]["name"] for s in h.OPENAI_TOOLS]
@@ -1464,6 +1518,305 @@ class TestSubagents(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             h.tool_task({"task": "do X"})
         self.assertEqual(h.USAGE_BY_CONV, {})
+
+    # --- depth accounting: _AGENT_DEPTH is scoped to each run_agent call ---
+
+    def test_task_depth_limit_message_names_the_cap(self):
+        h.MAX_SUBAGENT_DEPTH = 2
+        h._AGENT_DEPTH = 2
+        out = h.tool_task({"task": "do something"})
+        self.assertTrue(out.startswith("error: sub-agent depth limit reached"))
+        self.assertIn("capped at 2 level", out)
+        self.assertIn("level 3", out)  # what the refused call's depth would have been
+
+    def test_nested_task_calls_do_not_strand_later_top_level_calls(self):
+        """Regression: run_agent used to leave _AGENT_DEPTH at the depth its
+        sub-agents reached, so a later top-level task call in the same turn was
+        refused with 'sub-agent depth limit reached' even at depth 0."""
+        h.MAX_SUBAGENT_DEPTH = 2
+
+        def decide(messages, depth, turn):
+            if depth == 0:
+                if turn < 2:
+                    return (self._tool_turn("task", {"task": f"top {turn}"}), True)
+                return ({"role": "assistant", "content": "parent done"}, True)
+            if turn == 0:
+                return (self._tool_turn("task", {"task": "deeper"}), True)  # nests to level 2
+            return ({"role": "assistant", "content": f"sub summary at depth {depth}"}, True)
+
+        messages, calls = self._scripted(decide)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = h.run_agent(messages, "m")
+        self.assertEqual(code, 0)
+        results = [m["content"] for m in messages if m["role"] == "tool"]
+        self.assertEqual(len(results), 2)  # both top-level delegations ran
+        for result in results:
+            self.assertTrue(result.startswith("exit code: 0\nsub summary at depth 1"), result)
+        self.assertNotIn("depth limit", "".join(results))
+        self.assertEqual(h._AGENT_DEPTH, 0)
+
+    def test_run_agent_depth_seen_by_nested_runs_is_incremented(self):
+        h.MAX_SUBAGENT_DEPTH = 3
+        depths = []
+
+        def decide(messages, depth, turn):
+            depths.append(depth)
+            if depth == 0 and turn == 0:
+                return (self._tool_turn("task", {"task": "deeper"}), True)
+            return ({"role": "assistant", "content": f"summary at depth {depth}"}, True)
+
+        messages, _ = self._scripted(decide)
+        with contextlib.redirect_stdout(io.StringIO()):
+            h.run_agent(messages, "m")
+        # 0: the parent's first turn, 1: the sub-agent's, 0: the parent's turn
+        # after the sub-agent returned — the parent is back at level 0.
+        self.assertEqual(depths, [0, 1, 0])
+        self.assertEqual(h._AGENT_DEPTH, 0)
+
+    def test_run_agent_restores_depth_after_exit_tool(self):
+        depths = []
+
+        def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
+            depths.append(h._AGENT_DEPTH)
+            return (
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [self._call("exit", {"code": 7, "message": "done"}, "c1")],
+                },
+                True,
+            )
+
+        old = h.stream_once
+        h.stream_once = fake_stream_once
+        self.addCleanup(setattr, h, "stream_once", old)
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = h.run_agent([{"role": "user", "content": "go"}], "m", depth=2)
+        self.assertEqual(code, 7)
+        self.assertEqual(depths, [2])
+        self.assertEqual(h._AGENT_DEPTH, 0)
+
+    def test_run_agent_restores_depth_on_exception(self):
+        def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
+            raise RuntimeError("sub-agent exploded")
+
+        old = h.stream_once
+        h.stream_once = fake_stream_once
+        self.addCleanup(setattr, h, "stream_once", old)
+        with self.assertRaises(RuntimeError):
+            with contextlib.redirect_stdout(io.StringIO()):
+                h.run_agent([{"role": "user", "content": "go"}], "m", depth=1)
+        self.assertEqual(h._AGENT_DEPTH, 0)
+
+    def test_task_failure_does_not_corrupt_parent_depth(self):
+        h.MAX_SUBAGENT_DEPTH = 2
+
+        def decide(messages, depth, turn):
+            if depth == 0:
+                if turn == 0:
+                    return (self._tool_turn("task", {"task": "x"}), True)
+                return ({"role": "assistant", "content": "recovered"}, True)
+            raise RuntimeError("sub-agent exploded")
+
+        messages, calls = self._scripted(decide)
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = h.run_agent(messages, "m")
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [0, 1, 0])
+        results = [m["content"] for m in messages if m["role"] == "tool"]
+        self.assertEqual(results, ["error: RuntimeError: sub-agent exploded"])
+        self.assertEqual(h._AGENT_DEPTH, 0)
+
+    # --- a double ESC during a sub-agent stops the whole delegation chain ---
+
+    def test_task_bubbles_up_subagent_interrupt(self):
+        def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None):
+            raise h.StreamInterrupted(
+                {
+                    "role": "assistant",
+                    "content": "half an answer",
+                    "tool_calls": [self._call("read_file", {"path": "a"})],
+                }
+            )
+
+        self._fake_run_agent(fake_run_agent)
+        with self.assertRaises(h.SubagentInterrupted) as cm:
+            h.tool_task({"task": "do X"})
+        content = cm.exception.message["content"]
+        self.assertIn(h.SUBAGENT_INTERRUPT_PREFIX, content)
+        self.assertIn("half an answer", content)
+        self.assertEqual(h.OUTPUT_INDENT, "")
+        self.assertEqual(h._AGENT_DEPTH, 0)
+        self.assertEqual(h.USAGE_BY_CONV, {})
+
+    def test_execute_tool_does_not_swallow_subagent_interrupt(self):
+        def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None):
+            raise h.StreamInterrupted({"role": "assistant", "content": "partial"})
+
+        self._fake_run_agent(fake_run_agent)
+        with self.assertRaises(h.SubagentInterrupted):
+            h.execute_tool("task", json.dumps({"task": "do X"}))
+
+    def test_interrupt_stops_the_whole_turn(self):
+        h.MAX_SUBAGENT_DEPTH = 2
+
+        def decide(messages, depth, turn):
+            if depth == 0:
+                return (
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            self._call("task", {"task": "delegate"}, "call-task"),
+                            self._call("todo", {"action": "list"}, "call-todo"),
+                        ],
+                    },
+                    True,
+                )
+            raise h.StreamInterrupted({"role": "assistant", "content": "half the work"})
+
+        messages, calls = self._scripted(decide)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = h.run_agent(messages, "m")
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [0, 1])  # the parent does not ask the LLM again
+        answered = {m["tool_call_id"]: m["content"] for m in messages if m["role"] == "tool"}
+        # Every tool call in the batch is answered: a server rejects an
+        # assistant message whose tool_calls were left dangling.
+        self.assertEqual(sorted(answered), ["call-task", "call-todo"])
+        self.assertIn(h.SUBAGENT_INTERRUPT_PREFIX, answered["call-task"])
+        self.assertIn("half the work", answered["call-task"])
+        self.assertEqual(answered["call-todo"], "interrupted by user")
+        self.assertEqual(h._AGENT_DEPTH, 0)
+
+    def test_interrupt_bubbles_through_nested_subagents(self):
+        h.MAX_SUBAGENT_DEPTH = 3
+
+        def decide(messages, depth, turn):
+            if depth < 2:
+                return (self._tool_turn("task", {"task": "deeper"}), True)
+            raise h.StreamInterrupted({"role": "assistant", "content": "deepest partial work"})
+
+        messages, calls = self._scripted(decide)
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = h.run_agent(messages, "m")
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [0, 1, 2])  # stopped all the way up, no retries
+        results = [m["content"] for m in messages if m["role"] == "tool"]
+        self.assertEqual(len(results), 1)
+        self.assertIn("deepest partial work", results[0])
+        # The note is carried up unchanged rather than wrapped once per level.
+        self.assertEqual(results[0].count(h.SUBAGENT_INTERRUPT_PREFIX), 1)
+
+    def test_top_level_interrupt_still_returns_to_the_prompt(self):
+        """The top-level agent is not a sub-agent: an interrupt there keeps the
+        long-standing behaviour (keep the partial, return 0)."""
+
+        def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
+            raise h.StreamInterrupted({"role": "assistant", "content": "partial answer"})
+
+        old = h.stream_once
+        h.stream_once = fake_stream_once
+        self.addCleanup(setattr, h, "stream_once", old)
+        messages = [{"role": "user", "content": "go"}]
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = h.run_agent(messages, "m")
+        self.assertEqual(code, 0)
+        self.assertEqual(messages[-1], {"role": "assistant", "content": "partial answer"})
+        self.assertEqual(h._AGENT_DEPTH, 0)
+
+    # --- runaway guard: model turns allowed per sub-agent ---
+
+    def test_subagent_step_limit_stops_a_runaway(self):
+        h.MAX_SUBAGENT_DEPTH = 2
+        h.SUBAGENT_STEP_LIMIT = 3
+        depths = []
+
+        def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
+            depths.append(h._AGENT_DEPTH)
+            return (self._tool_turn("todo", {"action": "list"}), True)
+
+        old = h.stream_once
+        h.stream_once = fake_stream_once
+        self.addCleanup(setattr, h, "stream_once", old)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            out = h.tool_task({"task": "never ends"})
+        self.assertEqual(depths, [1, 1, 1])  # exactly SUBAGENT_STEP_LIMIT turns
+        self.assertTrue(out.startswith(f"exit code: {h.SUBAGENT_STEP_LIMIT_CODE}"), out)
+        self.assertIn("step limit", out)
+        self.assertIn("3 model turns", out)
+        self.assertIn("this summary may be incomplete", out)
+        self.assertIn("sub-agent stopped", buf.getvalue())
+        self.assertEqual(h._AGENT_DEPTH, 0)
+        self.assertEqual(h.OUTPUT_INDENT, "")
+
+    def test_step_limit_zero_disables_the_guard(self):
+        h.MAX_SUBAGENT_DEPTH = 2
+        h.SUBAGENT_STEP_LIMIT = 0
+        turns = []
+
+        def decide(messages, depth, turn):
+            turns.append((depth, turn))
+            if turn < 4:
+                return (self._tool_turn("todo", {"action": "list"}), True)
+            return ({"role": "assistant", "content": "sub done"}, True)
+
+        self._scripted(decide)
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = h.tool_task({"task": "keep going"})
+        self.assertEqual(out, "exit code: 0\nsub done")
+        self.assertEqual(len(turns), 5)
+
+    def test_top_level_agent_is_not_step_capped(self):
+        h.SUBAGENT_STEP_LIMIT = 2
+        turns = []
+
+        def decide(messages, depth, turn):
+            turns.append(depth)
+            if turn < 5:
+                return (self._tool_turn("todo", {"action": "list"}), True)
+            return ({"role": "assistant", "content": "done"}, True)
+
+        messages, _ = self._scripted(decide)
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = h.run_agent(messages, "m")
+        self.assertEqual(code, 0)
+        self.assertEqual(turns, [0] * 6)  # 5 tool turns + the finishing one, uncapped
+
+    def test_model_exit_code_is_not_mistaken_for_the_step_limit(self):
+        def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None):
+            messages.append({"role": "assistant", "content": "done"})
+            return h.SUBAGENT_STEP_LIMIT_CODE  # the sub-agent's own `exit` code collides
+
+        self._fake_run_agent(fake_run_agent)
+        out = h.tool_task({"task": "do X"})
+        self.assertEqual(out, f"exit code: {h.SUBAGENT_STEP_LIMIT_CODE}\ndone")
+        self.assertNotIn("step limit", out)
+
+    def test_step_limit_signal_leaves_no_state_behind(self):
+        h.MAX_SUBAGENT_DEPTH = 2
+        h.SUBAGENT_STEP_LIMIT = 2
+
+        def decide(messages, depth, turn):
+            return (self._tool_turn("todo", {"action": "list"}), True)  # a sub-agent that never ends
+
+        _, calls = self._scripted(decide)
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = h.tool_task({"task": "never ends"})
+        self.assertEqual(calls, [1, 1])  # the guard fired instead of looping on
+        self.assertIn("step limit", out)
+        self.assertEqual(h._AGENT_DEPTH, 0)
+        self.assertEqual(h.OUTPUT_INDENT, "")
+        self.assertEqual(h.USAGE_BY_CONV, {})
+
+    def test_clamp_int_bounds_cli_values(self):
+        self.assertEqual(h._clamp_int(2, 0, h.SUBAGENT_DEPTH_CEILING), 2)
+        self.assertEqual(h._clamp_int(-1, 0, h.SUBAGENT_DEPTH_CEILING), 0)
+        self.assertEqual(h._clamp_int(999, 0, h.SUBAGENT_DEPTH_CEILING), h.SUBAGENT_DEPTH_CEILING)
+        self.assertEqual(h._clamp_int(-5, 0, h.SUBAGENT_STEPS_CEILING), 0)
 
     def test_run_agent_exit_returns_code(self):
         def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
