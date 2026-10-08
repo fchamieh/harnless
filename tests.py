@@ -1418,6 +1418,7 @@ class TestSubagents(unittest.TestCase):
         self._old_model = h.MODEL
         self._old_temp = h.TEMPERATURE
         self._old_usage = dict(h.USAGE_BY_CONV)
+        self._old_exit_notes = dict(h.EXIT_NOTE_BY_CONV)
         self._old_next_conv = h._NEXT_CONV_ID
         self._old_steps = h.SUBAGENT_STEP_LIMIT
         self._old_chat = h.chat
@@ -1428,6 +1429,7 @@ class TestSubagents(unittest.TestCase):
         h.TEMPERATURE = 0.2
         h.SUBAGENT_STEP_LIMIT = 0  # guard off unless a test asks for it
         h.USAGE_BY_CONV.clear()
+        h.EXIT_NOTE_BY_CONV.clear()
 
         def no_live_api(*args, **kwargs):
             raise AssertionError("tests must not reach a live LLM server")
@@ -1442,6 +1444,8 @@ class TestSubagents(unittest.TestCase):
         self.addCleanup(setattr, h, "chat", self._old_chat)
         self.addCleanup(h.USAGE_BY_CONV.clear)
         self.addCleanup(h.USAGE_BY_CONV.update, self._old_usage)
+        self.addCleanup(h.EXIT_NOTE_BY_CONV.clear)
+        self.addCleanup(h.EXIT_NOTE_BY_CONV.update, self._old_exit_notes)
         self.addCleanup(setattr, h, "_NEXT_CONV_ID", self._old_next_conv)
 
     def _call(self, name, args, call_id=None):
@@ -1557,6 +1561,9 @@ class TestSubagents(unittest.TestCase):
         self.assertEqual(h.OUTPUT_INDENT, "")
 
     def test_task_no_final_content(self):
+        """Nothing to hand back: the result says so. A bare "exit code: 2" read
+        as "the sub-agent found nothing", which is how a lost summary got paid
+        for twice."""
         def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None):
             messages.append({"role": "assistant", "content": ""})
             return 2
@@ -1564,7 +1571,135 @@ class TestSubagents(unittest.TestCase):
         old = h.run_agent
         h.run_agent = fake_run_agent
         self.addCleanup(setattr, h, "run_agent", old)
-        self.assertEqual(h.tool_task({"task": "do X"}), "exit code: 2")
+        self.assertEqual(h.tool_task({"task": "do X"}), f"exit code: 2\n{h.NO_SUMMARY_NOTE}")
+
+    # --- the hand-off: what the parent actually receives as the summary ---
+
+    def test_task_harvests_exit_tool_message(self):
+        """The summary a sub-agent put in exit's `message` argument (which the
+        tool schema advertises as a final message) reaches the parent instead
+        of being printed and dropped."""
+        summary = "Coupling map: main() at 4760, TOOLS at 1757"
+
+        def decide(messages, depth, turn):
+            return (
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [self._call("exit", {"code": 0, "message": summary})],
+                },
+                True,
+            )
+
+        self._scripted(decide)
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = h.tool_task({"task": "map the codebase"})
+        self.assertEqual(out, f"exit code: 0\n{summary}")
+        self.assertEqual(h.EXIT_NOTE_BY_CONV, {})  # popped, not left behind
+
+    def test_closing_summary_prefers_the_substantive_text(self):
+        long = "\n".join(f"finding {i}: file.py:{i}" for i in range(30))
+        in_reply = {
+            "role": "assistant",
+            "content": long,
+            "tool_calls": [self._call("exit", {"code": 0, "message": "done"})],
+        }
+        in_exit = {
+            "role": "assistant",
+            "content": "done",
+            "tool_calls": [self._call("exit", {"code": 0, "message": long})],
+        }
+        self.assertEqual(h._closing_summary([in_reply], "done"), long)
+        self.assertEqual(h._closing_summary([in_exit], long), long)
+        self.assertEqual(h._closing_summary([in_exit], ""), "done")
+
+    def test_closing_summary_salvages_lesser_sources(self):
+        """A reasoning-only ending, or narration left over from an earlier turn,
+        still yields a hand-off — labelled, so it can't be mistaken for one."""
+        reasoning_only = {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "answer: main() at 4760",
+        }
+        self.assertEqual(
+            h._closing_summary([reasoning_only], ""),
+            h.SALVAGED_SUMMARY_NOTE + "\nanswer: main() at 4760",
+        )
+        leftover_narration = [
+            {"role": "assistant", "content": "now let me check the tool registry"},
+            {"role": "assistant", "content": ""},  # the closing turn: a bare exit
+        ]
+        self.assertEqual(
+            h._closing_summary(leftover_narration, ""),
+            h.SALVAGED_SUMMARY_NOTE + "\nnow let me check the tool registry",
+        )
+        self.assertEqual(h._closing_summary([{"role": "assistant", "content": ""}], ""), "")
+
+    def test_task_survives_a_reasoning_only_subagent(self):
+        """Reasoning models leave `content` empty: the analysis printed live used
+        to reach the user and none of it reach the delegating agent."""
+
+        def decide(messages, depth, turn):
+            return (
+                {"role": "assistant", "content": "", "reasoning_content": "main() at 4760"},
+                True,
+            )
+
+        self._scripted(decide)
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = h.tool_task({"task": "map it"})
+        self.assertIn("main() at 4760", out)
+        self.assertIn(h.SALVAGED_SUMMARY_NOTE, out)
+        self.assertNotIn(h.NO_SUMMARY_NOTE, out)
+
+    def test_exit_notes_do_not_leak_between_nested_runs(self):
+        h.MAX_SUBAGENT_DEPTH = 3
+
+        def decide(messages, depth, turn):
+            if depth == 1 and turn == 0:
+                return (self._tool_turn("task", {"task": "deeper"}), True)
+            note = "outer hand-off" if depth == 1 else "inner hand-off"
+            return (
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [self._call("exit", {"code": 0, "message": note})],
+                },
+                True,
+            )
+
+        self._scripted(decide)
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = h.tool_task({"task": "map it"})
+        self.assertEqual(out, "exit code: 0\nouter hand-off")
+        self.assertEqual(h.EXIT_NOTE_BY_CONV, {})
+
+    def test_exit_answers_every_call_in_its_batch(self):
+        """`exit` aborts a tool batch: the calls behind it get answers too, so
+        the conversation never ends with unanswered tool_calls."""
+
+        def decide(messages, depth, turn):
+            return (
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        self._call("get_cwd", {}, "a"),
+                        self._call("exit", {"code": 3, "message": "stopping"}, "b"),
+                        self._call("get_cwd", {}, "c"),
+                    ],
+                },
+                True,
+            )
+
+        messages, _ = self._scripted(decide)
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = h.run_agent(messages, "m")
+        self.assertEqual(code, 3)
+        answered = {m["tool_call_id"]: m["content"] for m in messages if m["role"] == "tool"}
+        self.assertEqual(sorted(answered), ["a", "b", "c"])
+        self.assertIn("exiting with code 3", answered["b"])
+        self.assertIn("skipped", answered["c"])
 
     def test_task_cleans_up_subagent_usage(self):
         def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None):
@@ -1820,14 +1955,48 @@ class TestSubagents(unittest.TestCase):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             out = h.tool_task({"task": "never ends"})
-        self.assertEqual(depths, [1, 1, 1])  # exactly SUBAGENT_STEP_LIMIT turns
+        self.assertEqual(depths, [1, 1, 1, 1])  # SUBAGENT_STEP_LIMIT turns + the closing one
         self.assertTrue(out.startswith(f"exit code: {h.SUBAGENT_STEP_LIMIT_CODE}"), out)
         self.assertIn("step limit", out)
         self.assertIn("3 model turns", out)
         self.assertIn("this summary may be incomplete", out)
+        self.assertIn(h.NO_SUMMARY_NOTE, out)  # never summarised, and it says so
         self.assertIn("sub-agent stopped", buf.getvalue())
         self.assertEqual(h._AGENT_DEPTH, 0)
         self.assertEqual(h.OUTPUT_INDENT, "")
+
+    def test_step_limit_closing_turn_delivers_a_summary(self):
+        """A capped run gets one turn devoted to the hand-off instead of stopping
+        mid-tool-call, which used to return `exit code: 4` with no findings."""
+        h.MAX_SUBAGENT_DEPTH = 2
+        h.SUBAGENT_STEP_LIMIT = 2
+
+        seen = {}  # the sub-agent builds its own messages list; capture it live
+
+        def decide(messages, depth, turn):
+            seen[id(messages)] = messages
+            if turn < 2:
+                return (self._tool_turn("todo", {"action": "list"}), True)  # a runaway
+            return ({"role": "assistant", "content": "Partial findings: X at 1, Y at 2"}, True)
+
+        self._scripted(decide)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            out = h.tool_task({"task": "never ends"})
+        self.assertTrue(out.startswith(f"exit code: {h.SUBAGENT_STEP_LIMIT_CODE}"), out)
+        self.assertIn("Partial findings: X at 1, Y at 2", out)
+        self.assertIn("this summary may be incomplete", out)
+        self.assertNotIn(h.NO_SUMMARY_NOTE, out)
+        # the extra turn was asked for, not invented by the harness
+        self.assertTrue(
+            any(
+                m.get("role") == "user" and m.get("content") == h.STEP_LIMIT_CLOSE_PROMPT
+                for conv in seen.values()
+                for m in conv
+            ),
+            [m for conv in seen.values() for m in conv],
+        )
+        self.assertIn("one closing turn", buf.getvalue())
 
     def test_step_limit_zero_disables_the_guard(self):
         h.MAX_SUBAGENT_DEPTH = 2
@@ -1882,11 +2051,12 @@ class TestSubagents(unittest.TestCase):
         _, calls = self._scripted(decide)
         with contextlib.redirect_stdout(io.StringIO()):
             out = h.tool_task({"task": "never ends"})
-        self.assertEqual(calls, [1, 1])  # the guard fired instead of looping on
+        self.assertEqual(calls, [1, 1, 1])  # limit + the closing turn, then the guard fired
         self.assertIn("step limit", out)
         self.assertEqual(h._AGENT_DEPTH, 0)
         self.assertEqual(h.OUTPUT_INDENT, "")
         self.assertEqual(h.USAGE_BY_CONV, {})
+        self.assertEqual(h.EXIT_NOTE_BY_CONV, {})
 
     def test_clamp_int_bounds_cli_values(self):
         self.assertEqual(h._clamp_int(2, 0, h.SUBAGENT_DEPTH_CEILING), 2)

@@ -12,7 +12,7 @@ Pure Python standard library — **no dependencies, no venv, no build step**.
 - **Single file** — the entire harness is `harnless.py` (stdlib only)
 - **OpenAI-compatible** — works with llama-server, llama.cpp, OpenRouter, or any `/v1/chat/completions` endpoint
 - **File & shell tools** — read/write/patch/search files and run shell commands (PowerShell on Windows, bash on POSIX)
-- **Sub-agents** — the `task` tool delegates self-contained work to a nested agent (configurable depth)
+- **Sub-agents** — the `task` tool delegates self-contained work to a nested agent (configurable depth) and hands the result back as the sub-agent's closing summary
 - **State tools** — `todo` (task list) and `memory` (persistent notes) survive across turns
 - **Streaming** — token-by-token output with Markdown rendering; press `ESC` twice to interrupt a running generation (it stops sub-agents and their parents too)
 - **MCP support** — plug in external tools via [Model Context Protocol](https://modelcontextprotocol.io) servers (stdio or HTTP)

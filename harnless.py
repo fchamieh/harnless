@@ -21,7 +21,7 @@ import urllib.error
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 API_URL = "http://127.0.0.1:11434/v1/chat/completions"
 API_KEY = None
 MODEL = "local-model"
@@ -34,6 +34,26 @@ SUBAGENT_DEPTH_CEILING = 10  # sanity clamp for --max-subagents
 SUBAGENT_STEP_LIMIT = 40
 SUBAGENT_STEPS_CEILING = 1_000  # sanity clamp for --max-subagent-steps
 SUBAGENT_STEP_LIMIT_CODE = 4  # exit code reported to the parent when the guard fires
+# A capped sub-agent gets one closing turn instead of stopping cold: a run that
+# ends on a tool-call turn leaves tool_task with no text to hand the parent.
+STEP_LIMIT_CLOSE_PROMPT = (
+    "You have reached the harness step limit for this sub-agent. Do not call any "
+    "more tools. Reply now with only the final summary the parent will receive: "
+    "self-contained findings with file paths and line numbers, decisions, and "
+    "caveats."
+)
+# Shown to the delegating agent when a sub-agent produced no hand-off text at
+# all. The sub-agent's printed output never enters the parent's context, so an
+# empty result has to say so — otherwise "nothing found" and "summary lost"
+# look identical and the parent redoes the work.
+NO_SUMMARY_NOTE = (
+    "(sub-agent returned no final summary — the output it printed is not part of "
+    "your context, so this task is still undone: delegate a narrower task or do it yourself)"
+)
+# Prefix on a hand-off recovered from less explicit places (a reasoning-only
+# turn, or narration from before the final turn) so the parent knows the text
+# was salvaged, not written as a summary.
+SALVAGED_SUMMARY_NOTE = "(no closing summary from the sub-agent; its last output follows)"
 # Current sub-agent nesting level: depth 0 = top-level agent. Scoped to each
 # run_agent call (set on entry, restored on exit — see run_agent).
 _AGENT_DEPTH = 0
@@ -83,6 +103,11 @@ AGENTS_MD_LIMIT = 20_000  # AGENTS.md appended to the system prompt (chars)
 # (MAIN_CONV_ID for the top-level conversation, unique counters for
 # sub-agents — see _record_usage).
 USAGE_BY_CONV: dict[int, dict] = {}
+# The `message` argument of an agent's `exit` call, per conversation id: the
+# text a sub-agent meant as its closing statement, recorded by _agent_loop's
+# exit handler and harvested by tool_task as that sub-agent's summary. Dropped
+# when the sub-agent finishes.
+EXIT_NOTE_BY_CONV: dict[int, str] = {}
 MAIN_CONV_ID = 0
 _NEXT_CONV_ID = 1  # monotonically increasing usage keys for sub-agent runs
 IMAGE_MIME = {
@@ -916,12 +941,14 @@ def tool_fetch_url(args: dict) -> str:
 
 SUBAGENT_NOTE = (
     "You are a sub-agent delegated a specific task. Work autonomously using the tools. "
-    "The parent only sees your final summary: make it self-contained and concise — key "
-    "findings, file paths with line numbers, decisions, and caveats — omitting intermediate "
-    "detail (aim for under 50 lines unless the task asks for more). "
-    "When the task is complete, write that final summary, then call the exit tool with code 0. "
-    "If the task cannot be completed, explain why in your final message and call the exit tool "
-    "with a non-zero code."
+    "The parent receives only your closing message: none of your tool output and nothing "
+    "you merely print reaches it. Make that message carry the result — self-contained and "
+    "concise, key findings with file paths and line numbers, decisions, and caveats, "
+    "omitting intermediate detail (aim for under 50 lines unless the task asks for more). "
+    "When the task is complete, write that summary as your reply and then call the exit "
+    "tool with code 0 — or pass the same summary as exit's `message` argument; the harness "
+    "reads either and keeps the more substantive one. If the task cannot be completed, say "
+    "why in your closing message and call exit with a non-zero code."
 )
 # Result a delegating agent gets when its sub-agent was interrupted. The note
 # is carried further up the delegation chain as-is instead of being re-wrapped
@@ -931,10 +958,50 @@ SUBAGENT_INTERRUPT_PREFIX = (
 )
 
 
+def _closing_summary(messages: list, exit_note: str) -> str:
+    """The hand-off text a sub-agent leaves behind ("" when it left none).
+
+    Models put a summary in different places: the assistant reply they end on,
+    the `exit` tool's `message` argument (which the tool schema advertises as a
+    final message), or — reasoning models — only in `reasoning_content`. Taking
+    the more substantive of the two closing texts means a closing "Done" never
+    replaces a real summary, and a real summary is never dropped just because
+    it went into `exit`. Anything that has to be dug out of an earlier turn is
+    labelled, so the parent can tell a summary from leftover narration.
+    """
+    exit_note = (exit_note or "").strip()
+    final_content = ""  # content of the sub-agent's last assistant turn
+    earlier_content = ""  # closest earlier assistant turn that had any content
+    reasoning = ""
+    seen_final = False
+    for m in reversed(messages):
+        if m.get("role") != "assistant":
+            continue
+        content = (m.get("content") or "").strip()
+        if not seen_final:
+            seen_final = True
+            final_content = content
+        elif not earlier_content:
+            earlier_content = content
+        if not reasoning:
+            reasoning = (m.get("reasoning_content") or "").strip()
+        if final_content and earlier_content and reasoning:
+            break
+    closing = max((exit_note, final_content), key=len)
+    if closing:
+        return closing
+    for salvage in (reasoning, earlier_content):
+        if salvage:
+            return SALVAGED_SUMMARY_NOTE + "\n" + salvage
+    return ""
+
+
 def tool_task(args: dict) -> str:
     """Delegate a task to a sub-agent: a nested run_agent with a fresh context.
 
-    Returns the sub-agent's exit code and final summary as the tool result.
+    Returns the sub-agent's exit code and closing summary as the tool result;
+    when the sub-agent left no hand-off text, the result says so rather than
+    reading like a successful empty answer.
     """
     task = (args.get("task") or "").strip()
     if not task:
@@ -994,25 +1061,29 @@ def tool_task(args: dict) -> str:
         # The sub-agent's messages list is freed on return; drop its usage
         # entry so the address can't be recycled and resurrect stale usage.
         USAGE_BY_CONV.pop(conv_id, None)
-    final = ""
-    for m in reversed(messages):
-        if m.get("role") == "assistant" and (m.get("content") or "").strip():
-            final = m["content"].strip()
-            break
+        # An `exit(message=...)` argument is the sub-agent's own closing
+        # statement: _agent_loop prints it, and only here does it reach the
+        # parent.
+        exit_note = EXIT_NOTE_BY_CONV.pop(conv_id, "") or ""
+    final = _closing_summary(messages, exit_note)
     if interrupt_note:
         final = interrupt_note
+    if not final:
+        # No hand-off text anywhere: say so. A bare "exit code: 0" reads to the
+        # model as "the sub-agent found nothing", which is how a lost summary
+        # gets paid for twice.
+        final = NO_SUMMARY_NOTE
     if step_limited:
         final = (
             final
             + "\n\n(sub-agent stopped: it reached its step limit of "
             f"{SUBAGENT_STEP_LIMIT} model turns; this summary may be incomplete)"
         ).strip()
-    if final:
-        final = _truncate(
-            final,
-            SUBAGENT_SUMMARY_LIMIT,
-            hint="delegate a narrower task, or ask the sub-agent for a shorter summary",
-        )
+    final = _truncate(
+        final,
+        SUBAGENT_SUMMARY_LIMIT,
+        hint="delegate a narrower task, or ask the sub-agent for a shorter summary",
+    )
     if interrupted:
         if final.startswith(SUBAGENT_INTERRUPT_PREFIX):
             body = final[len(SUBAGENT_INTERRUPT_PREFIX):]  # wrapped already, deeper up
@@ -1021,7 +1092,7 @@ def tool_task(args: dict) -> str:
         raise SubagentInterrupted(
             {"role": "assistant", "content": SUBAGENT_INTERRUPT_PREFIX + body}
         )
-    return f"exit code: {code}\n{final}" if final else f"exit code: {code}"
+    return f"exit code: {code}\n{final}"
 
 
 # ---------------------------------------------------------------- state tools
@@ -1821,7 +1892,7 @@ TOOLS = {
             "type": "function",
             "function": {
                 "name": "exit",
-                "description": "Finish the harness and exit with a given exit code. Use 0 for success, non-zero for failure. Call this when the task is complete.",
+                "description": "Finish this agent's run and exit with a given exit code. Use 0 for success, non-zero for failure. Call this when the task is complete. For a sub-agent, `message` is also the hand-off: whatever the parent agent receives as this task's result (write your summary as your reply text or pass it here — the harness keeps the more substantive of the two).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1831,7 +1902,7 @@ TOOLS = {
                         },
                         "message": {
                             "type": "string",
-                            "description": "Optional final message",
+                            "description": "Optional closing message; shown to the user and used as a sub-agent's summary for the parent",
                         },
                     },
                     "required": [],
@@ -4618,17 +4689,36 @@ def _agent_loop(
     # top-level agent is user-steered and double-ESC-able, so it stays uncapped.
     is_subagent = _AGENT_DEPTH > 0
     steps = 0
+    # A capped run gets one extra turn devoted to the hand-off. A sub-agent cut
+    # off at the top of this loop has usually just finished a tool-call turn, so
+    # stopping cold would leave tool_task with no summary to hand the parent.
+    closing_turn = False
+
+    def _step_limited() -> None:
+        print(
+            OUTPUT_INDENT
+            + colorize(
+                f"{icon('exit')} sub-agent stopped: step limit "
+                f"({SUBAGENT_STEP_LIMIT}) reached",
+                "error",
+            )
+        )
+        raise SubagentStepLimit(f"sub-agent exceeded {SUBAGENT_STEP_LIMIT} model turns")
+
     while True:
         if is_subagent and SUBAGENT_STEP_LIMIT and steps >= SUBAGENT_STEP_LIMIT:
+            if closing_turn:
+                _step_limited()
+            closing_turn = True
             print(
                 OUTPUT_INDENT
                 + colorize(
-                    f"{icon('exit')} sub-agent stopped: step limit "
-                    f"({SUBAGENT_STEP_LIMIT}) reached",
+                    f"{icon('exit')} sub-agent reached its step limit "
+                    f"({SUBAGENT_STEP_LIMIT}) — one closing turn to summarise",
                     "error",
                 )
             )
-            raise SubagentStepLimit(f"sub-agent exceeded {SUBAGENT_STEP_LIMIT} model turns")
+            messages.append({"role": "user", "content": STEP_LIMIT_CLOSE_PROMPT})
         steps += 1
         message = None
         streamed = False
@@ -4698,6 +4788,10 @@ def _agent_loop(
         if not tool_calls:
             if not streamed:
                 print_assistant(message.get("content", ""))
+            if closing_turn:
+                # The closing turn replied: still report the run as capped, so
+                # the parent knows the summary may be partial.
+                _step_limited()
             return 0
 
         if message.get("content") and not streamed:
@@ -4717,6 +4811,32 @@ def _agent_loop(
                     print(
                         OUTPUT_INDENT + colorize(f"{icon('exit')} {e.message}", "tool")
                     )
+                if is_subagent and conv_id is not None and e.message:
+                    # A closing statement the parent would otherwise never see:
+                    # tool_task harvests it as the sub-agent's summary.
+                    EXIT_NOTE_BY_CONV[conv_id] = e.message
+                # Answer the exit call and everything queued behind it, so the
+                # batch never leaves tool_calls unanswered (as the interrupt
+                # branch below does) — harmless today, since this agent's
+                # conversation ends here, but it is a broken request waiting to
+                # happen if a caller ever resumes it.
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": f"exiting with code {e.code}",
+                    }
+                )
+                for pending in tool_calls[index + 1:]:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": pending["id"],
+                            "content": f"skipped: the agent exited with code {e.code}",
+                        }
+                    )
+                if closing_turn:
+                    _step_limited()  # a capped run reports itself capped
                 return e.code
             except StreamInterrupted as e:
                 # A tool (the task tool) was interrupted. Answer this call and
