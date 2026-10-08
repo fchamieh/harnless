@@ -766,12 +766,22 @@ class TestResolveShell(Base):
         # found: dict name -> path (missing names simply absent => None)
         return lambda name: found.get(name)
 
+    @contextlib.contextmanager
+    def _fake_windows(self, found):
+        """_resolve_shell short-circuits to (None, "") when os.name is not "nt",
+        so the PowerShell-resolution tests have to assert *through* a faked
+        Windows host. Without it they pass vacuously on Linux (they did)."""
+        with mock.patch.object(h.os, "name", "nt"), mock.patch.object(
+            h.shutil, "which", side_effect=self._which(found)
+        ):
+            yield
+
     def test_non_windows_uses_shell_true(self):
         with mock.patch.object(h.os, "name", "posix"):
             self.assertEqual(h._resolve_shell("auto"), (None, ""))
 
     def test_auto_prefers_pwsh(self):
-        with mock.patch.object(h.shutil, "which", side_effect=self._which({"pwsh": "C:/pwsh.exe", "powershell": "C:/powershell.exe"})):
+        with self._fake_windows({"pwsh": "C:/pwsh.exe", "powershell": "C:/powershell.exe"}):
             argv, prefix = h._resolve_shell("auto")
         self.assertEqual(argv, ["C:/pwsh.exe", "-NoProfile", "-NonInteractive", "-Command"])
         # pwsh 7 can also emit the ANSI code page on redirected stdout, so
@@ -779,35 +789,35 @@ class TestResolveShell(Base):
         self.assertIn("OutputEncoding", prefix)
 
     def test_auto_falls_back_to_powershell(self):
-        with mock.patch.object(h.shutil, "which", side_effect=self._which({"powershell": "C:/powershell.exe"})):
+        with self._fake_windows({"powershell": "C:/powershell.exe"}):
             argv, prefix = h._resolve_shell("auto")
         self.assertEqual(argv, ["C:/powershell.exe", "-NoProfile", "-NonInteractive", "-Command"])
         self.assertIn("OutputEncoding", prefix)
 
     def test_auto_falls_back_to_cmd(self):
-        with mock.patch.object(h.shutil, "which", side_effect=self._which({})):
+        with self._fake_windows({}):
             self.assertEqual(h._resolve_shell("auto"), (None, ""))
 
     def test_force_pwsh(self):
-        with mock.patch.object(h.shutil, "which", side_effect=self._which({"pwsh": "C:/pwsh.exe"})):
+        with self._fake_windows({"pwsh": "C:/pwsh.exe"}):
             argv, prefix = h._resolve_shell("pwsh")
         self.assertEqual(argv[0], "C:/pwsh.exe")
         self.assertIn("OutputEncoding", prefix)
 
     def test_force_pwsh_missing_falls_back(self):
-        with mock.patch.object(h.shutil, "which", side_effect=self._which({"powershell": "C:/powershell.exe"})):
+        with self._fake_windows({"powershell": "C:/powershell.exe"}):
             argv, prefix = h._resolve_shell("pwsh")
         self.assertEqual(argv[0], "C:/powershell.exe")
         self.assertIn("OutputEncoding", prefix)
 
     def test_force_powershell(self):
-        with mock.patch.object(h.shutil, "which", side_effect=self._which({"powershell": "C:/powershell.exe"})):
+        with self._fake_windows({"powershell": "C:/powershell.exe"}):
             argv, prefix = h._resolve_shell("powershell")
         self.assertEqual(argv[0], "C:/powershell.exe")
         self.assertIn("OutputEncoding", prefix)
 
     def test_force_cmd(self):
-        with mock.patch.object(h.shutil, "which", side_effect=self._which({"pwsh": "C:/pwsh.exe"})):
+        with self._fake_windows({"pwsh": "C:/pwsh.exe"}):
             self.assertEqual(h._resolve_shell("cmd"), (None, ""))
 
 
