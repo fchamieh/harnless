@@ -2197,7 +2197,9 @@ class TestStatus(unittest.TestCase):
 
     def test_no_context_window_omits_percentage(self):
         out = h.format_status([{"role": "system", "content": "x"}])
-        self.assertNotIn("% of", out)
+        # The context line only: /status now also reports the compaction thresholds,
+        # and those are percentages of a window by nature.
+        self.assertNotIn("% of", out.splitlines()[0])
 
     def test_tiny_percentage_shows_lt_1(self):
         out = h.format_status([{"role": "system", "content": "x" * 400}], context_window=2222080)
@@ -6138,5 +6140,882 @@ class TestSessionLog(unittest.TestCase):
         self.assertIn("no session log for 'no-such-session'", proc.stdout)
 
 
+class TestCompaction(unittest.TestCase):
+    """Context compaction: the cut, the handoff note, the journal record, the two
+    triggers that run it, and the sessions tool that reads back what was replaced.
+
+    Like TestSessionLog and TestSubagents these drive the real run_agent/_agent_loop
+    with a scripted stream_once — streamed must be True or run_agent falls back to
+    chat(), i.e. a live request — and chat is patched to a scripted summariser so the
+    handoff note is produced without a server."""
+
+    ATTRS = (
+        "SESSION_LOG", "SESSION_ID", "SESSION_MODE", "SESSION_WARNED", "SESSION_DIR",
+        "AGENT_LOG_ID", "OUTPUT_INDENT", "MODEL", "TEMPERATURE", "_AGENT_DEPTH",
+        "MAX_SUBAGENT_DEPTH", "SUBAGENT_STEP_LIMIT", "_NEXT_CONV_ID", "chat",
+        "stream_once", "_session_new_id", "_open_request", "TODO_FILE", "CONTEXT_WINDOW",
+        "AUTO_COMPACT", "COMPACT_THRESHOLD_PCT", "COMPACT_MIN_MESSAGES",
+        "COMPACT_KEEP_MIN_MESSAGES", "COMPACT_KEEP_TOKENS_PCT", "COMPACT_MAX_ATTEMPTS",
+        "COMPACT_SUMMARY_LIMIT", "COMPACT_SUMMARY_TRIMS", "COMPACT_PRUNE_TOOL_RESULTS",
+        "COMPACT_DROP_REASONING", "COMPACT_TOOL_RESULT_KEEP",
+    )
+
+    def setUp(self):
+        self.tmp = "./_test_tmp"
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        os.makedirs(self.tmp, exist_ok=True)
+        self.sessions = os.path.join(self.tmp, "sessions")
+        self._saved = {name: getattr(h, name) for name in self.ATTRS}
+        self._saved_state = (
+            dict(h.SESSION_FILES), dict(h.SESSION_SEQ), dict(h.SESSION_MSG_SEQ),
+            dict(h.SUBAGENT_CHILDREN), dict(h.USAGE_BY_CONV), dict(h.COMPACT_STATS),
+        )
+        h.SESSION_DIR = self.sessions
+        h.SESSION_LOG = True
+        h.SESSION_WARNED = False
+        h.SESSION_ID = ""
+        h._session_new_id = lambda: "test-session"
+        h.AGENT_LOG_ID = ""
+        h.OUTPUT_INDENT = ""
+        h.MODEL = "test-model"
+        h.TEMPERATURE = 0.2
+        h._AGENT_DEPTH = 0
+        h.MAX_SUBAGENT_DEPTH = 3
+        h.SUBAGENT_STEP_LIMIT = 0
+        h.TODO_FILE = os.path.join(self.tmp, ".harnless", "todo.md")
+        # Small numbers on purpose: a handful of fat messages is enough to cross them,
+        # and the shapes of the result stay readable in a failure message.
+        h.CONTEXT_WINDOW = 4000
+        h.AUTO_COMPACT = True
+        h.COMPACT_THRESHOLD_PCT = 85
+        h.COMPACT_MAX_ATTEMPTS = 1
+        h.COMPACT_SUMMARY_TRIMS = 3
+        h._open_request = self._saved["_open_request"]
+        self.notes = []  # every request the summariser was asked to write
+        self.turns = []  # what each model turn was actually shown
+
+        def summariser(messages, model, interactive=False, temperature=0.2,
+                       conv_id=None, send_tools=True):
+            self.notes.append({
+                "messages": messages, "send_tools": send_tools, "conv_id": conv_id,
+            })
+            return {
+                "choices": [{"message": {"role": "assistant", "content": "HANDOFF NOTE"}}],
+                "usage": {"prompt_tokens": 999},
+            }
+
+        h.chat = summariser
+
+    def tearDown(self):
+        for name, value in self._saved.items():
+            setattr(h, name, value)
+        files, seq, msg_seq, children, usage, stats = self._saved_state
+        for target, saved in (
+            (h.SESSION_FILES, files), (h.SESSION_SEQ, seq), (h.SESSION_MSG_SEQ, msg_seq),
+            (h.SUBAGENT_CHILDREN, children), (h.USAGE_BY_CONV, usage),
+            (h.COMPACT_STATS, stats),
+        ):
+            target.clear()
+            target.update(saved)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # ---- helpers
+
+    def _call(self, name, args, call_id=None):
+        return {
+            "id": call_id or f"call-{name}",
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args)},
+        }
+
+    def _tool_turn(self, name, args, call_id=None):
+        return {"role": "assistant", "content": "", "tool_calls": [self._call(name, args, call_id)]}
+
+    def _scripted(self, decide):
+        """Install a scripted stream_once: decide(messages, depth, turn) -> (msg, True).
+
+        Records a copy of the messages each turn was shown — that is how a test sees
+        compaction happen *between* requests rather than after them."""
+        seen = {}
+
+        def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
+            depth = h._AGENT_DEPTH
+            turn = seen.get(depth, 0)
+            seen[depth] = turn + 1
+            self.turns.append(list(messages))
+            return decide(messages, depth, turn)
+
+        h.stream_once = fake_stream_once
+
+    def _seed(self, count=8, size=1200, tool_at=None, tool_size=None):
+        """A journaled top-level conversation: system, then user/assistant pairs.
+
+        `tool_at` puts an assistant tool call and its (fat) answer after that many
+        pairs — where a test wants a batch near the cut."""
+        h.start_session("interactive")
+        messages = [{"role": "system", "content": "sys"}]
+        for i in range(count):
+            messages.append({"role": "user", "content": f"u{i} " + "x" * size})
+            messages.append({"role": "assistant", "content": f"a{i} " + "y" * (size // 2)})
+            if tool_at is not None and i == tool_at:
+                messages.append(self._tool_turn("read_file", {"path": "./x"}, f"c{i}"))
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": f"c{i}",
+                    "content": "z" * (tool_size if tool_size is not None else 20_000),
+                })
+        h._session_messages(messages, h.MAIN_CONV_ID)
+        return messages
+
+    def _compact(self, messages, reason="manual"):
+        return h.compact_messages(
+            messages, h.MAIN_CONV_ID, model="test-model", reason=reason, interactive=True
+        )
+
+    def _run(self, **kw):
+        """A real top-level run against a seeded conversation (stream_once scripted)."""
+        h.start_session(kw.pop("mode", "interactive"))
+        messages = [{"role": "system", "content": "sys"}] + list(kw.pop("seed", []))
+        h._session_messages(messages, h.MAIN_CONV_ID)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = h.run_agent(
+                messages, "test-model", interactive=True, temperature=0.2,
+                conv_id=h.MAIN_CONV_ID,
+            )
+        return code, messages, buf.getvalue()
+
+    def _log(self, name="test-session.jsonl"):
+        with open(os.path.join(self.sessions, name), "r", encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def _records(self, kind, name="test-session.jsonl"):
+        return [r for r in self._log(name) if r.get("type") == kind]
+
+    def _compacts(self, name="test-session.jsonl"):
+        return self._records("compact", name)
+
+    def _summary_request(self, index=0):
+        return self.notes[index]["messages"]
+
+    @staticmethod
+    def _batches_intact(messages) -> bool:
+        """No tool answer separated from its call, no call left unanswered — the shape
+        a server insists on, so a cut must produce it."""
+        pending = None
+        for msg in messages:
+            role = msg.get("role")
+            if role == "assistant":
+                if pending is not None:
+                    return False
+                calls = [tc.get("id") for tc in (msg.get("tool_calls") or [])]
+                pending = calls or None
+            elif role == "tool":
+                if not pending or pending[0] != msg.get("tool_call_id"):
+                    return False
+                pending.pop(0)
+                if not pending:
+                    pending = None
+            elif pending is not None:
+                return False
+        return pending is None
+
+    # ---- the cut
+
+    def test_head_is_replaced_and_tail_kept_verbatim(self):
+        messages = self._seed(8)
+        untouched = list(messages)
+        ok, report = self._compact(messages)
+        self.assertTrue(ok)
+        self.assertIn("handoff note", report)
+        self.assertEqual(messages[0], {"role": "system", "content": "sys"})
+        summary = messages[1]
+        self.assertEqual(summary["role"], "user")  # a user message: chat templates
+        # reject a system message anywhere but the first (the todo reminder's trick)
+        self.assertTrue(summary["content"].startswith(h.COMPACT_SUMMARY_HEADER))
+        self.assertIn("HANDOFF NOTE", summary["content"])
+        tail = messages[2:]
+        self.assertEqual(len(tail), h.COMPACT_KEEP_MIN_MESSAGES)
+        for kept, original in zip(tail, untouched[-h.COMPACT_KEEP_MIN_MESSAGES:]):
+            self.assertIs(kept, original)  # verbatim: the same objects, untouched
+
+    def test_tail_floor_keeps_real_turns_whatever_the_budget_says(self):
+        h.CONTEXT_WINDOW = 100  # a 25-token tail budget: the token rule wants no tail
+        messages = self._seed(8)
+        self.assertTrue(self._compact(messages)[0])
+        self.assertGreaterEqual(len(messages) - 2, h.COMPACT_KEEP_MIN_MESSAGES)
+
+    def test_refuses_below_the_minimum(self):
+        messages = self._seed(2)  # 5 messages
+        ok, note = self._compact(messages)
+        self.assertFalse(ok)
+        self.assertIn(str(h.COMPACT_MIN_MESSAGES), note)
+        self.assertEqual(len(messages), 5)
+        self.assertEqual(self._compacts(), [])  # nothing done, nothing recorded
+
+    def test_refuses_when_nothing_is_older_than_the_tail(self):
+        h.CONTEXT_WINDOW = 10_000_000  # the tail budget covers the whole conversation
+        messages = self._seed(8)
+        before = list(messages)
+        ok, note = self._compact(messages)
+        self.assertFalse(ok)
+        self.assertIn("nothing is older than the verbatim tail", note)
+        self.assertEqual(messages, before)
+
+    def _batch(self, fat_at=None):
+        """An assistant turn with two calls and both answers — one batch, whole."""
+        return [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    self._call("read_file", {"path": "./x"}, "c1"),
+                    self._call("grep", {"pattern": "x"}, "c2"),
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "the answer"},
+            {"role": "tool", "tool_call_id": "c2", "content": "another answer"},
+        ]
+
+    def _straddling(self):
+        """A conversation whose tool batch sits exactly where the tail budget cuts."""
+        fat = "x" * 404  # ~101 tokens each
+        return (
+            [{"role": "system", "content": "sys"}]
+            + [{"role": "user", "content": f"u{i} {fat}"} for i in range(13)]
+            + self._batch()
+            + [{"role": "user", "content": f"v{i} {fat}"} for i in range(4)]
+        )
+
+    def test_cut_never_lands_inside_a_tool_call_batch(self):
+        messages = self._straddling()
+        # 21 messages; a 405-token tail budget stops on the first answer, whose call is
+        # two places back in the head. Cutting there would keep an answer to a call the
+        # head swallowed, which is a request no server answers.
+        self.assertEqual(messages[15].get("role"), "tool")
+        self.assertEqual(h._compact_cut(messages, 405), 17)  # nudged past both answers
+
+    def test_a_tool_answer_never_outlives_its_call(self):
+        h.CONTEXT_WINDOW = 1620  # a 405-token tail budget: the cut lands mid-batch
+        messages = self._straddling()
+        h.start_session("interactive")
+        h._session_messages(messages, h.MAIN_CONV_ID)
+        self.assertTrue(self._batches_intact(messages))
+        self.assertTrue(self._compact(messages)[0])
+        self.assertTrue(self._batches_intact(messages))
+        # The batch moved wholesale into the replaced head: no answer stayed behind.
+        self.assertEqual([m for m in messages if m.get("role") == "tool"], [])
+
+    def test_the_note_is_written_by_the_model_without_any_tools(self):
+        messages = self._seed(8)
+        self._compact(messages)
+        self.assertEqual(len(self.notes), 1)
+        request = self._summary_request()
+        self.assertFalse(self.notes[0]["send_tools"])
+        self.assertEqual(request[0]["role"], "system")
+        self.assertEqual(request[0]["content"], h.COMPACT_SUMMARY_PROMPT)
+        body = h._request_body(request, "test-model", send_tools=False)
+        self.assertNotIn("tools", body)
+        self.assertNotIn("tool_choice", body)  # no tool_choice without tools to choose
+
+    def test_the_note_is_capped(self):
+        def long_note(messages, model, interactive=False, temperature=0.2,
+                      conv_id=None, send_tools=True):
+            self.notes.append({"messages": messages, "send_tools": send_tools, "conv_id": conv_id})
+            return {"choices": [{"message": {"role": "assistant", "content": "n" * 20_000}}]}
+
+        h.chat = long_note
+        messages = self._seed(8)
+        self.assertTrue(self._compact(messages)[0])
+        content = messages[1]["content"]
+        self.assertIn("[truncated:", content)
+        self.assertLess(
+            len(content), h.COMPACT_SUMMARY_LIMIT + len(h.COMPACT_SUMMARY_HEADER) + 600
+        )
+
+    def test_the_note_says_where_the_replaced_turns_are(self):
+        messages = self._seed(8)
+        self._compact(messages)
+        content = messages[1]["content"]
+        self.assertIn("sessions tool", content)  # the way back, named in the conversation
+        self.assertIn("test-session", content)
+
+    # ---- what the journal says about it
+
+    def test_compact_record_names_the_turns_it_replaced(self):
+        messages = self._seed(8, tool_at=3)
+        before = list(messages)
+        self.assertTrue(self._compact(messages)[0])
+        records = self._compacts()
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record["reason"], "manual")
+        kept = len(messages) - 2  # the system prompt and the note; the rest went
+        dropped = before[1:len(before) - kept]
+        self.assertEqual(record["dropped"], len(dropped))
+        first, last = record["replaced"]
+        recorded = {r["seq"]: r for r in self._records("message")}
+        # The span names exactly the turns that went: their own records, contiguously.
+        self.assertEqual(recorded[first]["content"], dropped[0]["content"])
+        self.assertEqual(recorded[last]["content"], dropped[-1]["content"])
+        self.assertEqual(last - first + 1, len(dropped))
+        # The summary takes the seq the record promised: the record's own + 1.
+        self.assertEqual(record["summary_seq"], record["seq"] + 1)
+        self.assertEqual(
+            recorded[record["summary_seq"]]["content"][: len(h.COMPACT_SUMMARY_HEADER)],
+            h.COMPACT_SUMMARY_HEADER,
+        )
+        self.assertEqual(record["summary"], "model")
+        self.assertIsNone(record["summary_error"])
+        # The seq list keeps describing the conversation it is paired with.
+        entries = h.SESSION_MSG_SEQ[h.MAIN_CONV_ID]
+        self.assertEqual(len(entries), len(messages))
+        self.assertEqual(entries[1], record["summary_seq"])
+
+    def test_journal_numbering_continues_after_a_compaction(self):
+        messages = self._seed(8)
+        self._compact(messages)
+        messages.append({"role": "user", "content": "next " + "x" * 2000})
+        h._session_message(messages[-1], h.MAIN_CONV_ID)
+        seqs = [r["seq"] for r in self._log()]
+        self.assertEqual(seqs, list(range(len(seqs))))  # gapless, no seq reused
+        self.assertEqual(max(seqs), h.SESSION_SEQ[h.MAIN_CONV_ID] - 1)
+
+    def test_starting_a_session_starts_a_fresh_log(self):
+        self._seed(8)
+        previous = self._log()
+        self._seed(2)  # the same session id (patched): the new run owns the file
+        records = self._log()
+        self.assertEqual(len([r for r in records if r.get("type") == "session"]), 1)
+        self.assertEqual([r["seq"] for r in records], list(range(len(records))))
+        self.assertLess(len(records), len(previous))  # the old run's records are not in it
+
+    def test_a_resumed_conversation_keeps_the_original_numbering(self):
+        messages = self._seed(8)
+        last_seq = self._log()[-1]["seq"]
+        resumed, _ = h.resume_session("test-session")
+        # The way main() puts a fresh system prompt in front of restored turns — with
+        # _session_prepend, so the seq list stays aligned with the conversation.
+        resumed.insert(0, {"role": "system", "content": "sys again"})
+        h._session_prepend(resumed[0], h.MAIN_CONV_ID)
+        entries = h.SESSION_MSG_SEQ[h.MAIN_CONV_ID]
+        self.assertEqual(len(entries), len(resumed))
+        self.assertEqual(entries[0], last_seq + 2)  # resume marker, then the new prompt
+        self.assertEqual(entries[1], 2)  # the first restored turn keeps its own seq
+        self.assertTrue(self._compact(resumed)[0])
+        self.assertEqual(self._compacts()[-1]["replaced"][0], 2)
+
+    def test_a_second_compaction_absorbs_the_first_note(self):
+        messages = self._seed(8)
+        self._compact(messages)
+        extra = [{"role": "user", "content": f"more{i} " + "x" * 2000} for i in range(8)]
+        messages.extend(extra)
+        h._session_messages(extra, h.MAIN_CONV_ID)
+        self.notes.clear()
+        self.assertTrue(self._compact(messages)[0])
+        self.assertEqual(len(self._compacts()), 2)
+        # The handoff the first round wrote is part of what the second round reads.
+        self.assertIn("HANDOFF NOTE", json.dumps(self._summary_request()))
+
+    # ---- reading the transcript back (the sessions tool)
+
+    def _compacted_once(self, **seed_kw):
+        """A seeded conversation, compacted once: (messages, its compact record)."""
+        messages = self._seed(**seed_kw)
+        self.assertTrue(self._compact(messages)[0])
+        return messages, self._compacts()[0]
+
+    def test_the_sessions_tool_lists_the_recorded_logs(self):
+        self._seed(8)
+        out = h.tool_sessions({"action": "list"})
+        self.assertIn("test-session", out)
+        self.assertIn("interactive (test-model)", out)  # what the run was, from its header
+        self.assertIn("/resume", out)  # the other way back, named in the same answer
+
+    def test_read_returns_the_words_the_note_condensed(self):
+        _, record = self._compacted_once(tool_at=2, tool_size=4000)
+        first, last = record["replaced"]
+        recorded = {r["seq"]: r for r in self._records("message")}
+        out = h.tool_sessions({"action": "read", "from": first, "to": last})
+        self.assertIn(f"records {first}-{last}", out)
+        self.assertIn(f"#{first} {recorded[first]['role']}", out)
+        self.assertIn(f"#{last} {recorded[last]['role']}", out)
+        for seq in (first, last):
+            text = recorded[seq].get("content")
+            if isinstance(text, str):
+                self.assertIn(text[:60], out)  # the turn itself, not a pointer to it
+        self.assertNotIn("HANDOFF NOTE", out)  # the note stands outside the range it replaced
+
+    def test_a_compaction_reads_as_the_gap_it_made(self):
+        _, record = self._compacted_once()
+        first, last = record["replaced"]
+        spans = h.tool_sessions({"action": "spans"})
+        self.assertIn("1 compaction", spans)
+        self.assertIn("HARNLESS COMPACTED", spans)
+        self.assertIn(f"seqs {first}-{last}", spans)
+        self.assertIn("handoff note", spans)
+        self.assertIn(record["reason"], spans)
+        # A plain read shows the cut where it happened, between the turns it left.
+        out = h.tool_sessions({"action": "read", "from": first, "to": record["summary_seq"] + 1})
+        self.assertIn("HARNLESS COMPACTED", out)
+        self.assertIn(f"#{record['seq']} [", out)
+
+    def test_a_gap_made_without_a_note_says_the_note_failed(self):
+        def broken(messages, model, interactive=False, temperature=0.2,
+                   conv_id=None, send_tools=True):
+            raise urllib.error.URLError("no route to the summariser")
+
+        h.chat = broken
+        self._compacted_once()
+        self.assertIn("placeholder (the summarising request failed)",
+                      h.tool_sessions({"action": "spans"}))
+
+    def test_a_record_line_shows_the_calls_the_turn_made(self):
+        self._seed(3, tool_at=1, tool_size=200)
+        lines = "\n".join(h._session_record_line(r) for r in self._records("message"))
+        self.assertIn("called read_file(", lines)
+        self.assertIn('"path": "./x"', lines)  # the arguments, as the model sent them
+        self.assertIn("(answer to c1)", lines)  # an answer says which call it answers
+
+    def test_an_inline_image_reads_as_a_note_not_a_blob(self):
+        h.start_session("interactive")
+        h._session_message({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is in this screenshot?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 5000}},
+                {"type": "image_url", "image_url": {"url": "http://x/y.png"}},
+            ],
+        }, h.MAIN_CONV_ID)
+        out = h.tool_sessions({"action": "read"})
+        self.assertIn("what is in this screenshot?", out)
+        self.assertIn("[image elided in the session log", out)  # the pixels stay out of the transcript
+        self.assertIn("[image]", out)  # a short reference is kept, as a label
+        self.assertNotIn("AAAA", out)
+
+    def test_a_long_turn_is_clipped_and_says_where_the_rest_is(self):
+        h.start_session("interactive")
+        h._session_message(
+            {"role": "assistant", "content": "b" * (h.SESSION_RECORD_CHARS + 400)}, h.MAIN_CONV_ID
+        )
+        out = h.tool_sessions({"action": "read"})
+        self.assertIn("[truncated:", out)
+        self.assertIn("the rest of this turn is in the log file itself", out)
+
+    def test_reading_is_capped_and_says_how_to_narrow_it(self):
+        self._seed(8)
+        out = h.tool_sessions({"action": "read", "limit": 3})
+        self.assertIn("showing the last 3 of", out)
+        self.assertIn("narrower from/to", out)
+        self.assertEqual(len([line for line in out.splitlines() if line.startswith("#")]), 3)
+        out = h.tool_sessions({"action": "read", "max_chars": 900})
+        self.assertIn("[truncated:", out)
+        self.assertIn("narrow from/to", out)
+
+    def test_the_sessions_tool_says_what_it_could_not_find(self):
+        self._seed(8)
+        self.assertIn("no records", h.tool_sessions({"action": "read", "from": 900, "to": 999}))
+        self.assertIn("unknown action", h.tool_sessions({"action": "archaeology"}))
+        missing = h.tool_sessions({"action": "read", "session": "no-such-session"})
+        self.assertTrue(missing.startswith("error:"))
+        self.assertIn("no session log for 'no-such-session'", missing)
+        self.assertIn("test-session", missing)  # and it names what it does have
+
+    def test_the_sessions_tool_is_a_model_tool_too(self):
+        names = [s["function"]["name"] for s in h.OPENAI_TOOLS]
+        self.assertIn("sessions", names)  # the way back has to be reachable from a turn
+        self.assertIn("sessions", h.DISPATCH)
+
+    # ---- when the summarising request fails
+
+    def test_fallback_note_when_the_summarising_request_fails(self):
+        def broken(messages, model, interactive=False, temperature=0.2,
+                   conv_id=None, send_tools=True):
+            raise urllib.error.URLError("no route to the summariser")
+
+        h.chat = broken
+        messages = self._seed(8)
+        before = len(messages)
+        ok, report = self._compact(messages)
+        self.assertTrue(ok)  # dropping the head is what made the room: that still happens
+        self.assertIn(h.COMPACT_FALLBACK_NOTE, messages[1]["content"])
+        self.assertLess(len(messages), before)
+        record = self._compacts()[0]
+        self.assertEqual(record["summary"], "fallback")
+        self.assertIn("no route to the summariser", record["summary_error"])
+        self.assertTrue(record["replaced"])  # the dropped range is recorded either way
+        self.assertIn("placeholder", report)
+
+    def test_summariser_retries_smaller_when_the_head_itself_is_too_big(self):
+        def too_big(messages, model, interactive=False, temperature=0.2,
+                    conv_id=None, send_tools=True):
+            self.notes.append({"messages": messages, "send_tools": send_tools, "conv_id": conv_id})
+            if len(self.notes) == 1:
+                raise h.ContextOverflow("HTTP 400: prompt is too long")
+            return {"choices": [{"message": {"role": "assistant", "content": "SMALLER NOTE"}}]}
+
+        h.chat = too_big
+        messages = self._seed(8, tool_at=2, tool_size=60_000)
+        self.assertTrue(self._compact(messages)[0])
+        self.assertEqual(len(self.notes), 2)
+        self.assertLess(len(self._summary_request(1)), len(self._summary_request(0)))
+        self.assertIn("SMALLER NOTE", messages[1]["content"])
+
+    # ---- what the pruning saves
+
+    def test_tool_result_pruning_is_a_switch_and_it_is_measured(self):
+        messages = self._seed(8, tool_at=2, tool_size=30_000)
+        self.assertTrue(self._compact(messages)[0])
+        bodies = [m.get("content") or "" for m in self._summary_request() if m.get("role") == "tool"]
+        self.assertTrue(bodies)
+        self.assertTrue(any("harnless elided" in b for b in bodies))
+        self.assertLess(max(len(b) for b in bodies), h.COMPACT_TOOL_RESULT_KEEP + 400)
+        pruned_size = len(json.dumps(self._summary_request()))
+        pruned_saving = self._compacts()[0]["pruned_chars"]
+        self.assertGreaterEqual(pruned_saving, 30_000 - h.COMPACT_TOOL_RESULT_KEEP)
+
+        self.notes.clear()
+        h.COMPACT_PRUNE_TOOL_RESULTS = False
+        messages = self._seed(8, tool_at=2, tool_size=30_000)
+        self.assertTrue(self._compact(messages)[0])
+        whole_bodies = [m.get("content") or "" for m in self._summary_request() if m.get("role") == "tool"]
+        self.assertEqual(self._compacts()[0]["pruned_chars"], 0)  # nothing was made smaller
+        self.assertNotIn("harnless elided", json.dumps(self._summary_request()))
+        # What the switch actually buys: the summariser reads the head through a budget.
+        # Condensed, that fat turn is inside the request it is summarising; left whole
+        # it never fits, and the note gets written without ever seeing it.
+        self.assertTrue(bodies)  # pruned: the turn was there
+        self.assertEqual(whole_bodies, [])  # unpruned: the same turn did not fit at all
+        self.assertGreater(pruned_saving, h.COMPACT_TOOL_RESULT_KEEP)
+        self.assertLess(pruned_size + pruned_saving, h.TOOL_RESULT_LIMIT)
+
+    def test_a_small_tool_result_is_not_pruned_at_all(self):
+        messages = self._seed(8, tool_at=2, tool_size=600)  # under the keep size
+        self.assertTrue(self._compact(messages)[0])
+        bodies = [m.get("content") or "" for m in self._summary_request() if m.get("role") == "tool"]
+        self.assertEqual(max(len(b) for b in bodies), 600)  # no note, no elision
+        self.assertNotIn("harnless elided", json.dumps(self._summary_request()))
+        self.assertEqual(self._compacts()[0]["pruned_chars"], 0)
+
+    def test_a_fat_tool_result_in_the_kept_tail_is_left_alone(self):
+        # Out of the tail means elided; inside it means verbatim — the tail is what the
+        # agent keeps working from, not what it is about to forget.
+        messages = self._seed(8, tool_at=7, tool_size=30_000)
+        self.assertTrue(self._compact(messages)[0])
+        kept = [m for m in messages if m.get("role") == "tool"]
+        self.assertEqual(kept[0]["content"].count("z"), 30_000)
+        self.assertNotIn("harnless elided", json.dumps(self._summary_request()))
+
+    def test_thinking_stops_being_replayed_once_it_produced_its_turn(self):
+        h.start_session("interactive")
+        messages = [{"role": "system", "content": "sys"}]
+        for i in range(8):
+            messages.append({"role": "user", "content": f"u{i} " + "x" * 1200})
+            messages.append({
+                "role": "assistant",
+                "content": f"a{i}",
+                "reasoning_content": "r" * 4000,
+            })
+        h._session_messages(messages, h.MAIN_CONV_ID)
+        current = messages[-1]  # the thinking that produced the turn in progress
+        self.assertTrue(self._compact(messages)[0])
+        assistants = [m for m in messages[2:] if m.get("role") == "assistant"]
+        self.assertTrue(assistants)
+        self.assertIs(assistants[-1], current)
+        self.assertEqual(current.get("reasoning_content"), "r" * 4000)
+        for msg in assistants[:-1]:
+            self.assertNotIn("reasoning_content", msg)
+        # The log still has every word of it.
+        self.assertEqual(len([r for r in self._records("message") if r.get("reasoning_content")]), 8)
+        # The accounting, exactly: every assistant turn but the one still in play.
+        self.assertEqual(self._compacts()[0]["pruned_chars"], 7 * 4000)
+
+    def test_the_reasoning_switch_off_leaves_it_in_place(self):
+        h.COMPACT_DROP_REASONING = False
+        messages = self._seed(8)
+        messages.append({"role": "assistant", "content": "late", "reasoning_content": "r" * 4000})
+        h._session_message(messages[-1], h.MAIN_CONV_ID)
+        self.assertTrue(self._compact(messages)[0])
+        self.assertEqual(messages[-1].get("reasoning_content"), "r" * 4000)
+        self.assertEqual(self._compacts()[0]["pruned_chars"], 0)
+
+    # ---- the proactive trigger
+
+    def _seeded_run(self, count=8, size=1200, decide=None):
+        """Seed a conversation and run the real loop over it."""
+        seed = []
+        for i in range(count):
+            seed.append({"role": "user", "content": f"u{i} " + "x" * size})
+            seed.append({"role": "assistant", "content": f"a{i} " + "y" * (size // 2)})
+        self._scripted(decide or (lambda m, d, t: ({"role": "assistant", "content": "done"}, True)))
+        return self._run(seed=seed)
+
+    def test_usage_over_the_threshold_compacts_before_the_next_request(self):
+        h.USAGE_BY_CONV[h.MAIN_CONV_ID] = {"prompt_tokens": 3_900, "completion_tokens": 10}
+        self._scripted(
+            lambda m, d, t: (self._tool_turn("get_cwd", {}, "c1"), True)
+            if t == 0 else ({"role": "assistant", "content": "done"}, True)
+        )
+        seed = [{"role": "user", "content": f"u{i} " + "x" * 1200} for i in range(8)]
+        seed += [{"role": "assistant", "content": f"a{i}"} for i in range(8)]
+        code, messages, out = self._run(seed=seed)
+        self.assertEqual(code, 0)
+        self.assertEqual([r["reason"] for r in self._compacts()], ["proactive"])
+        self.assertEqual(messages[1]["content"][: len(h.COMPACT_SUMMARY_HEADER)],
+                         h.COMPACT_SUMMARY_HEADER)
+        # What the model was shown was the compacted conversation, not the one that
+        # would not have fit: 8 seed turns + system became the tail plus the note.
+        self.assertLess(len(self.turns[0]), len(seed) + 1)
+        self.assertIn("compacted", out)
+        self.assertEqual(h.COMPACT_STATS[h.MAIN_CONV_ID]["rounds"], 1)
+
+    def test_the_trigger_measures_what_the_server_reported_when_it_can(self):
+        h.CONTEXT_WINDOW = 20_000  # threshold 17,000 tokens
+        seed = [{"role": "user", "content": f"u{i} " + "x" * 2000} for i in range(8)]
+        seed += [{"role": "assistant", "content": f"a{i}"} for i in range(8)]
+        self.assertLess(
+            h.estimate_context_tokens(seed, True), 20_000 * h.COMPACT_THRESHOLD_PCT // 100
+        )  # the estimate alone would not have triggered it
+        h.USAGE_BY_CONV[h.MAIN_CONV_ID] = {"prompt_tokens": 18_000}
+        code, _, _ = self._seeded_run(decide=lambda m, d, t: (
+            (self._tool_turn("get_cwd", {}, "c1"), True) if t == 0
+            else ({"role": "assistant", "content": "done"}, True)
+        ))
+        self.assertEqual(code, 0)
+        self.assertEqual([r["reason"] for r in self._compacts()], ["proactive"])
+
+    def test_the_proactive_trigger_ignores_what_compaction_cannot_shrink(self):
+        h.CONTEXT_WINDOW = 3000  # threshold 2550 tokens
+        seed = [{"role": "user", "content": f"u{i}"} for i in range(6)]
+        seed += [{"role": "assistant", "content": f"a{i}"} for i in range(6)]
+        request = [{"role": "system", "content": "sys"}] + seed
+        threshold = h.CONTEXT_WINDOW * h.COMPACT_THRESHOLD_PCT // 100
+        # The tool schemas ride along with every request, and here they alone are over
+        # the threshold while the conversation is nowhere near it. Compacting would cut
+        # turns that were never what filled the context — that overflow is the reactive
+        # trigger's, and it says plainly when compaction cannot help.
+        self.assertGreater(h.estimate_context_tokens(request, True), threshold)
+        self.assertLess(h._turn_tokens(request), threshold)
+        self._scripted(lambda m, d, t: ({"role": "assistant", "content": "done"}, True))
+        code, _, _ = self._run(seed=seed)
+        self.assertEqual(code, 0)
+        self.assertEqual(self._compacts(), [])
+        self.assertEqual(self.notes, [])  # no handoff note asked for either
+
+    def _spread_seed(self):
+        """8 long user turns then 8 short replies — cheap to measure, big enough to cut."""
+        h.start_session("interactive")
+        messages = [{"role": "system", "content": "sys"}]
+        messages += [{"role": "user", "content": f"u{i} " + "x" * 2000} for i in range(8)]
+        messages += [{"role": "assistant", "content": f"a{i}"} for i in range(8)]
+        h._session_messages(messages, h.MAIN_CONV_ID)
+        return messages
+
+    def test_a_reported_usage_is_what_the_tail_budget_is_counted_against(self):
+        h.CONTEXT_WINDOW = 20_000  # a 5000-token tail budget
+        ours = self._spread_seed()
+        self.assertFalse(self._compact(ours)[0])  # our estimate fits the tail: nothing to drop
+        reported = self._spread_seed()
+        h.USAGE_BY_CONV[h.MAIN_CONV_ID] = {"prompt_tokens": 18_000}
+        self.assertTrue(self._compact(reported)[0])  # the server's number says otherwise
+        record = self._compacts()[0]
+        self.assertEqual(record["used_tokens"], 18_000)
+        self.assertLess(record["turn_tokens"], record["used_tokens"])  # it counts more than the turns look like
+        self.assertGreater(record["token_scale"], 1.0)  # so the cut is made in its units
+
+    def test_auto_compact_off_leaves_the_context_as_it_is(self):
+        h.AUTO_COMPACT = False
+        h.USAGE_BY_CONV[h.MAIN_CONV_ID] = {"prompt_tokens": 3_900}
+        code, messages, _ = self._seeded_run(count=10, size=2000)
+        self.assertEqual(code, 0)
+        self.assertEqual(self._compacts(), [])
+        self.assertEqual(self.notes, [])  # no handoff note was even asked for
+        self.assertEqual(len(messages), 22)  # system + 20 seeded turns + the reply
+
+    def test_no_known_window_means_no_proactive_compaction(self):
+        h.CONTEXT_WINDOW = 0
+        code, _, _ = self._seeded_run(count=10, size=2000)
+        self.assertEqual(code, 0)
+        self.assertEqual(self._compacts(), [])
+        self.assertEqual(self.notes, [])
+
+    def test_a_context_that_cannot_be_compacted_says_so_once(self):
+        h.COMPACT_MIN_MESSAGES = 2  # long enough to try, but:
+        h.COMPACT_KEEP_TOKENS_PCT = 100  # the tail budget is the whole window
+        h.USAGE_BY_CONV[h.MAIN_CONV_ID] = {"prompt_tokens": 3_900}
+        self._scripted(
+            lambda m, d, t: (self._tool_turn("get_cwd", {}, f"c{t}"), True)
+            if t < 2 else ({"role": "assistant", "content": "done"}, True)
+        )
+        code, _, out = self._run(seed=[{"role": "user", "content": "u"} for _ in range(3)])
+        self.assertEqual(code, 0)
+        self.assertEqual(self._compacts(), [])
+        self.assertEqual(out.count("but not compacting"), 1)  # once, not every turn
+
+    # ---- the reactive trigger
+
+    def _overflow_once(self):
+        """A stream_once that reports the context full the first time, then behaves."""
+        def decide(messages, depth, turn):
+            if turn == 0:
+                raise h.ContextOverflow(
+                    "HTTP 400: This is over n_ctx, consider trimming your prompt"
+                )
+            if turn == 1:
+                return self._tool_turn("get_cwd", {}, "c1"), True
+            return {"role": "assistant", "content": "done"}, True
+
+        self._scripted(decide)
+
+    def test_a_rejected_prompt_is_retried_after_compacting(self):
+        seed = [{"role": "user", "content": f"u{i} " + "x" * 1200} for i in range(8)]
+        seed += [{"role": "assistant", "content": f"a{i}"} for i in range(8)]
+        self._overflow_once()
+        code, messages, out = self._run(seed=seed)
+        self.assertEqual(code, 0)  # the same turn, in a context that now fits
+        self.assertEqual([r["reason"] for r in self._compacts()], ["overflow"])
+        self.assertIn("n_ctx", out)  # what the server actually said, passed along
+        self.assertIn("retrying", out)
+        self.assertIn(h.COMPACT_SUMMARY_HEADER, messages[1]["content"])
+
+    def test_prompt_that_is_still_too_big_ends_the_run_with_the_overflow_code(self):
+        h.COMPACT_KEEP_TOKENS_PCT = 100  # nothing can be dropped: the tail is everything
+        seed = [{"role": "user", "content": f"u{i} " + "x" * 1200} for i in range(8)]
+        self._scripted(
+            lambda m, d, t: (_ for _ in ()).throw(
+                h.ContextOverflow("HTTP 400: maximum context length exceeded")
+            )
+        )
+        code, _, out = self._run(seed=seed)
+        self.assertEqual(code, h.CONTEXT_OVERFLOW_CODE)
+        self.assertEqual(self._compacts(), [])
+        self.assertIn("compaction cannot help", out)
+
+    def test_a_second_rejection_ends_the_run_with_the_overflow_code(self):
+        seed = [{"role": "user", "content": f"u{i} " + "x" * 1200} for i in range(8)]
+        seed += [{"role": "assistant", "content": f"a{i}"} for i in range(8)]
+        self._scripted(
+            lambda m, d, t: (_ for _ in ()).throw(
+                h.ContextOverflow("HTTP 400: This is over n_ctx")
+            )
+        )
+        code, _, out = self._run(seed=seed)
+        self.assertEqual(code, h.CONTEXT_OVERFLOW_CODE)  # not 1, not 0: its own code
+        self.assertNotEqual(code, h.SUBAGENT_STEP_LIMIT_CODE)
+        self.assertEqual(len(self._compacts()), 1)  # COMPACT_MAX_ATTEMPTS, not more
+        self.assertIn("out of context", out)
+        self.assertIn("test-session", out)  # names the transcript that still has it
+        self.assertIn("sessions", out)
+
+    def test_overflow_when_auto_compaction_is_off_says_so(self):
+        h.AUTO_COMPACT = False
+        seed = [{"role": "user", "content": f"u{i} " + "x" * 1200} for i in range(8)]
+        self._overflow_once()
+        code, _, out = self._run(seed=seed)
+        self.assertEqual(code, h.CONTEXT_OVERFLOW_CODE)
+        self.assertEqual(self._compacts(), [])
+        self.assertIn("auto-compaction is off", out)
+
+    def test_a_refused_prompt_on_the_non_streaming_path_compacts_too(self):
+        seed = [{"role": "user", "content": f"u{i} " + "x" * 1200} for i in range(8)]
+
+        def no_deltas(messages, model, interactive=False, temperature=0.2, conv_id=None):
+            return {"role": "assistant", "content": "no deltas"}, False  # run_agent falls back
+
+        h.stream_once = no_deltas
+
+        def chat(messages, model, interactive=False, temperature=0.2, conv_id=None,
+                 send_tools=True):
+            if not send_tools:  # the handoff note request
+                self.notes.append({"messages": messages, "send_tools": send_tools,
+                                   "conv_id": conv_id})
+                return {"choices": [{"message": {"role": "assistant", "content": "HANDOFF"}}]}
+            raise h.ContextOverflow("HTTP 400: maximum context length exceeded")
+
+        h.chat = chat
+        code, _, out = self._run(seed=seed)
+        # The fallback is a request too: whichever path the server refused, a prompt
+        # still too big after the one compaction ends the run the same way.
+        self.assertEqual(code, h.CONTEXT_OVERFLOW_CODE)
+        self.assertEqual([r["reason"] for r in self._compacts()], ["overflow"])
+        self.assertEqual(len(self.notes), 1)  # one note, one retry — not a loop
+        self.assertIn("out of context", out)
+        self.assertIn("test-session", out)  # and where the transcript still is
+
+        self.assertEqual(len(self.notes), 1)  # one note, one retry — not a loop
+
+    def test_overflow_recognition_is_about_size_not_any_bad_request(self):
+        def rejected(code, body):
+            return urllib.error.HTTPError(
+                "http://127.0.0.1:11434/v1/chat/completions", code, "Bad Request", {},
+                io.BytesIO(body.encode("utf-8")),
+            )
+
+        cases = [
+            (400, '{"error": {"message": "This is over n_ctx, try trimming your prompt"}}', True),
+            (400, '{"error": {"message": "prompt is too long: 33000 tokens > 32000 maximum"}}', True),
+            (413, "context length exceeded", True),
+            (400, '{"error": {"message": "invalid tool schema: expected object"}}', False),
+            (500, "n_ctx assertion failed", False),  # a crash is not a size rejection
+        ]
+        for code, body, is_overflow in cases:
+            reason = h._context_overflow_reason(rejected(code, body))
+            if is_overflow:
+                self.assertIn(f"HTTP {code}", reason)
+            else:
+                self.assertEqual(reason, "")
+
+    def test_chat_raises_context_overflow_for_a_refused_prompt(self):
+        h.chat = self._saved["chat"]  # the real one, this time
+
+        def refuse(request, progress=None, on_socket=None):
+            raise urllib.error.HTTPError(
+                "http://x/y", 400, "Bad Request", {},
+                io.BytesIO(b'{"error": {"message": "over n_ctx"}}'),
+            )
+
+        h._open_request = refuse
+        with self.assertRaises(h.ContextOverflow) as caught:
+            h.chat([{"role": "user", "content": "x"}], "test-model")
+        self.assertIn("n_ctx", str(caught.exception))
+
+    def test_another_kind_of_bad_request_is_still_just_an_http_error(self):
+        h.chat = self._saved["chat"]
+
+        def refuse(request, progress=None, on_socket=None):
+            raise urllib.error.HTTPError(
+                "http://x/y", 400, "Bad Request", {},
+                io.BytesIO(b'{"error": {"message": "invalid json in arguments"}}'),
+            )
+
+        h._open_request = refuse
+        with self.assertRaises(urllib.error.HTTPError):
+            h.chat([{"role": "user", "content": "x"}], "test-model")
+
+    # ---- sub-agents
+
+    def test_a_sub_agent_compacts_its_own_run_in_its_own_log(self):
+        conv_id = 7
+        h.start_session("interactive")  # the parent's log exists, and stays untouched
+        h._session_open(
+            conv_id, h._session_path(h.SESSION_ID, "1"),
+            {"depth": 1, "mode": "sub-agent", "subagent_id": "1"},
+        )
+        sub = [{"role": "system", "content": "sub sys"}, {"role": "user", "content": "the task"}]
+        for i in range(8):
+            sub.append({"role": "assistant", "content": f"a{i} " + "y" * 1600})
+            sub.append({"role": "user", "content": f"u{i} " + "x" * 1600})
+        h._session_messages(sub, conv_id)
+        h.USAGE_BY_CONV[conv_id] = {"prompt_tokens": 9_000}  # over 85% of the window
+        self._scripted(lambda m, d, t: ({"role": "assistant", "content": "sub done"}, True))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = h.run_agent(sub, "test-model", interactive=False, temperature=0.2,
+                               depth=1, conv_id=conv_id)
+        self.assertEqual(code, 0)
+        self.assertEqual([r["reason"] for r in self._compacts("test-session.1.jsonl")],
+                         ["proactive"])
+        self.assertEqual(self._compacts(), [])  # a sub-agent's room is its own business
+        self.assertIn(h.COMPACT_SUMMARY_HEADER, sub[1]["content"])
 if __name__ == "__main__":
     unittest.main(verbosity=2)

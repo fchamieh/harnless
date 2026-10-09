@@ -22,7 +22,7 @@ import urllib.error
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 API_URL = "http://127.0.0.1:11434/v1/chat/completions"
 API_KEY = None
 MODEL = "local-model"
@@ -100,6 +100,8 @@ SUBAGENT_SUMMARY_LIMIT = 20_000  # task: sub-agent final summary (chars)
 TODO_BLOCK_LIMIT = 8_000  # todo render + reminder injection (chars)
 MEMORY_BLOCK_LIMIT = 12_000  # memory notes injected into the system prompt (chars)
 AGENTS_MD_LIMIT = 20_000  # AGENTS.md appended to the system prompt (chars)
+SESSION_READ_LIMIT = 30_000  # sessions: transcript text returned from the log (chars)
+SESSION_RECORD_CHARS = 2_000  # sessions: chars kept of one recorded message
 # Context compaction: the answer to "the context is full". Older turns are
 # replaced by one model-written handoff note and the recent turns stay verbatim.
 # Two triggers: proactive (usage crosses COMPACT_THRESHOLD_PCT of CONTEXT_WINDOW)
@@ -117,6 +119,7 @@ COMPACT_TOOL_RESULT_KEEP = 1_500  # chars kept of an elided tool result (head+ta
 COMPACT_DROP_REASONING = True  # stop replaying reasoning_content of old turns
 COMPACT_SUMMARY_LIMIT = 4_000  # chars kept from the generated handoff note
 COMPACT_MAX_ATTEMPTS = 1  # compact-and-retry budget after a reactive overflow
+COMPACT_SUMMARY_TRIMS = 3  # tries at the summarising request, each with a smaller head
 # Said out loud when the summarizing request itself failed: the turns were still
 # dropped (that is what made room), so the session must know the note is missing.
 COMPACT_FALLBACK_NOTE = (
@@ -176,6 +179,10 @@ SESSION_FILES: dict = {}  # conversation key -> the .jsonl it is appending to
 SESSION_SEQ: dict = {}  # conversation key -> next record seq (a stable message id:
 # compaction can later name the turns it replaced by their seq, and a resumed run
 # picks up where the log left off)
+SESSION_MSG_SEQ: dict = {}  # conversation key -> journal seq of each message *in the
+# conversation*, in order (None for a message a rebuild invented, which has no record
+# of its own). It is what lets a compact record name the seqs it replaced.
+COMPACT_STATS: dict = {}  # conversation key -> rounds / turns replaced (/status)
 AGENT_LOG_ID = ""  # delegation chain id of the agent currently running ("" = top level)
 SUBAGENT_CHILDREN: dict = {}  # parent chain id -> how many sub-agent runs it started
 # Server-reported token usage per conversation, keyed by conversation id
@@ -532,15 +539,18 @@ def _session_disable(error) -> None:
         print(colorize(f"{icon('error')} session log disabled: {error}", "error"))
 
 
-def _session_append(key, record: dict) -> None:
-    """Append one record to conversation `key`'s journal. A conversation that was
-    never opened — a test driving run_agent directly, a --no-session-log run — is
-    silently skipped, which is how the journal stays off by default."""
+def _session_append(key, record: dict) -> int:
+    """Append one record to conversation `key`'s journal; returns the seq it got
+    (-1 when nothing was written: logging off, or a conversation never opened).
+
+    A conversation that was never opened — a test driving run_agent directly, a
+    --no-session-log run — is silently skipped, which is how the journal stays off
+    by default."""
     if not SESSION_LOG:
-        return
+        return -1
     path = SESSION_FILES.get(key)
     if not path:
-        return
+        return -1
     seq = SESSION_SEQ.get(key, 0)
     record = {**record, "seq": seq, "ts": _session_stamp()}  # envelope last: a
     # journal field can never be shadowed by a key the server put in the message
@@ -550,8 +560,9 @@ def _session_append(key, record: dict) -> None:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except (OSError, TypeError, ValueError) as e:
         _session_disable(e)
-        return
+        return -1
     SESSION_SEQ[key] = seq + 1
+    return seq
 
 
 def _session_elide(content):
@@ -576,16 +587,22 @@ def _session_elide(content):
     return kept
 
 
-def _session_message(msg: dict, key) -> None:
+def _session_message(msg: dict, key) -> int:
     """Journal one message exactly as the harness replays it to the API (role,
     content, tool_calls, tool_call_id, reasoning_content … whatever the message
-    actually carries)."""
+    actually carries). Returns its seq (-1 if nothing was written) — compaction
+    needs a stable id for the turns it replaces."""
     record = dict(msg)
     if "content" in record:
         record["content"] = _session_elide(record.get("content"))
     record["chars"] = _content_chars(msg.get("content"))
     record["type"] = "message"
-    _session_append(key, record)
+    seq = _session_append(key, record)
+    if seq >= 0:
+        # Positional: this list stays aligned with the conversation itself, so a
+        # compact record can name the exact seqs of the turns it drops.
+        SESSION_MSG_SEQ.setdefault(key, []).append(seq)
+    return seq
 
 
 def _session_messages(messages: list, key) -> None:
@@ -600,6 +617,17 @@ def _session_open(key, path: str, header: dict) -> None:
         return
     SESSION_FILES[key] = path
     SESSION_SEQ[key] = 0
+    SESSION_MSG_SEQ[key] = []
+    try:
+        os.makedirs(SESSION_DIR, exist_ok=True)
+        # A new session owns its file: opening a journal starts it, it does not
+        # continue one that happens to be there (two runs in one file would mix
+        # their records under restarting seqs). Continuations use _session_continue.
+        with open(path, "w", encoding="utf-8"):
+            pass
+    except OSError as e:
+        _session_disable(e)
+        return
     _session_append(key, {
         "harnless": VERSION,
         "session_id": SESSION_ID,
@@ -612,13 +640,16 @@ def _session_open(key, path: str, header: dict) -> None:
     })
 
 
-def _session_continue(key, path: str, start_seq: int, record: dict) -> None:
+def _session_continue(key, path: str, start_seq: int, record: dict, seqs: list = None) -> None:
     """Point conversation `key`'s journal at an already-written file and keep its
     numbering, then mark the continuation in the log itself."""
     if not SESSION_LOG:
         return
     SESSION_FILES[key] = path
     SESSION_SEQ[key] = max(0, start_seq)
+    # Restored messages carry the seqs their records already have: a compaction in
+    # the resumed run names the turns it replaced in the same numbering.
+    SESSION_MSG_SEQ[key] = list(seqs or [])
     _session_append(key, record)
 
 
@@ -686,8 +717,11 @@ def _session_id_of(path: str) -> str:
     return os.path.basename(path)[: -len(".jsonl")]
 
 
-def _session_read(path: str) -> tuple:
-    """Read one journal: (header record, message records in order, last seq)."""
+def _session_read(path: str, kinds: tuple = ("message",)) -> tuple:
+    """Read one journal: (header record, kept records in order, last seq).
+
+    `kinds` picks the record types to keep: the conversation rebuild wants messages
+    only, the sessions tool also wants the compact markers that name a gap."""
     header: dict = {}
     messages = []
     last_seq = -1
@@ -711,7 +745,7 @@ def _session_read(path: str) -> tuple:
                 kind = rec.get("type")
                 if kind == "session" and not header:
                     header = rec
-                elif kind == "message":
+                elif kind in kinds:
                     messages.append(rec)
     except OSError as e:
         _session_disable(e)
@@ -719,8 +753,10 @@ def _session_read(path: str) -> tuple:
     return header, messages, last_seq
 
 
-def _session_rebuild(records: list) -> list:
-    """Turn journal records back into a conversation a server will accept.
+def _session_rebuild_pairs(records: list) -> list:
+    """Turn journal records back into a conversation a server will accept, keeping
+    each message's journal seq beside it (None for a message this rebuild invented,
+    which has no record of its own) — the numbering compaction reports against.
 
     A run recorded mid tool-call is the interesting case: its calls were never
     answered, and a server rejects an assistant message whose tool calls are
@@ -730,27 +766,26 @@ def _session_rebuild(records: list) -> list:
     (an interrupted mid-thinking partial — the server rejects those too). System
     messages are dropped as well: the resumed run supplies its own.
     """
-    messages = []
+    pairs: list = []  # (seq, message), the conversation in replay order
     pending = []  # tool_call ids the log never answered
 
     def _close_pending():
         for call_id in pending:
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "content": SESSION_UNANSWERED_NOTE,
-                }
-            )
+            pairs.append((None, {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": SESSION_UNANSWERED_NOTE,
+            }))
 
     for rec in records:
         msg = {k: v for k, v in rec.items() if k not in _SESSION_META_KEYS}
+        seq = rec.get("seq") if isinstance(rec.get("seq"), int) else None
         role = msg.get("role")
         if role == "tool":
             call_id = msg.get("tool_call_id")
             if call_id in pending:
                 pending.remove(call_id)
-                messages.append(msg)
+                pairs.append((seq, msg))
             continue  # an answer to a call this rebuild never asked about
         _close_pending()  # the log moved on without answering them
         pending = []
@@ -758,7 +793,7 @@ def _session_rebuild(records: list) -> list:
             continue  # system (and anything unexpected) — the run builds its own
         if role == "assistant" and not msg.get("content") and not msg.get("tool_calls"):
             continue
-        messages.append(msg)
+        pairs.append((seq, msg))
         if role == "assistant":
             pending = [
                 tc.get("id")
@@ -766,7 +801,12 @@ def _session_rebuild(records: list) -> list:
                 if isinstance(tc, dict) and tc.get("id")
             ]
     _close_pending()  # the log ended on an unanswered call
-    return messages
+    return pairs
+
+
+def _session_rebuild(records: list) -> list:
+    """The conversation a journal describes (see _session_rebuild_pairs)."""
+    return [msg for _, msg in _session_rebuild_pairs(records)]
 
 
 def _session_resolve(spec: str) -> tuple:
@@ -814,7 +854,8 @@ def resume_session(spec: str, keep: int = 0, mode: str = "") -> tuple:
         # tool-call batch leaves answers whose call is gone, and _session_rebuild
         # is what drops them.
         records = records[-keep:]
-    messages = _session_rebuild(records)
+    pairs = _session_rebuild_pairs(records)
+    messages = [msg for _, msg in pairs]
     if not messages:
         return None, f"no messages to resume in {os.path.basename(path)}"
     if mode:
@@ -834,11 +875,27 @@ def resume_session(spec: str, keep: int = 0, mode: str = "") -> tuple:
             "model": MODEL,
             "type": "resume",
         },
+        seqs=[seq for seq, _ in pairs],
     )
     note = f"resumed session {SESSION_ID}: {len(messages)} messages from {path}"
     if keep:
         note += f" (kept the last {keep} of {last_seq + 1} records)"
     return messages, note
+
+
+def _session_prepend(msg: dict, key) -> int:
+    """Journal a message being inserted at the *front* of a conversation — the system
+    prompt a resumed run supplies.
+
+    SESSION_MSG_SEQ is positional, so the seq _session_message appended at the end moves
+    to the slot the message actually occupies; left where it was, a later compact record
+    would name the wrong turns."""
+    seq = _session_message(msg, key)
+    entries = SESSION_MSG_SEQ.get(key)
+    if seq >= 0 and entries is not None:
+        entries.pop()
+        entries.insert(0, seq)
+    return seq
 
 
 def format_sessions(limit: int = SESSION_LIST_LIMIT) -> str:
@@ -878,6 +935,657 @@ def format_sessions(limit: int = SESSION_LIST_LIMIT) -> str:
         lines.append(f"  … {len(sessions) - shown} more (increase with the SESSION_LIST_LIMIT constant)")
     lines.append("resume one with: /resume <session-id>  —  or --resume <session-id> at startup")
     return "\n".join(lines)
+
+
+def _record_text(content) -> str:
+    """A content value as plain text (multimodal parts flattened; an image becomes a
+    label) — what the sessions tool prints for a recorded turn."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text":
+                out.append(part.get("text") or "")
+            elif part.get("type") == "image_url":
+                out.append("[image]")
+        return "\n".join(out)
+    return ""
+
+
+def _session_record_line(rec: dict) -> str:
+    """One journal record as a readable transcript line (for the sessions tool).
+
+    A `compact` record prints as the gap it made — which turns, replaced by what — so
+    a model reading the log can see where the conversation was cut and pick up the
+    threads it needs from either side of it."""
+    seq = rec.get("seq")
+    if rec.get("type") == "compact":
+        span = rec.get("replaced") or []
+        span_text = f"seqs {span[0]}-{span[1]}" if len(span) == 2 else "turns"
+        note = (
+            "a handoff note"
+            if rec.get("summary") == "model"
+            else "a placeholder (the summarising request failed)"
+        )
+        return (
+            f"#{seq} [HARNLESS COMPACTED {rec.get('dropped', 0)} turns ({span_text}) into "
+            f"{note} at seq {rec.get('summary_seq')}; reason: {rec.get('reason', '?')}]"
+        )
+    msg = {k: v for k, v in rec.items() if k not in _SESSION_META_KEYS}
+    role = msg.get("role") or "?"
+    head = f"#{seq} {role}"
+    if role == "tool":
+        head += f" (answer to {msg.get('tool_call_id', '?')})"
+    lines = [head]
+    text = _record_text(msg.get("content"))
+    if text:
+        lines.append(
+            _truncate(
+                text,
+                SESSION_RECORD_CHARS,
+                hint="the rest of this turn is in the log file itself",
+            )
+        )
+    for tc in msg.get("tool_calls") or []:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") or {}
+        lines.append(f"    called {fn.get('name', '?')}({_clip_line(fn.get('arguments') or '', 200)})")
+    if msg.get("reasoning_content"):
+        lines.append("    (thinking recorded in the log)")
+    return "\n".join(lines)
+
+
+def _seq_arg(args: dict, key: str, default: int) -> int:
+    """An integer seq argument (a seq can legitimately be 0, so no clamp to 1)."""
+    raw = args.get(key)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def tool_sessions(args: dict) -> str:
+    """Read the session journal: list the recorded sessions, or read turns back out of
+    one — including the turns compaction replaced.
+
+    This is the payoff of journaling every message: a session that compacted itself is
+    not a session that forgot things. The `compact` record names the seqs it replaced,
+    so `read` can fetch the exact turns the handoff note condensed — a fact that went
+    back in the summary is re-readable, not something to re-derive by re-running tools.
+    """
+    action = (args.get("action") or "list").strip().lower()
+    if action == "list":
+        limit = _limit_arg(args, "limit", SESSION_LIST_LIMIT, MAX_COUNT_LIMIT)
+        return _truncate(format_sessions(limit), SESSION_READ_LIMIT,
+                         hint="narrow it with the 'limit' argument")
+    if action not in ("read", "spans", "compactions"):
+        return "error: unknown action (use list, read, or spans)"
+    path, error = _session_resolve(args.get("session") or "latest")
+    if not path:
+        return f"error: {error}"
+    kinds = ("compact",) if action in ("spans", "compactions") else ("message", "compact")
+    header, records, last_seq = _session_read(path, kinds)
+    lo = _seq_arg(args, "from", 0)
+    hi = _seq_arg(args, "to", last_seq)
+    picked = [r for r in records if lo <= int(r.get("seq", 0)) <= hi]
+    if not picked:
+        return (
+            f"no records in {os.path.basename(path)} between seq {lo} and {hi} "
+            f"(this log holds seqs 0-{last_seq}; 'list' shows the other sessions)"
+        )
+    limit = _limit_arg(args, "limit", SESSION_LIST_LIMIT * 2, MAX_COUNT_LIMIT)
+    shown = picked[-limit:] if len(picked) > limit else picked
+    max_chars = _limit_arg(args, "max_chars", SESSION_READ_LIMIT, TOOL_RESULT_LIMIT)
+    title = f"session {_session_id_of(path)} ({path}): records {lo}-{hi}, {len(picked)} found"
+    if action in ("spans", "compactions"):
+        title += f" — {len(picked)} compaction(s)"
+    lines = [title]
+    if len(shown) < len(picked):
+        lines.append(
+            f"(showing the last {limit} of {len(picked)}; earlier seqs start at "
+            f"{picked[0].get('seq')} — ask again with a narrower from/to)"
+        )
+    lines.extend(_session_record_line(r) for r in shown)
+    return _truncate("\n".join(lines), max_chars,
+                     hint="narrow from/to, raise max_chars, or read the .jsonl file directly")
+
+
+# ------------------------------------------------------------ compaction
+
+
+class ContextOverflow(Exception):
+    """The server refused a request because the context is full.
+
+    Raised by `chat`/`stream_chat` in place of the bare HTTP error so the agent loop
+    can tell "compact and retry" from "the API is unhappy about something else"."""
+
+
+# What a rejection has to say to count as "out of context" rather than some other bad
+# request: llama.cpp (n_ctx, context exceeded), OpenAI-compatible servers ('prompt is
+# too long', maximum context length), and the proxies in between word it differently.
+_CONTEXT_OVERFLOW_RE = re.compile(
+    r"n_ctx|context[_ ]length|context[_ ]window|maximum context|context exceeded"
+    r"|too many tokens|prompt is too long|input length|token limit|outside the context",
+    re.IGNORECASE,
+)
+_CONTEXT_OVERFLOW_STATUS = (400, 413, 422)  # rejections worth reading the body of
+
+
+def _context_overflow_reason(exc) -> str:
+    """Why a request was rejected, when it looks like the context being full
+    ('' when it does not). Status plus a snippet: the wording is the server's own,
+    so this is the only place that has to know the shapes the message comes in."""
+    status = getattr(exc, "code", None) or getattr(exc, "status", None) or 0
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        status = 0
+    if status not in _CONTEXT_OVERFLOW_STATUS:
+        return ""
+    try:
+        body = exc.read().decode("utf-8", "replace")  # an HTTPError is its own response
+    except (OSError, AttributeError, ValueError):
+        body = ""
+    text = " ".join((body or str(exc)).split())
+    if not text or not _CONTEXT_OVERFLOW_RE.search(text):
+        return ""
+    return f"HTTP {status}: {text[:300]}{'…' if len(text) > 300 else ''}"
+
+
+def _elision_note(dropped: int) -> str:
+    """Says, inside an elided message, what is missing and where the full text is."""
+    return (
+        f"\n\n[... harnless elided {dropped} chars of this message when compacting the "
+        "session; the full text is in the session log (the sessions tool) ...]\n\n"
+    )
+
+
+def _prune_text(text: str, keep: int) -> tuple:
+    """Shrink a message body to its first and last `keep` characters.
+
+    Returns (text, chars_dropped), where 0 dropped means the body was already small
+    enough to keep whole — pruning what does not need it only adds a confusing note.
+    """
+    if keep <= 0 or len(text) <= keep:
+        return text, 0
+    head = keep // 2
+    tail = keep - head
+    return (
+        text[:head] + _elision_note(len(text) - keep) + (text[-tail:] if tail else ""),
+        len(text) - keep,
+    )
+
+
+def _compact_prune(msg: dict) -> tuple:
+    """A copy of a turn about to be replaced, shrunk for the summarising request.
+
+    Two switchable savings: the middle of an oversized tool result (the megabyte
+    carriers of a session) and the thinking a note replaces instead of replaying. The
+    originals stay in the log — and in the conversation — until this compaction drops
+    them. Returns (message, chars_saved).
+    """
+    out = msg
+    saved = 0
+    if COMPACT_PRUNE_TOOL_RESULTS and msg.get("role") == "tool":
+        text = msg.get("content")
+        if isinstance(text, str):
+            pruned, dropped = _prune_text(text, COMPACT_TOOL_RESULT_KEEP)
+            if dropped:
+                out = dict(msg)
+                out["content"] = pruned
+                saved += dropped
+    if COMPACT_DROP_REASONING and out.get("reasoning_content"):
+        if out is msg:
+            out = dict(out)
+        saved += len(out.get("reasoning_content") or "")
+        out.pop("reasoning_content", None)
+    return out, saved
+
+
+def _compact_tail_prune(messages: list) -> int:
+    """Stop replaying the thinking of turns that are no longer the current one.
+
+    Only the last assistant reply's reasoning can still shape what the agent does next;
+    the rest produced its tool calls and its answer already, and the log has it. Returns
+    the chars taken out of every request from here on.
+    """
+    if not COMPACT_DROP_REASONING or not messages:
+        return 0
+    last_assistant = -1
+    for i, msg in enumerate(messages):
+        if msg.get("role") == "assistant":
+            last_assistant = i
+    saved = 0
+    for i, msg in enumerate(messages):
+        if i == last_assistant or not msg.get("reasoning_content"):
+            continue
+        saved += len(msg.get("reasoning_content") or "")
+        msg.pop("reasoning_content", None)
+    return saved
+
+
+def _system_prefix(messages: list) -> int:
+    """How many leading messages are system prompts — never compacted away."""
+    i = 0
+    while i < len(messages) and messages[i].get("role") == "system":
+        i += 1
+    return i
+
+
+def _msg_tokens(msg: dict) -> int:
+    """What one message costs the next request: content + reasoning + tool arguments."""
+    total = _content_chars(msg.get("content"))
+    total += len(msg.get("reasoning_content") or "")
+    for tc in msg.get("tool_calls") or []:
+        total += len((tc.get("function") or {}).get("arguments") or "")
+    return max(1, total // 4)
+
+
+def _turn_tokens(messages: list) -> int:
+    """What a conversation's *turns* cost (chars/4) — the part compaction can act on.
+
+    Tool schemas and the system prompt are deliberately left out: they ride along with
+    every request no matter how short the conversation is, so measuring them here would
+    make the proactive trigger compact a conversation that is not what filled the
+    context — and then have nothing left to drop. What a request really costs (fixed
+    overhead included) is /status's estimate_context_tokens; a prompt too big for the
+    overhead's sake is the reactive trigger's business, and it says plainly that
+    compaction cannot help."""
+    return sum(_msg_tokens(msg) for msg in messages)
+
+
+def _context_tokens_used(messages: list, conv_key) -> int:
+    """How full this conversation is: what the server last reported for it, or the
+    estimate of its turns (see _turn_tokens)."""
+    usage = USAGE_BY_CONV.get(conv_key)
+    if isinstance(usage, dict) and usage.get("prompt_tokens"):
+        try:
+            return int(usage["prompt_tokens"])
+        except (TypeError, ValueError):
+            pass
+    return _turn_tokens(messages)
+
+
+def _token_scale(used: int, turn_tokens: int) -> float:
+    """How to read our chars/4 costs when the server has its own number for this
+    conversation: (reported / estimated).
+
+    A server counts the chat template, the tool schemas and its own tokenizer, so it
+    routinely reports more than the turns look like they cost. Compaction's tail budget
+    is in the server's units, so the budgets and the per-turn costs have to be compared
+    in one unit — this is the conversion. 1.0 when nothing was reported (then both
+    numbers are the same estimate)."""
+    if used <= 0 or turn_tokens <= 0:
+        return 1.0
+    return used / turn_tokens
+
+
+def _compact_cut(messages: list, keep_tokens: int, scale: float = 1.0) -> int:
+    """Index where the verbatim tail begins (everything after the system prefix that
+    comes before it is replaced by the handoff note).
+
+    Sized by the tail's token budget, floored at COMPACT_KEEP_MIN_MESSAGES so the model
+    always gets some real recent turns rather than only a summary, and nudged off a tool
+    answer: cutting there would keep an answer whose call was dropped — and a server
+    rejects that.
+    """
+    start = _system_prefix(messages)
+    cut = start
+    used = 0.0
+    for i in range(len(messages) - 1, start - 1, -1):
+        used += _msg_tokens(messages[i]) * scale
+        if used > keep_tokens:
+            cut = i + 1
+            break
+    floor = len(messages) - COMPACT_KEEP_MIN_MESSAGES
+    if floor < cut:
+        cut = floor  # never a tail smaller than the floor, however tight the budget
+    if cut < start:
+        cut = start
+    while cut < len(messages) and messages[cut].get("role") == "tool":
+        cut += 1
+    return cut
+
+
+def _fit_head(head: list, budget: int, scale: float = 1.0) -> list:
+    """The newest slice of the head that fits `budget` tokens.
+
+    Trimmed from the old end — a handoff lives on the recent turns — and never starting
+    on a tool answer, whose call would then be missing from the request."""
+    kept = []
+    used = 0.0
+    for msg in reversed(head):
+        cost = _msg_tokens(msg) * scale
+        if kept and used + cost > budget:
+            break
+        kept.append(msg)
+        used += cost
+    kept.reverse()
+    while len(kept) > 1 and kept[0].get("role") == "tool":
+        kept.pop(0)
+    return kept
+
+
+def _session_span(key, start: int, end: int) -> list:
+    """The [first, last] journal seqs of messages[start:end] ([] when none of them has
+    a record of its own — a message a rebuild invented)."""
+    real = [s for s in (SESSION_MSG_SEQ.get(key) or [])[start:end] if isinstance(s, int)]
+    return [real[0], real[-1]] if real else []
+
+
+def _compact_summary(head: list, budget: int, model: str, scale: float = 1.0) -> tuple:
+    """Ask the model for the note that replaces the turns about to be dropped.
+
+    The head is what filled the context, so the request is trimmed to `budget` tokens —
+    in the same units the budget was set in (`scale`, see _token_scale) — and trimmed
+    again if even that was refused. No tools are sent (the note is written, not acted
+    on) and the call is keyed to a throwaway conversation id, so this request never
+    masquerades as the agent's own usage and nothing of its scaffolding is journaled
+    into the transcript. Returns (note, error); an empty note means fall back.
+    """
+    global _NEXT_CONV_ID
+    conv_id = _NEXT_CONV_ID
+    _NEXT_CONV_ID += 1
+    room = max(512, budget)
+    error = ""
+    for _ in range(max(1, COMPACT_SUMMARY_TRIMS)):
+        try:
+            data = chat(
+                [{"role": "system", "content": COMPACT_SUMMARY_PROMPT}]
+                + _fit_head(head, room, scale),
+                model or MODEL,
+                interactive=False,
+                temperature=TEMPERATURE,
+                conv_id=conv_id,
+                send_tools=False,
+            )
+        except ContextOverflow as e:
+            # The head we are trying to summarise is what overflowed: read less of it.
+            error = f"the summarising request was itself too large ({e})"
+            room = max(512, room // 2)
+            continue
+        except (urllib.error.URLError, ConnectionError, OSError) as e:
+            return "", f"the summarising request failed ({e})"
+        except (KeyError, IndexError, TypeError, AttributeError) as e:
+            return "", f"the summarising request returned nothing usable ({e})"
+        finally:
+            USAGE_BY_CONV.pop(conv_id, None)  # not the agent's own usage
+        choices = data.get("choices") or [{}]
+        note = (choices[0].get("message") or {}).get("content") or ""
+        if isinstance(note, str) and note.strip():
+            return note.strip(), ""
+        return "", "the model replied with no note"
+    return "", error or "the summarising request kept being rejected"
+
+
+def _transcript_note(conv_key, span: list) -> str:
+    """Names the transcript a handoff note stands for, inside the conversation itself:
+    the model can ask for the exact turns the note condensed (sessions tool) instead of
+    re-deriving them with fresh tool calls."""
+    if not SESSION_LOG:
+        return "[transcript: not journaled (--no-session-log), so these turns are gone]"
+    path = SESSION_FILES.get(conv_key) or _session_path()
+    replaced = f"seqs {span[0]}-{span[1]}" if len(span) == 2 else "the turns above"
+    return (
+        f"[transcript of this session: {_session_id_of(path)} — what this note replaced "
+        f"({replaced}) is still recorded; the sessions tool reads it back by seq]"
+    )
+
+
+def compact_messages(messages: list, conv_key, model: str = "", reason: str = "manual",
+                     interactive: bool = False) -> tuple:
+    """Replace a conversation's oldest turns with one handoff note the model wrote.
+
+    The head — everything above the verbatim tail — is pruned first (an oversized tool
+    result keeps only its head and tail, old thinking is dropped): that is what makes
+    room for the summarising request, and the tail stops paying for it on every later
+    request too. Then the model rewrites the head (COMPACT_SUMMARY_PROMPT) and the
+    conversation gives it up for that note, marked with COMPACT_SUMMARY_HEADER so the
+    model knows the harness did the cutting rather than the user.
+
+    Nothing is lost for good — every turn was journaled as it entered the conversation,
+    and the `compact` record names the seqs it replaced, so the sessions tool (or a
+    resume) can read them back. A run that keeps its own journal (a sub-agent) keeps its
+    own compact record in it: the record always goes to `conv_key`'s log.
+
+    Returns (compacted, note) — `note` is what the user is told: what was replaced, or
+    why nothing was.
+    """
+    total = len(messages)
+    if total < COMPACT_MIN_MESSAGES:
+        return False, (
+            f"only {total} messages in play — compaction waits for {COMPACT_MIN_MESSAGES} "
+            "before there is worth summarising"
+        )
+    start = _system_prefix(messages)
+    used = _context_tokens_used(messages, conv_key)
+    turn_tokens = _turn_tokens(messages)
+    # What the whole request looked like (tool schemas and system prompt included):
+    # the part compaction cannot touch, recorded next to the part it cut.
+    request_tokens = estimate_context_tokens(messages, interactive)
+    scale = _token_scale(used, turn_tokens)
+    # With no window known (--context-window unset, nothing probed), compare against
+    # what this conversation is actually using instead of a window we don't have.
+    window = CONTEXT_WINDOW if CONTEXT_WINDOW > 0 else max(used, 1)
+    keep_tokens = max(1, window * COMPACT_KEEP_TOKENS_PCT // 100)
+    # The budget is the server's number, the turns are ours: scale reads them in the
+    # same units, so a reported usage of 18k against a 4k-looking conversation cuts
+    # where 18k says it should instead of finding nothing to drop.
+    cut = _compact_cut(messages, keep_tokens, scale)
+    if cut <= start:
+        return False, "nothing is older than the verbatim tail — there is nothing to replace"
+
+    dropped = messages[start:cut]
+    head, pruned = [], 0
+    for msg in dropped:
+        shrunk, saved = _compact_prune(msg)
+        head.append(shrunk)
+        pruned += saved
+    tail_pruned = _compact_tail_prune(messages[cut:])  # the turns that stay, too
+    # Room the summarising request gets: it carries the head it is condensing and the
+    # note it is writing, but not the tail — so what is left after reserving the note
+    # (roughly COMPACT_SUMMARY_LIMIT tokens) is what it may read. _fit_head trims the
+    # oldest turns out of it, and _compact_summary trims again if it is still refused.
+    budget = max(512, window - COMPACT_SUMMARY_LIMIT // 4)
+    note, note_error = _compact_summary(head, budget, model, scale)
+
+    span = _session_span(conv_key, start, cut)
+    summary_msg = {
+        "role": "user",
+        "content": COMPACT_SUMMARY_HEADER
+        + "\n\n"
+        + (
+            _truncate(
+                note,
+                COMPACT_SUMMARY_LIMIT,
+                hint="the full transcript is in the session log (sessions tool)",
+            )
+            if note
+            else COMPACT_FALLBACK_NOTE
+        )
+        + "\n\n"
+        + _transcript_note(conv_key, span),
+    }
+
+    seq_now = SESSION_SEQ.get(conv_key)
+    summary_seq = seq_now + 1 if isinstance(seq_now, int) else None  # this record takes seq_now
+    _session_append(conv_key, {
+        "type": "compact",
+        "reason": reason,
+        "replaced": span,
+        "dropped": len(dropped),
+        "kept": total - len(dropped),
+        "summary_seq": summary_seq,
+        "summary": "model" if note else "fallback",
+        "summary_error": note_error or None,
+        "pruned_chars": pruned + tail_pruned,
+        "window": window,
+        "used_tokens": used,
+        "turn_tokens": turn_tokens,  # what the turns alone looked like (chars/4); the
+        # gap between it and used_tokens is what the server counts on top — the scale
+        # the cut was made with, recorded so a reader can re-derive the cut.
+        "token_scale": round(scale, 3),
+        "request_tokens": request_tokens,  # the whole request, fixed overhead included
+        "keep_tokens": keep_tokens,
+    })
+
+    messages[start:cut] = [summary_msg]
+    written = _session_message(summary_msg, conv_key)
+    entries = SESSION_MSG_SEQ.get(conv_key)
+    if entries is not None:
+        # Keep the seq list aligned with the conversation it describes: the summary
+        # takes the slot the replaced turns occupied.
+        if written >= 0:
+            entries.pop()  # the seq _session_message just appended at the end
+            entries[start:cut] = [written]
+        else:
+            entries[start:cut] = [None]
+
+    stats = COMPACT_STATS.setdefault(conv_key, {"rounds": 0, "dropped": 0})
+    stats["rounds"] += 1
+    stats["dropped"] += len(dropped)
+    # The server's last token count described the conversation *before* the cut, so it
+    # is no evidence about the one we now have — leaving it in place would make the
+    # proactive trigger compact again on every following turn. Until the next reply
+    # reports usage, /status and the trigger fall back to the estimate.
+    USAGE_BY_CONV.pop(conv_key, None)
+
+    report = (
+        f"compacted {len(dropped)} turns into a handoff note: {total} → {len(messages)} "
+        f"messages, {total - cut} kept verbatim"
+    )
+    if pruned or tail_pruned:
+        report += f", {pruned + tail_pruned} chars pruned first"
+    if span:
+        report += f" (transcript seqs {span[0]}–{span[1]} still readable)"
+    if not note:
+        report += f" — {note_error}, so the note is a placeholder; the turns still went"
+    return True, report
+
+
+def _compact_if_needed(messages: list, conv_key, model: str = "", interactive: bool = False) -> bool:
+    """Proactive trigger: compact before the next request once this conversation's
+    turns cross COMPACT_THRESHOLD_PCT of the window, rather than waiting for the server
+    to refuse the request (what the server reported for it wins when it has said so —
+    see _context_tokens_used for what is measured and why the fixed overhead is left
+    out).
+
+    Says what it did (or, once per conversation, why it is stuck) so a session that
+    compacts itself is visible instead of mysterious. Returns whether it compacted.
+    """
+    if not AUTO_COMPACT or CONTEXT_WINDOW <= 0:
+        return False  # no window to compare against: the reactive trigger covers that
+    used = _context_tokens_used(messages, conv_key)
+    threshold = max(1, CONTEXT_WINDOW * COMPACT_THRESHOLD_PCT // 100)
+    if used < threshold:
+        return False
+    ok, note = compact_messages(
+        messages, conv_key, model=model, reason="proactive", interactive=interactive
+    )
+    if ok:
+        print(OUTPUT_INDENT + colorize(f"{icon('wait')} {note}", "dim"))
+        return True
+    stats = COMPACT_STATS.setdefault(conv_key, {"rounds": 0, "dropped": 0, "warned": False})
+    if not stats.get("warned"):
+        # Said once: the threshold will keep being crossed from here, and repeating the
+        # same refusal every turn is noise.
+        stats["warned"] = True
+        print(
+            OUTPUT_INDENT
+            + colorize(
+                f"{icon('wait')} context is {used}/{CONTEXT_WINDOW} tokens but not compacting: {note}",
+                "dim",
+            )
+        )
+    return False
+
+
+def _recover_overflow(messages: list, conv_key, model: str, reason: str,
+                      attempts: int, interactive: bool = False) -> bool:
+    """Reactive trigger: the server rejected the prompt for being too long. Compact and
+    let the caller retry the turn — up to COMPACT_MAX_ATTEMPTS times, which is why the
+    caller counts them.
+
+    The rejection is said out loud first (`reason` is the server's own wording): a
+    session that silently re-sent a shrunken prompt is hard to trust afterwards.
+    Returns False when the run is genuinely out of context: the attempts are spent, or
+    there is nothing left that compaction could drop.
+    """
+    if attempts >= COMPACT_MAX_ATTEMPTS:
+        return False
+    if not AUTO_COMPACT:
+        print(
+            OUTPUT_INDENT
+            + colorize(f"{icon('wait')} context is full ({reason}) and auto-compaction is off — /compact to make room", "dim")
+        )
+        return False
+    print(OUTPUT_INDENT + colorize(f"{icon('wait')} the server rejected the prompt: {reason}", "error"))
+    ok, note = compact_messages(
+        messages, conv_key, model=model, reason="overflow", interactive=interactive
+    )
+    if not ok:
+        print(
+            OUTPUT_INDENT
+            + colorize(f"{icon('error')} context is full and compaction cannot help: {note}", "error")
+        )
+        return False
+    print(OUTPUT_INDENT + colorize(f"{icon('wait')} {note} — retrying the request", "tool"))
+    return True
+
+
+def _transcript_hint(conv_key) -> str:
+    """Tells a stranded run where its transcript still is (out-of-context report)."""
+    if not SESSION_LOG:
+        return "the transcript was not journaled (--no-session-log), so there is nothing to read back"
+    path = SESSION_FILES.get(conv_key) or _session_path()
+    return (
+        f"the transcript is in {path}: read the turns that were dropped with the sessions "
+        f"tool, or continue this session with --resume {_session_id_of(path)}"
+    )
+
+
+def set_auto_compact(arg: str) -> str:
+    """Apply an /auto-compact argument; return the status line to print ('' = unknown)."""
+    global AUTO_COMPACT, COMPACT_THRESHOLD_PCT
+    v = arg.strip().lower()
+    if v in ("on", "true", "yes", "1"):
+        AUTO_COMPACT = True
+        return f"auto-compact on — compaction starts at {COMPACT_THRESHOLD_PCT}% of the window"
+    if v in ("off", "false", "no", "0"):
+        AUTO_COMPACT = False
+        return "auto-compact off — only /compact (and a rejected request) will compact"
+    if v.startswith("threshold"):
+        rest = v[len("threshold"):].strip()
+        try:
+            COMPACT_THRESHOLD_PCT = _clamp_int(int(rest), 1, COMPACT_THRESHOLD_CEILING)
+        except ValueError:
+            return ""
+        return f"auto-compact threshold: {COMPACT_THRESHOLD_PCT}% of the context window"
+    if not v:
+        return (
+            f"auto-compact {'on' if AUTO_COMPACT else 'off'} at "
+            f"{COMPACT_THRESHOLD_PCT}% of the window (/auto-compact on|off|threshold N)"
+        )
+    return ""
+
+
+def format_compaction() -> str:
+    """The /status line on compaction: what it would do, and what it already did."""
+    window = f"{CONTEXT_WINDOW} tokens" if CONTEXT_WINDOW > 0 else "window unknown"
+    rounds = sum(int(s.get("rounds", 0)) for s in COMPACT_STATS.values())
+    dropped = sum(int(s.get("dropped", 0)) for s in COMPACT_STATS.values())
+    done = f"{rounds} round(s), {dropped} turns replaced" if rounds else "no compactions yet"
+    return (
+        f"compaction: auto-compact {'on' if AUTO_COMPACT else 'off'} at "
+        f"{COMPACT_THRESHOLD_PCT}% of {window}, tail keeps {COMPACT_KEEP_TOKENS_PCT}% of it "
+        f"({COMPACT_KEEP_MIN_MESSAGES} messages minimum); {done}; /compact to do it now"
+    )
 
 
 # ---------------------------------------------------------------- tools
@@ -1711,6 +2419,8 @@ def tool_task(args: dict) -> str:
         # key is free again (an id() fallback could otherwise land on it later).
         SESSION_FILES.pop(conv_id, None)
         SESSION_SEQ.pop(conv_id, None)
+        SESSION_MSG_SEQ.pop(conv_id, None)
+        COMPACT_STATS.pop(conv_id, None)
         SUBAGENT_CHILDREN.pop(log_id, None)
         # An `exit(message=...)` argument is the sub-agent's own closing
         # statement: _agent_loop prints it, and only here does it reach the
@@ -2543,6 +3253,52 @@ TOOLS = {
             },
         },
         tool_ask_user,
+    ),
+    "sessions": (
+        {
+            "type": "function",
+            "function": {
+                "name": "sessions",
+                "description": (
+                    "Read the session journal. Every turn of every session is journaled to a .jsonl log, so the "
+                    "turns context compaction replaced are still readable: 'list' the recorded sessions, 'spans' "
+                    "for a session's compactions (the journal seq ranges they replaced), or 'read' the recorded "
+                    "turns of a seq range. Use it to recover something a compacted-away search already found "
+                    "instead of searching again."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "description": "'list' (default), 'spans', or 'read'",
+                        },
+                        "session": {
+                            "type": "string",
+                            "description": "Which log: a session id, an '<id>.<chain>' sub-agent log, 'latest' (default), or a path to a .jsonl file",
+                        },
+                        "from": {
+                            "type": "integer",
+                            "description": "First journal seq to read (inclusive; default 0)",
+                        },
+                        "to": {
+                            "type": "integer",
+                            "description": "Last journal seq to read (inclusive; default the end of that log)",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max records to return (default 60; the last N of the range are shown)",
+                        },
+                        "max_chars": {
+                            "type": "integer",
+                            "description": "Max characters of transcript text (default 30000, max 60000)",
+                        },
+                    },
+                    "required": [],
+                },
+            },
+        },
+        tool_sessions,
     ),
     "exit": (
         {
@@ -4211,15 +4967,16 @@ def chat(
     interactive: bool = False,
     temperature: float = 1.0,
     conv_id: int = None,
+    send_tools: bool = True,
 ) -> dict:
     payload = json.dumps(
-        {
-            "model": model,
-            "messages": messages,
-            "tools": _active_tools(interactive),
-            "tool_choice": "auto",
-            "temperature": temperature,
-        }
+        _request_body(
+            messages,
+            model,
+            interactive=interactive,
+            temperature=temperature,
+            send_tools=send_tools,
+        )
     ).encode("utf-8")
     req = urllib.request.Request(API_URL, data=payload, headers=_headers())
     spinner = ContextProgress(messages, interactive)
@@ -4227,10 +4984,43 @@ def chat(
     try:
         with _open_request(req, spinner if spinner.active else None) as resp:
             data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        # A prompt the server refuses because it is too long is something the agent can
+        # act on — compact and retry. Anything else stays the error it was.
+        reason = _context_overflow_reason(e)
+        if reason:
+            raise ContextOverflow(reason) from e
+        raise
     finally:
         spinner.stop()
     _record_usage(messages, data.get("usage"), conv_id)
     return data
+
+
+def _request_body(
+    messages: list,
+    model: str,
+    stream=None,
+    interactive: bool = False,
+    temperature: float = 1.0,
+    send_tools: bool = True,
+) -> dict:
+    """What a chat request sends.
+
+    `stream=None` (the non-streaming call) omits the key entirely; `send_tools=False`
+    leaves `tools` and `tool_choice` out — a request whose job is to write something,
+    like a compaction handoff note, must not be one the server answers with a tool call.
+    """
+    body: dict = {"model": model, "messages": messages, "temperature": temperature}
+    if send_tools:
+        body["tools"] = _active_tools(interactive)
+        body["tool_choice"] = "auto"
+    if stream is not None:
+        body["stream"] = stream
+        if stream:
+            # Ask for a final usage chunk so /status can show exact token counts.
+            body["stream_options"] = {"include_usage": True}
+    return body
 
 
 def _build_request(
@@ -4239,19 +5029,18 @@ def _build_request(
     stream: bool,
     interactive: bool = False,
     temperature: float = 1.0,
+    send_tools: bool = True,
 ) -> urllib.request.Request:
-    body = {
-        "model": model,
-        "messages": messages,
-        "tools": _active_tools(interactive),
-        "tool_choice": "auto",
-        "temperature": temperature,
-        "stream": stream,
-    }
-    if stream:
-        # Ask for a final usage chunk so /status can show exact token counts.
-        body["stream_options"] = {"include_usage": True}
-    payload = json.dumps(body).encode("utf-8")
+    payload = json.dumps(
+        _request_body(
+            messages,
+            model,
+            stream,
+            interactive=interactive,
+            temperature=temperature,
+            send_tools=send_tools,
+        )
+    ).encode("utf-8")
     return urllib.request.Request(API_URL, data=payload, headers=_headers())
 
 
@@ -4304,6 +5093,15 @@ def stream_chat(
     )
     try:
         resp_cm = _open_request(req, progress, watcher.attach_socket if watcher else None)
+    except urllib.error.HTTPError as e:
+        # Refused before the stream even started: if it is a size rejection, raise the
+        # thing the agent loop knows how to recover from.
+        reason = _context_overflow_reason(e)
+        if reason:
+            raise ContextOverflow(reason) from e
+        if watcher is None or not watcher.triggered:
+            raise
+        return
     except (OSError, http.client.HTTPException):
         # An interrupt during the context send closes the socket, which
         # surfaces as a send error; swallow it only when the interrupt
@@ -5176,6 +5974,7 @@ def format_status(messages: list, context_window: int = 0, conv_id: int = None) 
         f"api url: {API_URL}",
         f"tools: {tool_names}",
         f"session: {SESSION_ID or '(no session id)'}  {_session_note()}",
+        format_compaction(),
     ]
     if MCP_CLIENTS:
         mcp_lines = []
@@ -5195,6 +5994,8 @@ REPL_COMMANDS = [
     ("/status", "show context usage, api url, and tools"),
     ("/sessions", "list the recorded session logs"),
     ("/resume", "continue a recorded session: /resume <session-id> (no argument lists them)"),
+    ("/compact", "replace this session's older turns with a handoff note now"),
+    ("/auto-compact", "on|off, or 'threshold N': compact automatically as the context fills up"),
     ("/tools", "interactive tool menu: up/down move, space toggle, enter apply, esc cancel"),
     ("/auto-send", "on: Enter submits (default); off: Enter inserts a newline, Ctrl+Enter sends"),
     ("/help", "show this help"),
@@ -5392,61 +6193,90 @@ def _agent_loop(
             )
             messages.append({"role": "user", "content": STEP_LIMIT_CLOSE_PROMPT})
             _session_message(messages[-1], conv_key)
+        # Make room before asking, not after the server refuses: compact when this
+        # conversation's usage has crossed the threshold of the window.
+        _compact_if_needed(messages, conv_key, model, interactive)
         steps += 1
-        message = None
-        streamed = False
-        try:
-            message, streamed = stream_once(
-                messages,
-                model,
-                interactive=interactive,
-                temperature=temperature,
-                conv_id=conv_id,
-            )
-            if not streamed:
-                message = None
-        except StreamInterrupted as e:
-            # Keep the partial output (minus any half-formed tool calls,
-            # which would leave the conversation in an invalid state) so
-            # the model can see what it had said, then back out. Partials
-            # without content (e.g. interrupted mid-thinking) are dropped:
-            # servers reject assistant messages that have neither content
-            # nor tool_calls, which would break every later request.
-            message = e.message
-            message.pop("tool_calls", None)
-            if message.get("content"):
-                messages.append(message)
-                _session_message(message, conv_key)  # what was said before the stop
-            if is_subagent:
-                # Hand the stop to whoever delegated us: tool_task turns it
-                # into a stopped-sub-agent result and re-raises, so the whole
-                # chain halts instead of resuming with half the work done.
-                raise
-            return 0
-        except (urllib.error.URLError, ConnectionError, OSError) as e:
-            print(
-                OUTPUT_INDENT
-                + colorize(
-                    f"{icon('error')} streaming failed ({e}); retrying non-streaming",
-                    "error",
-                )
-            )
-        if message is None:
+        # A rejected-for-size prompt gets retried after compacting — one turn either
+        # way, so `steps` counts it once, and `attempts` is how many times compaction
+        # has already been given a shot at this request.
+        attempts = 0
+        while True:
+            message = None
+            streamed = False
             try:
-                data = chat(
+                message, streamed = stream_once(
                     messages,
                     model,
                     interactive=interactive,
                     temperature=temperature,
                     conv_id=conv_id,
                 )
-            except urllib.error.URLError as e:
+                if not streamed:
+                    message = None
+            except ContextOverflow as e:
+                if not _recover_overflow(messages, conv_key, model, str(e), attempts, interactive):
+                    print(
+                        OUTPUT_INDENT
+                        + colorize(f"{icon('error')} out of context ({e}) — this run stops here", "error")
+                    )
+                    print(OUTPUT_INDENT + colorize(_transcript_hint(conv_key), "dim"))
+                    return CONTEXT_OVERFLOW_CODE
+                attempts += 1
+                continue
+            except StreamInterrupted as e:
+                # Keep the partial output (minus any half-formed tool calls,
+                # which would leave the conversation in an invalid state) so
+                # the model can see what it had said, then back out. Partials
+                # without content (e.g. interrupted mid-thinking) are dropped:
+                # servers reject assistant messages that have neither content
+                # nor tool_calls, which would break every later request.
+                message = e.message
+                message.pop("tool_calls", None)
+                if message.get("content"):
+                    messages.append(message)
+                    _session_message(message, conv_key)  # what was said before the stop
+                if is_subagent:
+                    # Hand the stop to whoever delegated us: tool_task turns it
+                    # into a stopped-sub-agent result and re-raises, so the whole
+                    # chain halts instead of resuming with half the work done.
+                    raise
+                return 0
+            except (urllib.error.URLError, ConnectionError, OSError) as e:
                 print(
                     OUTPUT_INDENT
-                    + colorize(f"{icon('error')} connection error: {e}", "error")
+                    + colorize(
+                        f"{icon('error')} streaming failed ({e}); retrying non-streaming",
+                        "error",
+                    )
                 )
-                return 1
-            message = data["choices"][0]["message"]
+            if message is None:
+                try:
+                    data = chat(
+                        messages,
+                        model,
+                        interactive=interactive,
+                        temperature=temperature,
+                        conv_id=conv_id,
+                    )
+                except ContextOverflow as e:
+                    if not _recover_overflow(messages, conv_key, model, str(e), attempts, interactive):
+                        print(
+                            OUTPUT_INDENT
+                            + colorize(f"{icon('error')} out of context ({e}) — this run stops here", "error")
+                        )
+                        print(OUTPUT_INDENT + colorize(_transcript_hint(conv_key), "dim"))
+                        return CONTEXT_OVERFLOW_CODE
+                    attempts += 1
+                    continue
+                except urllib.error.URLError as e:
+                    print(
+                        OUTPUT_INDENT
+                        + colorize(f"{icon('error')} connection error: {e}", "error")
+                    )
+                    return 1
+                message = data["choices"][0]["message"]
+            break
         messages.append(message)
         _session_message(message, conv_key)  # the model's answer, as recorded
 
@@ -5554,6 +6384,7 @@ def main():
     global API_URL, API_KEY, MODEL, TEMPERATURE, MAX_SUBAGENT_DEPTH, VISION_ENABLED
     global INTERRUPT_ENABLED, SHELL_PREFERRED, SUBAGENT_STEP_LIMIT
     global SESSION_LOG, SESSION_DIR, SESSION_MODE
+    global AUTO_COMPACT, COMPACT_THRESHOLD_PCT, CONTEXT_WINDOW
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[reportAttributeAccessIssue]
@@ -5622,7 +6453,23 @@ def main():
         "--context-window",
         type=int,
         default=0,
-        help="model context window size in tokens, shown as a percentage in /status (0 = not shown)",
+        help="model context window size in tokens, shown as a percentage in /status (0 = not shown; default: probed from the API)",
+    )
+    parser.add_argument(
+        "--no-auto-compact",
+        action="store_true",
+        help=(
+            "do not compact the conversation automatically when the context fills up "
+            "(a rejected-for-size prompt then ends the run with exit code 3; /compact "
+            "still works)"
+        ),
+    )
+    parser.add_argument(
+        "--compact-threshold",
+        type=int,
+        default=COMPACT_THRESHOLD_PCT,
+        metavar="PCT",
+        help=f"auto-compact once usage reaches this percentage of the context window (default: {COMPACT_THRESHOLD_PCT}, max {COMPACT_THRESHOLD_CEILING})",
     )
     parser.add_argument(
         "--no-session-log",
@@ -5712,10 +6559,15 @@ def main():
     SESSION_LOG = not args.no_session_log
     if args.sessions_dir:
         SESSION_DIR = os.path.abspath(os.path.expanduser(args.sessions_dir))
+    AUTO_COMPACT = not args.no_auto_compact
+    COMPACT_THRESHOLD_PCT = _clamp_int(args.compact_threshold, 1, COMPACT_THRESHOLD_CEILING)
 
     context_window = args.context_window
     if context_window == 0 and args.prompt is None:
         context_window = probe_context_window()
+    # The compaction triggers compare against this: 0 (no flag, nothing probed) means
+    # no proactive compaction — the reactive one still fires if the server complains.
+    CONTEXT_WINDOW = max(0, int(context_window or 0))
 
     set_color_enabled(not args.no_color and color_enabled())
     set_emoji_enabled(not args.no_emoji and _stdout_can_encode_emoji())
@@ -5806,7 +6658,7 @@ def main():
         messages = [{"role": "system", "content": system_prompt}]
     # The log starts where the conversation does. Restored messages are not
     # re-journaled: the file is one continuous transcript, not a copy per resume.
-    _session_message(messages[0], MAIN_CONV_ID)
+    _session_prepend(messages[0], MAIN_CONV_ID)
 
     if args.prompt is not None:
         print(colorize(f"harnless {VERSION} one-shot in {CWD} (api: {API_URL})", "dim"))
@@ -5866,7 +6718,7 @@ def main():
                 print(colorize(f"{icon('error')} {note}", "error"))
                 continue
             messages = [{"role": "system", "content": system_prompt}] + resumed
-            _session_message(messages[0], MAIN_CONV_ID)
+            _session_prepend(messages[0], MAIN_CONV_ID)
             print(colorize(note, "dim"))
             continue
         if user_input == "/clear-screen":
@@ -5896,6 +6748,19 @@ def main():
                         print(colorize(f"{icon('error')} unknown tool: {name}", "error"))
                     else:
                         print(colorize(f"{name}: {state}", "dim"))
+            continue
+        if user_input == "/auto-compact" or user_input.startswith("/auto-compact "):
+            msg = set_auto_compact(user_input[len("/auto-compact"):])
+            if msg:
+                print(colorize(msg, "dim"))
+            else:
+                print(colorize("usage: /auto-compact on|off|threshold N", "error"))
+            continue
+        if user_input == "/compact":
+            ok, note = compact_messages(
+                messages, MAIN_CONV_ID, model=args.model, reason="manual", interactive=True
+            )
+            print(colorize(note, "dim" if ok else "error"))
             continue
         if user_input == "/auto-send" or user_input.startswith("/auto-send "):
             msg = set_auto_send(user_input[len("/auto-send"):])

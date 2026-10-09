@@ -15,6 +15,7 @@ Pure Python standard library — **no dependencies, no venv, no build step**.
 - **Sub-agents** — the `task` tool delegates self-contained work to a nested agent (configurable depth) and hands the result back as the sub-agent's closing summary
 - **State tools** — `todo` (task list) and `memory` (persistent notes) survive across turns
 - **Session log** — every message of a conversation is journaled as JSON Lines under `.harnless/sessions/` (each sub-agent run in its own file), and `--resume` / `/resume` continues a recorded session
+- **Context compaction** — when the context fills up, the oldest turns are replaced by one handoff note the model wrote; the turns it replaced stay readable in the session log (the `sessions` tool reads them back by `seq`)
 - **Streaming** — token-by-token output with Markdown rendering; press `ESC` twice to interrupt a running generation (it stops sub-agents and their parents too)
 - **MCP support** — plug in external tools via [Model Context Protocol](https://modelcontextprotocol.io) servers (stdio or HTTP)
 - **Standalone binaries** — build a self-contained executable for Windows, Linux, or macOS with Nuitka
@@ -51,6 +52,8 @@ python harnless.py --prompt "summarize the files in this directory"
 | `/status` | Show context usage, model, enabled tools, and MCP servers |
 | `/sessions` | List the recorded session logs (newest first) |
 | `/resume <id>` | Continue a recorded session (`/resume` with no argument lists them) |
+| `/compact` | Replace this session's older turns with a handoff note now |
+| `/auto-compact on\|off\|threshold N` | Switch automatic compaction, or set the percentage of the window it starts at |
 | `/exit` | Quit (alias: `/quit`) |
 
 Other REPL behaviors:
@@ -61,7 +64,10 @@ Other REPL behaviors:
 
 ### One-shot mode
 
-`python harnless.py --prompt "task"` runs the agent to completion and exits with its exit code.
+`python harnless.py --prompt "task"` runs the agent to completion and exits with its exit code:
+`0` finished, `1` a connection/API failure (or a `--resume` that matched nothing), `3` out of
+context and compaction could not help — plus whatever code the agent's own `exit` call asked for
+(`4` is what a step-limited sub-agent reports to whoever delegated it).
 
 ### CLI options
 
@@ -76,6 +82,8 @@ Other REPL behaviors:
 | `--max-subagent-steps N` | Model turns a single sub-agent may take before its run is stopped (default `40`; `0` = unlimited; top-level agents are never capped) |
 | `--shell MODE` | Windows shell for `run_shell`: `auto` / `pwsh` / `powershell` / `cmd` (default `auto`, ignored off-Windows) |
 | `--context-window N` | Context window size in tokens (shown in `/status`); probed from the API's `/models` endpoint if omitted |
+| `--no-auto-compact` | Do not compact the conversation automatically (a rejected-for-size prompt then ends the run with exit code 3; `/compact` still works) |
+| `--compact-threshold PCT` | Auto-compact once the conversation reaches this percentage of the context window (default `85`, max `99`) |
 | `--sessions-dir DIR` | Where session logs are written (default `.harnless/sessions`, or `HARNLESS_SESSIONS_DIR`) |
 | `--no-session-log` | Do not journal the session |
 | `--resume SPEC` | Continue a recorded session: a session id, a `"<id>.<chain>"` sub-agent log, `latest`, or a path to a `.jsonl` |
@@ -100,15 +108,16 @@ The dotted chain id in a sub-agent file says who delegated it. Each line is one 
 | `session` | First line: version, session id, mode, cwd, API URL, model — and for a sub-agent log, its `depth`, `subagent_id`, `parent_log` and the `task` text it was given |
 | `message` | One message: `role`, `content`, `tool_calls`, `tool_call_id`, `reasoning_content`, plus the harness envelope (`seq`, `ts`, `chars`) |
 | `usage` | One per model call: message count and the server-reported token usage (how full the context was at that point) |
+| `compact` | Written when context compaction replaces older turns: the `replaced` seq range, `dropped`/`kept` counts, `summary_seq` (the handoff note's own record), whether the note came from the model or is a fallback placeholder, `pruned_chars`, and the token numbers the cut was made with (`window`, `used_tokens`, `turn_tokens`, `token_scale`, `keep_tokens`) |
 | `end` | How a sub-agent's run ended: its exit code, `interrupted`, `step_limited` |
 | `resume` / `cleared` | Written when a log is resumed or when `/new` starts a new session |
 
-`seq` numbers a conversation's records from 0 and keeps counting across a resume — a
-stable id for each message, which is what a later compaction pass refers to. Inline
-images (`@[cwd://img.png]`) are recorded as a note naming them rather than as base64
-megabytes (`chars` still reports their real size). A log that cannot be written is
-dropped with one warning and the session continues without it. Nothing is written when
-`--no-session-log` is given.
+`seq` numbers a conversation's records from 0 and keeps counting across a resume and across a
+compaction — a stable id for each message, which is what a `compact` record names the replaced
+turns with. Inline images (`@[cwd://img.png]`) are recorded as a note naming them rather than as
+base64 megabytes (`chars` still reports their real size). A log that cannot be written is dropped
+with one warning and the session continues without it. Nothing is written when `--no-session-log`
+is given.
 
 **Resuming** (`--resume <id|latest|path>`, or `/resume <id>` in the REPL) reads such a
 file back and continues that conversation: the recorded turns are replayed, the *system
@@ -118,6 +127,44 @@ rebuilt conversation is one a server will accept. The resumed run keeps appendin
 same file — one continuous transcript, restored messages not recorded a second time.
 `--resume-last N` cuts the tail off a long session before rebuilding it (a cut landing
 inside a tool-call batch drops the orphaned answer). `/sessions` lists what is recorded.
+
+### Context compaction
+
+When the context fills up, the oldest turns are replaced by one note the model wrote from them,
+and the recent turns stay exactly as they were:
+
+```
+system prompt                kept
+[harnless handoff note]      the model's summary of everything below the cut
+… recent turns …             kept verbatim
+```
+
+Two things trigger it:
+
+- **proactively**, before the next request, once the conversation crosses `--compact-threshold`
+  percent of the context window — measured as what the server last reported for that conversation,
+  or an estimate of its *turns* when it has not reported anything; the tool schemas and system
+  prompt ride along with every request either way, so they are not what this trigger watches
+  (compaction cannot shrink them);
+- **reactively**, when the server rejects a prompt as too long: the rejection is printed with the
+  server's own wording, the conversation is compacted, and the request is retried (`/compact` does
+  the same on demand, `--no-auto-compact` or `/auto-compact off` turns the automatic ones off).
+
+Before the summarising request is made, the turns about to go are shrunk: an oversized tool result
+keeps its first and last characters with a note about what was elided, and thinking that already
+produced its turn stops being replayed. If the summarising request itself fails, the turns still
+go — that is what made the room — and a placeholder stands in for the note, said out loud and
+recorded.
+
+Nothing is lost for good. Every turn was journaled when it entered the conversation, and the
+`compact` record names the seqs it replaced, so the **`sessions`** tool can read them back: `list`
+the recorded logs, `spans` for a session's compactions and the ranges they replaced, `read` the
+transcript of a seq range (a `compact` record shows up in a read as the gap it made). A handoff
+note in the conversation names the session and the range it stands for, so the agent can look a
+fact up instead of re-running the tool that already found it.
+
+A sub-agent compacts its own run in its own log. If a prompt is still too big after the one
+compaction attempt, the run stops with exit code `3` and says where the transcript is.
 
 ### MCP servers
 
@@ -134,7 +181,7 @@ A server entry may set `"enabled": false` to skip connecting it at startup (it c
 
 Built-in tools: `get_cwd`, `run_shell`, `mkdir`, `read_file`, `write_file`, `patch_file`,
 `grep`, `glob`, `list_dir`, `delete_file`, `move_file`, `copy_file`, `fetch_url`, `todo`,
-`memory`, `task`, `ask_user`, `exit`.
+`memory`, `task`, `ask_user`, `sessions`, `exit`.
 
 All file paths are relative to the working directory and sandboxed to it. An `AGENTS.md`
 in the working directory (case-insensitive) is auto-loaded and appended to the system prompt.
