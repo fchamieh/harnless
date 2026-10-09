@@ -22,7 +22,7 @@ import urllib.error
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 API_URL = "http://127.0.0.1:11434/v1/chat/completions"
 API_KEY = None
 MODEL = "local-model"
@@ -881,6 +881,25 @@ def resume_session(spec: str, keep: int = 0, mode: str = "") -> tuple:
     if keep:
         note += f" (kept the last {keep} of {last_seq + 1} records)"
     return messages, note
+
+
+def _resume_target(resume, resume_last) -> tuple:
+    """What the resume flags ask for: (spec, keep, implied).
+
+    Normally --resume names the session and --resume-last only trims it. Given on
+    its own, --resume-last is the shorthand for "continue where I left off": it
+    supplies spec 'latest' (no value = keep everything, N = keep the last N).
+    `implied` marks that shorthand, and main() treats a miss accordingly: a newest
+    session that isn't there is a soft miss (say so, start fresh), while a session
+    the user named by id is not (that fails the run).
+    """
+    named = (resume or "").strip()
+    implied = not named and resume_last is not None
+    return (
+        named or ("latest" if implied else ""),
+        _clamp_int(resume_last or 0, 0, SESSION_KEEP_CEILING),
+        implied,
+    )
 
 
 def _session_prepend(msg: dict, key) -> int:
@@ -6497,9 +6516,15 @@ def main():
     parser.add_argument(
         "--resume-last",
         type=int,
-        default=0,
+        nargs="?",
+        const=0,
+        default=None,
         metavar="N",
-        help=f"with --resume: keep only the last N recorded messages of that session (0 = all, max {SESSION_KEEP_CEILING})",
+        help=(
+            f"continue the newest recorded session, keeping only its last N "
+            f"messages (no value or 0 = all, max {SESSION_KEEP_CEILING}); "
+            f"with --resume it only trims that session"
+        ),
     )
     parser.add_argument(
         "--no-color",
@@ -6639,23 +6664,28 @@ def main():
         system_prompt += "\n\n" + additions
     _todo_load()
     SESSION_MODE = "one-shot" if args.prompt is not None else "interactive"
-    if args.resume:
-        resumed, note = resume_session(
-            args.resume,
-            keep=_clamp_int(args.resume_last, 0, SESSION_KEEP_CEILING),
-            mode=SESSION_MODE,
-        )
-        if resumed is None:
-            print(colorize(f"{icon('error')} {note}", "error"))
-            sys.exit(1)
+    resume_spec, resume_keep, resume_implied = _resume_target(args.resume, args.resume_last)
+    resumed = None  # restored messages; None means this run starts fresh
+    if resume_spec:
+        restored, note = resume_session(resume_spec, keep=resume_keep, mode=SESSION_MODE)
+        if restored is None:
+            if not resume_implied:
+                print(colorize(f"{icon('error')} {note}", "error"))
+                sys.exit(1)
+            # --resume-last on its own asks for whoever was here last; when nobody
+            # was, that is not an error — say so and open a new session instead.
+            print(colorize(f"{icon('wait')} {note} — starting a new session", "dim"))
+        else:
+            resumed = restored
+            print(colorize(note, "dim"))
+    if resumed is None:
+        start_session(SESSION_MODE)
+        messages = [{"role": "system", "content": system_prompt}]
+    else:
         # The transcript comes back; the system prompt does not. The resumed run
         # describes itself as it is now (this version, current AGENTS.md, current
         # memory notes) instead of replaying what an older run was told.
         messages = [{"role": "system", "content": system_prompt}] + resumed
-        print(colorize(note, "dim"))
-    else:
-        start_session(SESSION_MODE)
-        messages = [{"role": "system", "content": system_prompt}]
     # The log starts where the conversation does. Restored messages are not
     # re-journaled: the file is one continuous transcript, not a copy per resume.
     _session_prepend(messages[0], MAIN_CONV_ID)

@@ -87,7 +87,7 @@ context and compaction could not help — plus whatever code the agent's own `ex
 | `--sessions-dir DIR` | Where session logs are written (default `.harnless/sessions`, or `HARNLESS_SESSIONS_DIR`) |
 | `--no-session-log` | Do not journal the session |
 | `--resume SPEC` | Continue a recorded session: a session id, a `"<id>.<chain>"` sub-agent log, `latest`, or a path to a `.jsonl` |
-| `--resume-last N` | With `--resume`: keep only the last N recorded messages of that session (0 = all) |
+| `--resume-last [N]` | Continue the **newest** recorded session, keeping only its last N messages (no value or `0` = all). With `--resume` it only trims that session. Nothing recorded yet → warns and starts a fresh session |
 | `--version` | Print the version and exit |
 
 ### Session log
@@ -125,8 +125,12 @@ prompt is not* (the new run supplies its own, with the current AGENTS.md and mem
 notes), and any tool call the log left unanswered gets a note as its answer, so the
 rebuilt conversation is one a server will accept. The resumed run keeps appending to the
 same file — one continuous transcript, restored messages not recorded a second time.
-`--resume-last N` cuts the tail off a long session before rebuilding it (a cut landing
-inside a tool-call batch drops the orphaned answer). `/sessions` lists what is recorded.
+`--resume-last [N]` cuts a long session down to its last N records before rebuilding it (a cut
+landing inside a tool-call batch drops the orphaned answer) — and on its own it is how you say
+"continue where I left off" without looking up an id: `python harnless.py --resume-last` picks
+up the newest log, `--resume-last 30` picks it up keeping only its last 30 messages. With
+nothing recorded yet it says so and opens a fresh session, while a `--resume <id>` that matches
+nothing stays an error (exit 1). `/sessions` lists what is recorded.
 
 ### Context compaction
 

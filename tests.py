@@ -5727,11 +5727,16 @@ class TestSessionLog(unittest.TestCase):
     def _jmessages(self, name="test-session.jsonl"):
         return [r for r in self._log(name) if r.get("type") == "message"]
 
-    def _write_log(self, name, records):
-        os.makedirs(self.sessions, exist_ok=True)
-        with open(os.path.join(self.sessions, name), "w", encoding="utf-8") as f:
+    def _write_log(self, name, records, directory=None):
+        directory = directory or self.sessions
+        os.makedirs(directory, exist_ok=True)
+        with open(os.path.join(directory, name), "w", encoding="utf-8") as f:
             for rec in records:
                 f.write(json.dumps(rec) + "\n")
+
+    def _read_log(self, path):
+        with open(path, "r", encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
 
     def _names(self):
         return sorted(os.listdir(self.sessions))
@@ -6066,6 +6071,24 @@ class TestSessionLog(unittest.TestCase):
         self.assertIsNone(messages)
         self.assertIn("lists recent sessions", note)
 
+    def test_resume_target_reads_both_resume_flags(self):
+        # --resume names the session; --resume-last only trims it.
+        self.assertEqual(h._resume_target("abc", None), ("abc", 0, False))
+        self.assertEqual(h._resume_target("abc", 20), ("abc", 20, False))
+        # Neither flag: no resume at all (resume_last is None, not 0, when absent).
+        self.assertEqual(h._resume_target(None, None), ("", 0, False))
+        # --resume-last on its own, with or without N, means "the newest session".
+        self.assertEqual(h._resume_target(None, 0), ("latest", 0, True))
+        self.assertEqual(h._resume_target(None, 7), ("latest", 7, True))
+        self.assertEqual(h._resume_target("", 3), ("latest", 3, True))
+        # The keep limit is clamped like every other CLI knob.
+        self.assertEqual(h._resume_target(None, -4), ("latest", 0, True))
+        self.assertEqual(
+            h._resume_target(None, h.SESSION_KEEP_CEILING + 99),
+            ("latest", h.SESSION_KEEP_CEILING, True),
+        )
+        self.assertEqual(h._resume_target("abc", -4), ("abc", 0, False))
+
     def test_resuming_a_sub_agent_log_continues_that_chain(self):
         self._write_log("chain.1.2.jsonl", [
             {"type": "session", "seq": 0, "ts": "t", "session_id": "chain", "subagent_id": "1.2"},
@@ -6136,6 +6159,68 @@ class TestSessionLog(unittest.TestCase):
             base + ["--sessions-dir", missing, "--resume", "no-such-session"], input="/exit\n",
             capture_output=True, text=True, encoding="utf-8", timeout=120,
         )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("no session log for 'no-such-session'", proc.stdout)
+
+    def test_cli_resume_last_alone_continues_the_newest_session(self):
+        """--resume-last without --resume: pick up the last session at startup. No
+        model call happens here (/exit ends the run), so no server is needed."""
+        import subprocess
+
+        base = [sys.executable, "harnless.py", "--no-color", "--context-window", "1000"]
+
+        def run_cli(*flags):
+            return subprocess.run(
+                base + list(flags), input="/exit\n",
+                capture_output=True, text=True, encoding="utf-8", timeout=120,
+            )
+
+        log_dir = os.path.join(self.tmp, "cli-resume-last")
+        newest = os.path.join(log_dir, "newest.jsonl")
+
+        def seed():
+            # Two sessions with distinct mtimes, so 'newest' is unambiguous.
+            shutil.rmtree(log_dir, ignore_errors=True)
+            self._write_log("older.jsonl", [
+                {"type": "session", "seq": 0, "ts": "t", "session_id": "older"},
+                {"type": "message", "seq": 1, "ts": "t", "role": "user", "content": "the older chat"},
+            ], log_dir)
+            self._write_log("newest.jsonl", [
+                {"type": "session", "seq": 0, "ts": "t", "session_id": "newest"},
+                {"type": "message", "seq": 1, "ts": "t", "role": "user", "content": "the newest chat"},
+                {"type": "message", "seq": 2, "ts": "t", "role": "assistant", "content": "an answer"},
+            ], log_dir)
+            now = time.time()
+            os.utime(os.path.join(log_dir, "older.jsonl"), (now - 600, now - 600))
+            os.utime(newest, (now - 60, now - 60))
+
+        seed()
+        proc = run_cli("--sessions-dir", log_dir, "--resume-last")
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("resumed session newest", proc.stdout)
+        self.assertIn("2 messages", proc.stdout)  # its own system prompt is not restored
+        # One continuous transcript: the resumed run appends to that same file.
+        self.assertIn("resume", [r.get("type") for r in self._read_log(newest)])
+        self.assertEqual(self._read_log(os.path.join(log_dir, "older.jsonl"))[1]["content"],
+                         "the older chat")
+
+        seed()
+        proc = run_cli("--sessions-dir", log_dir, "--resume-last", "1")
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("resumed session newest", proc.stdout)
+        self.assertIn("kept the last 1 of 3 records", proc.stdout)
+
+        # Nothing to continue is not an error for the shorthand: it warns and starts fresh.
+        empty = os.path.join(self.tmp, "cli-resume-empty")
+        shutil.rmtree(empty, ignore_errors=True)
+        proc = run_cli("--sessions-dir", empty, "--resume-last", "5")
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("no session logs in", proc.stdout)
+        self.assertIn("starting a new session", proc.stdout)
+        self.assertTrue(any(n.endswith(".jsonl") for n in os.listdir(empty)))
+
+        # A session the user named by id still has to exist.
+        proc = run_cli("--sessions-dir", empty, "--resume", "no-such-session", "--resume-last", "5")
         self.assertEqual(proc.returncode, 1)
         self.assertIn("no session log for 'no-such-session'", proc.stdout)
 
