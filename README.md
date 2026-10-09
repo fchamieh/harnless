@@ -132,6 +132,16 @@ up the newest log, `--resume-last 30` picks it up keeping only its last 30 messa
 nothing recorded yet it says so and opens a fresh session, while a `--resume <id>` that matches
 nothing stays an error (exit 1). `/sessions` lists what is recorded.
 
+A resumed run in the REPL also shows you **where you left off**: after the note it replays the
+tail of the journal the way the session printed it — the `you>` line, the `thinking:` line, the
+reply through the same Markdown renderer, each tool call followed by the answer it got, in the
+order they happened. `RESUME_TAIL_ITEMS` is how many speaking turns the echo reaches back over
+and `RESUME_TAIL_RECORDS` is the hard bound on records replayed (a tool-heavy turn cannot flood
+the screen), with `RESUME_TAIL_CHARS` capping a replayed thinking block — a reply is shown
+whole, thinking is not. The turns the harness injects for the model (todo reminders, a
+compaction handoff note) are not replayed, because they were never something you saw. A
+one-shot run has nobody standing at the terminal, so `--prompt` prints the note only.
+
 ### Context compaction
 
 When the context fills up, the oldest turns are replaced by one note the model wrote from them,

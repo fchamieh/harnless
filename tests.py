@@ -6071,6 +6071,175 @@ class TestSessionLog(unittest.TestCase):
         self.assertIsNone(messages)
         self.assertIn("lists recent sessions", note)
 
+    def _echo(self, *args, **kwargs):
+        """resume_session(...) with colour off, returning (messages, note, what it printed)."""
+        saved = h.COLORS_ENABLED
+        h.set_color_enabled(False)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                messages, note = h.resume_session(*args, **kwargs)
+        finally:
+            h.set_color_enabled(saved)
+        return messages, note, buf.getvalue()
+
+    def _write_chat(self, name="echo"):
+        """A journal holding a few exchanges: a system prompt, turns, thinking, a tool
+        call with an oversized answer, then another exchange."""
+        self._write_log(f"{name}.jsonl", [
+            {"type": "session", "seq": 0, "ts": "t", "session_id": name},
+            {"type": "message", "seq": 1, "ts": "t", "role": "system", "content": "the system prompt"},
+            {"type": "message", "seq": 2, "ts": "t", "role": "user", "content": "first ask"},
+            {"type": "message", "seq": 3, "ts": "t", "role": "assistant", "content": "first answer",
+             "reasoning_content": "thinking hard " + "x" * 1300},
+            {"type": "message", "seq": 4, "ts": "t", "role": "assistant", "content": "",
+             "tool_calls": [self._call("run_shell", {"command": "echo hi"}, "c1")]},
+            {"type": "message", "seq": 5, "ts": "t", "role": "tool", "tool_call_id": "c1",
+             "content": "y" * 600},
+            {"type": "message", "seq": 6, "ts": "t", "role": "user", "content": "second ask"},
+            {"type": "message", "seq": 7, "ts": "t", "role": "assistant", "content": "second answer"},
+        ])
+
+    def test_resume_echo_repeats_the_last_exchanges_of_the_session(self):
+        self._write_chat()
+        messages, note, out = self._echo("echo", echo=4)
+        self.assertEqual([m["role"] for m in messages],
+                         ["user", "assistant", "assistant", "tool", "user", "assistant"])
+        # The note is said once, by resume_session itself, before the replay
+        self.assertIn("resumed session echo", out)
+        self.assertLess(out.index("resumed session echo"), out.index(h.icon("user")))
+        self.assertIn("4 turns from echo", out)  # what the window reached back over
+        # ... and the turns themselves, in the REPL's own look
+        self.assertIn(f"{h.icon('user')} you> second ask", out)
+        self.assertIn(f"{h.icon('assistant')} assistant> second answer", out)
+        self.assertIn(f"{h.icon('assistant')} assistant> first answer", out)
+        # Four speaking turns back is where the window closed
+        self.assertNotIn("first ask", out)
+        # The system prompt was never a turn the user saw, so it is not one now
+        self.assertNotIn("the system prompt", out)
+
+    def test_resume_echo_replays_a_tool_call_with_the_answer_to_it(self):
+        self._write_chat()
+        _, _, out = self._echo("echo", echo=4)
+        self.assertIn(
+            f"{h.icon('tool')} run_shell({json.dumps({'command': 'echo hi'})})", out
+        )
+        # the same TOOL_RESULT_ECHO preview the agent loop printed while it ran
+        self.assertIn(f"{h.icon('result')} " + "y" * h.TOOL_RESULT_ECHO + "...", out)
+        self.assertNotIn("y" * (h.TOOL_RESULT_ECHO + 1), out)
+        # call, then its answer — the order they happened in, not calls then answers
+        self.assertLess(out.index("run_shell("), out.index(h.icon("result")))
+
+    def test_resume_echo_caps_replayed_thinking_but_not_the_replies(self):
+        self._write_chat()
+        _, _, out = self._echo("echo", echo=4)
+        kept = h.RESUME_TAIL_CHARS - len("thinking hard ")
+        self.assertIn(
+            f"{h.icon('thinking')} thinking: thinking hard " + "x" * kept
+            + f"... [+{1314 - h.RESUME_TAIL_CHARS} chars in the session log]",
+            out,
+        )
+        self.assertNotIn("x" * h.RESUME_TAIL_CHARS, out)
+        self.assertIn("first answer", out)  # a reply is what they came back for: uncapped
+
+    def test_resume_echo_bounds_the_window_to_recent_records(self):
+        records = [
+            {"type": "session", "seq": 0, "ts": "t", "session_id": "long"},
+            {"type": "message", "seq": 1, "ts": "t", "role": "user", "content": "the oldest ask"},
+        ]
+        seq = 2
+        for i in range(10):  # a tool-heavy stretch: 20 records between two real turns
+            records.append({"type": "message", "seq": seq, "ts": "t", "role": "assistant",
+                            "content": "", "tool_calls": [self._call("get_cwd", {}, f"c{i}")]})
+            records.append({"type": "message", "seq": seq + 1, "ts": "t", "role": "tool",
+                            "tool_call_id": f"c{i}", "content": f"cwd output {i}"})
+            seq += 2
+        records.append({"type": "message", "seq": seq, "ts": "t", "role": "user",
+                        "content": "the newest ask"})
+        records.append({"type": "message", "seq": seq + 1, "ts": "t", "role": "assistant",
+                        "content": "the newest answer"})
+        self._write_log("long.jsonl", records)
+        # Even asked for the whole session, the echo stops at RESUME_TAIL_RECORDS
+        _, _, out = self._echo("long", echo=len(records))
+        self.assertIn("you> the newest ask", out)
+        self.assertIn("assistant> the newest answer", out)
+        self.assertNotIn("the oldest ask", out)
+        self.assertNotIn("cwd output 0", out)
+        self.assertNotIn("cwd output 4", out)  # the window cuts mid-batch, not mid-turn
+        pairs = max(1, (h.RESUME_TAIL_RECORDS - 2) // 2)  # the calls that made the cut
+        self.assertEqual(out.count(f"{h.icon('tool')} get_cwd("), pairs)
+        self.assertEqual(out.count(f"{h.icon('result')} cwd output "), pairs)
+        # a tool-call turn is not a reply: nothing claims an answer it never gave
+        self.assertEqual(out.count(f"{h.icon('assistant')} assistant>"), 1)
+
+    def test_resume_echo_leaves_out_the_turns_the_harness_injected(self):
+        self._write_log("inj.jsonl", [
+            {"type": "session", "seq": 0, "ts": "t", "session_id": "inj"},
+            {"type": "message", "seq": 1, "ts": "t", "role": "user", "content": "ask"},
+            {"type": "message", "seq": 2, "ts": "t", "role": "assistant", "content": "answer"},
+            {"type": "message", "seq": 3, "ts": "t", "role": "user",
+             "content": h.TODO_REMINDER_HEADER + "\n- [x] a todo item"},
+            {"type": "message", "seq": 4, "ts": "t", "role": "user",
+             "content": h.COMPACT_SUMMARY_HEADER + "\n\nthe handoff note"},
+            {"type": "message", "seq": 5, "ts": "t", "role": "user", "content": "next ask"},
+            {"type": "message", "seq": 6, "ts": "t", "role": "assistant", "content": "later answer"},
+        ])
+        _, _, out = self._echo("inj", echo=4)
+        self.assertIn("you> next ask", out)
+        self.assertIn("assistant> later answer", out)
+        self.assertNotIn("Current todo list", out)  # shown to the model, never to the user
+        self.assertNotIn("the handoff note", out)
+        self.assertEqual(out.count(f"{h.icon('user')} you> "), 2)
+
+    def test_resume_without_echo_prints_nothing(self):
+        """echo=0 — what a one-shot run asks for — keeps resume as quiet as it was."""
+        self._write_chat()
+        messages, note, out = self._echo("echo")
+        self.assertIsNotNone(messages)
+        self.assertIn("resumed session echo", note)
+        self.assertEqual(out, "")
+
+    def test_resume_echo_always_shows_the_turn_the_session_ended_on(self):
+        """One record after another is what the user is looking for: the window keeps
+        the last exchange whole even when it overruns RESUME_TAIL_RECORDS."""
+        calls = [self._call("get_cwd", {}, f"b{i}") for i in range(20)]
+        records = [
+            {"type": "session", "seq": 0, "ts": "t", "session_id": "batch"},
+            {"type": "message", "seq": 1, "ts": "t", "role": "user", "content": "dig deeper"},
+            {"type": "message", "seq": 2, "ts": "t", "role": "assistant", "content": "",
+             "tool_calls": calls},
+        ]
+        for i, call in enumerate(calls):
+            records.append({"type": "message", "seq": 3 + i, "ts": "t", "role": "tool",
+                            "tool_call_id": call["id"], "content": f"cwd {i}"})
+        self._write_log("batch.jsonl", records)
+        _, _, out = self._echo("batch", echo=2)
+        self.assertNotIn("dig deeper", out)  # the oldest turn is what got cut
+        self.assertEqual(out.count(f"{h.icon('tool')} get_cwd("), len(calls))
+        self.assertEqual(out.count(f"{h.icon('result')} cwd "), len(calls))
+        self.assertIn("1 turn from batch", out)  # singular, and only the closing exchange
+
+    def test_resume_echo_shows_the_journal_as_it_happened(self):
+        """A call the log never answered is answered for the *server* (so the resumed
+        conversation is valid) but nothing is invented on screen."""
+        self._write_log("half.jsonl", [
+            {"type": "session", "seq": 0, "ts": "t", "session_id": "half"},
+            {"type": "message", "seq": 1, "ts": "t", "role": "user", "content": "keep going"},
+            {"type": "message", "seq": 2, "ts": "t", "role": "assistant", "content": "",
+             "tool_calls": [self._call("get_cwd", {}, "h1"), self._call("get_cwd", {}, "h2")]},
+            {"type": "message", "seq": 3, "ts": "t", "role": "tool", "tool_call_id": "h1",
+             "content": "the cwd"},
+        ])
+        messages, _, out = self._echo("half", echo=2)
+        # rebuilt: the dangling call gets the placeholder answer a server insists on
+        self.assertEqual([m.get("content") for m in messages if m["role"] == "tool"],
+                         ["the cwd", h.SESSION_UNANSWERED_NOTE])
+        # replayed: both calls, the one recorded answer, and no placeholder
+        self.assertIn("you> keep going", out)
+        self.assertEqual(out.count(f"{h.icon('tool')} get_cwd("), 2)
+        self.assertEqual(out.count(f"{h.icon('result')} "), 1)
+        self.assertNotIn(h.SESSION_UNANSWERED_NOTE, out)
+
     def test_resume_target_reads_both_resume_flags(self):
         # --resume names the session; --resume-last only trims it.
         self.assertEqual(h._resume_target("abc", None), ("abc", 0, False))
@@ -6223,6 +6392,59 @@ class TestSessionLog(unittest.TestCase):
         proc = run_cli("--sessions-dir", empty, "--resume", "no-such-session", "--resume-last", "5")
         self.assertEqual(proc.returncode, 1)
         self.assertIn("no session log for 'no-such-session'", proc.stdout)
+
+
+    def test_cli_resume_replays_the_last_turns_to_the_repl(self):
+        """The REPL shows a resumed session where it left off, in its own format; a
+        one-shot run, which has nobody standing there, does not."""
+        import subprocess
+
+        log_dir = os.path.join(self.tmp, "cli-echo")
+
+        def seed(name):
+            self._write_log(f"{name}.jsonl", [
+                {"type": "session", "seq": 0, "ts": "t", "session_id": name},
+                {"type": "message", "seq": 1, "ts": "t", "role": "user",
+                 "content": "delete the journals"},
+                {"type": "message", "seq": 2, "ts": "t", "role": "assistant", "content": "",
+                 "tool_calls": [self._call("get_cwd", {}, "e1")]},
+                {"type": "message", "seq": 3, "ts": "t", "role": "tool", "tool_call_id": "e1",
+                 "content": "the tool answer"},
+                {"type": "message", "seq": 4, "ts": "t", "role": "assistant",
+                 "content": "seventeen journals deleted"},
+            ], log_dir)
+
+        seed("echo-session")
+        proc = subprocess.run(
+            [sys.executable, "harnless.py", "--no-color", "--sessions-dir", log_dir,
+             "--resume", "echo-session"],
+            input="/exit\n", capture_output=True, text=True, encoding="utf-8", timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("resumed session echo-session", proc.stdout)
+        self.assertIn("turns from echo-session", proc.stdout)
+        self.assertIn("you> delete the journals", proc.stdout)
+        self.assertIn("get_cwd({})", proc.stdout)
+        self.assertIn("the tool answer", proc.stdout)
+        self.assertIn("assistant> seventeen journals deleted", proc.stdout)
+        # Replay-only: the restored turns are not journalled a second time
+        self.assertEqual(
+            [r["role"] for r in self._read_log(os.path.join(log_dir, "echo-session.jsonl"))
+             if r.get("type") == "message"],
+            ["user", "assistant", "tool", "assistant", "system"],
+        )
+
+        seed("solo-session")
+        proc = subprocess.run(
+            [sys.executable, "harnless.py", "--no-color", "--sessions-dir", log_dir,
+             "--resume", "solo-session", "--prompt", "carry on",
+             "--api-url", "http://127.0.0.1:9/v1/chat/completions"],
+            capture_output=True, text=True, encoding="utf-8", timeout=120,
+        )
+        self.assertEqual(proc.returncode, 1)  # nothing is listening on that port
+        self.assertIn("resumed session solo-session", proc.stdout)
+        self.assertNotIn("seventeen journals deleted", proc.stdout)  # no replay in one-shot
+        self.assertNotIn("turns from solo-session", proc.stdout)
 
 
 class TestCompaction(unittest.TestCase):

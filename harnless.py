@@ -22,7 +22,7 @@ import urllib.error
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 API_URL = "http://127.0.0.1:11434/v1/chat/completions"
 API_KEY = None
 MODEL = "local-model"
@@ -166,6 +166,21 @@ SESSION_URL_KEEP = 300  # chars of a content part's URL kept (base64 image data 
 SESSION_LIST_LIMIT = 30  # sessions listed by /resume / /sessions (count)
 SESSION_RECORD_LIMIT = 50_000  # records read from one journal file (sanity ceiling)
 SESSION_KEEP_CEILING = 10_000  # sanity clamp for --resume-last
+# When the REPL resumes a session it echoes back the last stretch of the transcript
+# it restored, printed exactly the way the original session printed it (see
+# replay_session_tail): the `you>` line, the thinking line, the assistant reply
+# through the same Markdown renderer, the tool-call and tool-result lines with the
+# same caps. RESUME_TAIL_ITEMS is how many *speaking turns* (user / assistant) the
+# echo reaches back over, RESUME_TAIL_RECORDS is the hard bound on records replayed
+# (so a tool-heavy final turn cannot flood the screen), and RESUME_TAIL_CHARS caps a
+# replayed thinking block (a reply is shown whole — it is what the user came back for).
+# Items = 0 turns off the echo; only the interactive mode asks for it.
+RESUME_TAIL_ITEMS = 4  # speaking turns a resumed run echoes back
+RESUME_TAIL_RECORDS = 12  # journal records replayed at most
+RESUME_TAIL_CHARS = 1_200  # chars of a replayed thinking block
+# User messages the harness injects for the model and never prints as the user's own:
+# the todo reminder, and the handoff note a compacted head is replaced by.
+TODO_REMINDER_HEADER = "Current todo list:"
 # Said instead of a result for a tool call the log recorded but never answered
 # (the session ended while it was running): a server rejects a dangling call.
 SESSION_UNANSWERED_NOTE = (
@@ -230,6 +245,12 @@ SHELL_NOTE = (
     "background processes running: at the timeout the command and its whole process tree are killed."
 )
 
+# What the terminal shows of a tool call about to run and of the answer it returned.
+# The agent loop prints these and a resumed session replays them with the very same
+# caps (see _print_tool_call / _print_tool_result / replay_session_tail), so the
+# replay cannot drift from what the original session showed.
+TOOL_ARG_ECHO = 200  # chars of a tool call's arguments
+TOOL_RESULT_ECHO = 500  # chars of a tool result
 ANSI = {
     "user": "\033[1;36m",
     "assistant": "\033[1;32m",
@@ -834,7 +855,111 @@ def _session_resolve(spec: str) -> tuple:
     return "", f"no session log for '{spec}' in {SESSION_DIR};{hint} (see /sessions)"
 
 
-def resume_session(spec: str, keep: int = 0, mode: str = "") -> tuple:
+def _session_injected_turn(rec: dict) -> bool:
+    """A user record the harness wrote for the *model* rather than a line someone
+    typed: a todo reminder, or the handoff note a compacted head was replaced by.
+    The session never printed either as the user's own line, so neither does a replay."""
+    if rec.get("role") != "user":
+        return False
+    text = _record_text(rec.get("content")).lstrip()
+    return text.startswith(TODO_REMINDER_HEADER) or text.startswith(COMPACT_SUMMARY_HEADER)
+
+
+def _session_tail(records: list, items: int) -> list:
+    """The contiguous slice of a journal a resumed run replays.
+
+    `items` is how many *speaking turns* — a user line or an assistant message — the
+    echo reaches back over; the window also carries the tool calls and answers that
+    sit between them, since those are part of what the user saw. It is cut to the
+    last RESUME_TAIL_RECORDS records so a tool-heavy turn cannot flood the terminal."""
+    if items <= 0:
+        return []
+    spoken = [
+        i
+        for i, rec in enumerate(records)
+        if rec.get("role") == "assistant"
+        or (rec.get("role") == "user" and not _session_injected_turn(rec))
+    ]
+    if not spoken:
+        return []
+    start = max(
+        spoken[-items] if len(spoken) >= items else 0,
+        len(records) - RESUME_TAIL_RECORDS,
+    )
+    if start > spoken[-1]:
+        # The window cut off every turn but a run of tool answers that came after
+        # the last one: that is what the session ended looking like, so show it.
+        start = spoken[-1]
+    return records[start:]
+
+
+def replay_session_tail(
+    records: list, items: int = RESUME_TAIL_ITEMS, label: str = ""
+) -> int:
+    """Print the last stretch of a journaled session the way the original session did.
+
+    A resumed run gets the transcript back but not the memory of what it looked like,
+    so the REPL replays its tail through the very printers the agent loop used: the
+    `you>` line, the thinking line, the reply through the Markdown renderer, each tool
+    call followed by the answer the log recorded for it, with the same previews. Turns
+    the harness injected for the model (todo reminders, a compaction note) stay
+    unprinted, as they were live. Returns how many turns were shown (0 = nothing)."""
+    tail = _session_tail(records, items)
+    spoken = [
+        rec
+        for rec in tail
+        if rec.get("role") == "assistant"
+        or (rec.get("role") == "user" and not _session_injected_turn(rec))
+    ]
+    if not spoken:
+        return 0
+    if label:
+        plural = "turns" if len(spoken) != 1 else "turn"
+        print(colorize(f"last {len(spoken)} {plural} from {label}:", "dim"))
+    shown = 0
+    index = 0
+    while index < len(tail):
+        rec = tail[index]
+        role = rec.get("role")
+        if role == "user":
+            if not _session_injected_turn(rec):
+                print_user(_record_text(rec.get("content")))
+                shown += 1
+            index += 1
+            continue
+        if role == "assistant":
+            shown += 1
+            print_reasoning(rec.get("reasoning_content") or "", RESUME_TAIL_CHARS)
+            calls = [tc for tc in (rec.get("tool_calls") or []) if isinstance(tc, dict)]
+            content = _record_text(rec.get("content"))
+            if content or not calls:
+                print_assistant(content)
+            index += 1
+            answers = []
+            while index < len(tail) and tail[index].get("role") == "tool":
+                answers.append(tail[index])
+                index += 1
+            answered = {
+                a.get("tool_call_id"): _record_text(a.get("content")) for a in answers
+            }
+            for call in calls:  # call, then its answer, then the next — as it ran
+                fn = call.get("function") or {}
+                print_tool_call(fn.get("name") or "?", fn.get("arguments") or "")
+                if call.get("id") in answered:
+                    print_tool_result(answered[call.get("id")])
+            for answer in answers:  # answered here, but its call is outside the window
+                if answer.get("tool_call_id") not in {c.get("id") for c in calls}:
+                    print_tool_result(_record_text(answer.get("content")))
+            continue
+        if role == "tool":  # an answer whose call the window cut off
+            print_tool_result(_record_text(rec.get("content")))
+            index += 1
+            continue
+        index += 1  # the system prompt this run supplies itself, anything unexpected
+    return shown
+
+
+def resume_session(spec: str, keep: int = 0, mode: str = "", echo: int = 0) -> tuple:
     """Continue a recorded session: rebuild its conversation from the journal.
 
     Returns (messages, note), or (None, error) when nothing matches. The resumed
@@ -843,6 +968,11 @@ def resume_session(spec: str, keep: int = 0, mode: str = "") -> tuple:
     run adds from here on, and it picks up the log's `seq` numbering where it
     stopped instead of restarting it (a log that re-recorded its own restored
     messages would double on every resume).
+
+    `echo` is how many of the restored turns the caller wants shown to the user: the
+    note and then those turns, printed out of the journal in the session's own format
+    (see replay_session_tail) — so the caller does not print the note itself. 0, what
+    a one-shot run asks for, prints nothing and leaves the note to the caller.
     """
     global SESSION_ID, SESSION_MODE
     path, error = _session_resolve(spec)
@@ -880,6 +1010,13 @@ def resume_session(spec: str, keep: int = 0, mode: str = "") -> tuple:
     note = f"resumed session {SESSION_ID}: {len(messages)} messages from {path}"
     if keep:
         note += f" (kept the last {keep} of {last_seq + 1} records)"
+    if echo:
+        # The caller asked to be told where it left off, so it is told in full: the
+        # note (which it then does not print itself) and the turns themselves, read
+        # back out of the records — the transcript as it happened, orphan answers and
+        # all — through the same printers the session used live.
+        print(colorize(note, "dim"))
+        replay_session_tail(records, echo, SESSION_ID)
     return messages, note
 
 
@@ -5649,6 +5786,46 @@ def print_assistant(content: str):
     print()
 
 
+def print_user(text: str):
+    """Print a user turn the way the prompt echoed it: the label, then their text
+    untouched (what a resumed session replays — see replay_session_tail)."""
+    print(colorize(f"{icon('user')} you> ", "user") + (text or ""))
+
+
+def print_reasoning(reasoning: str, limit: int = 0):
+    """The `thinking:` line a non-streamed turn gets (the streaming path paints it
+    live instead). `limit` caps a replayed one: thinking is the part of a session
+    worth summarising, not reading again."""
+    text = (reasoning or "").strip()
+    if not text:
+        return
+    if limit and len(text) > limit:
+        text = text[:limit] + f"... [+{len(text) - limit} chars in the session log]"
+    print(OUTPUT_INDENT + colorize(f"{icon('thinking')} thinking: {text}", "thinking"))
+
+
+def print_tool_call(name: str, raw_args: str):
+    """How the loop shows a call before running it: the name and its arguments, previewed."""
+    args = raw_args or ""
+    print(
+        OUTPUT_INDENT
+        + colorize(f"{icon('tool')} {name}({args[:TOOL_ARG_ECHO]})", "tool")
+    )
+
+
+def print_tool_result(result: str):
+    """How the loop shows what a call returned: its first TOOL_RESULT_ECHO characters."""
+    text = result or ""
+    print(
+        OUTPUT_INDENT
+        + colorize(
+            f"{icon('result')} {text[:TOOL_RESULT_ECHO]}"
+            f"{'...' if len(text) > TOOL_RESULT_ECHO else ''}",
+            "result",
+        )
+    )
+
+
 def execute_tool(name: str, raw_args: str) -> str:
     try:
         args = json.loads(raw_args) if raw_args else {}
@@ -6301,12 +6478,7 @@ def _agent_loop(
 
         reasoning = message.get("reasoning_content")
         if reasoning and not streamed:
-            print(
-                OUTPUT_INDENT
-                + colorize(
-                    f"{icon('thinking')} thinking: {reasoning.strip()}", "thinking"
-                )
-            )
+            print_reasoning(reasoning)
 
         tool_calls = message.get("tool_calls") or []
         if not tool_calls:
@@ -6323,11 +6495,7 @@ def _agent_loop(
         for index, tc in enumerate(tool_calls):
             name = tc["function"]["name"]
             raw_args = tc["function"].get("arguments", "")
-            arg_preview = raw_args[:200]
-            print(
-                OUTPUT_INDENT
-                + colorize(f"{icon('tool')} {name}({arg_preview})", "tool")
-            )
+            print_tool_call(name, raw_args)
             try:
                 result = execute_tool(name, raw_args)
             except ExitSignal as e:
@@ -6382,13 +6550,7 @@ def _agent_loop(
                 if is_subagent:
                     raise
                 return 0
-            print(
-                OUTPUT_INDENT
-                + colorize(
-                    f"{icon('result')} {result[:500]}{'...' if len(result) > 500 else ''}",
-                    "result",
-                )
-            )
+            print_tool_result(result)
             tool_result = {
                 "role": "tool",
                 "tool_call_id": tc["id"],
@@ -6666,8 +6828,13 @@ def main():
     SESSION_MODE = "one-shot" if args.prompt is not None else "interactive"
     resume_spec, resume_keep, resume_implied = _resume_target(args.resume, args.resume_last)
     resumed = None  # restored messages; None means this run starts fresh
+    # A resumed session is replayed back to the user only in the REPL: a one-shot run
+    # has nobody standing there to read it.
+    resume_echo = 0 if args.prompt is not None else RESUME_TAIL_ITEMS
     if resume_spec:
-        restored, note = resume_session(resume_spec, keep=resume_keep, mode=SESSION_MODE)
+        restored, note = resume_session(
+            resume_spec, keep=resume_keep, mode=SESSION_MODE, echo=resume_echo
+        )
         if restored is None:
             if not resume_implied:
                 print(colorize(f"{icon('error')} {note}", "error"))
@@ -6677,7 +6844,8 @@ def main():
             print(colorize(f"{icon('wait')} {note} — starting a new session", "dim"))
         else:
             resumed = restored
-            print(colorize(note, "dim"))
+            if not resume_echo:  # with echo on, resume_session already said it
+                print(colorize(note, "dim"))
     if resumed is None:
         start_session(SESSION_MODE)
         messages = [{"role": "system", "content": system_prompt}]
@@ -6743,13 +6911,14 @@ def main():
             if not spec:
                 print(colorize(format_sessions(), "dim"))
                 continue
-            resumed, note = resume_session(spec)
+            resumed, note = resume_session(spec, echo=RESUME_TAIL_ITEMS)
             if resumed is None:
                 print(colorize(f"{icon('error')} {note}", "error"))
                 continue
             messages = [{"role": "system", "content": system_prompt}] + resumed
             _session_prepend(messages[0], MAIN_CONV_ID)
-            print(colorize(note, "dim"))
+            if not RESUME_TAIL_ITEMS:  # echo off: the note is the only word on it
+                print(colorize(note, "dim"))
             continue
         if user_input == "/clear-screen":
             os.system("cls" if os.name == "nt" else "clear")
