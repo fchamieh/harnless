@@ -22,7 +22,7 @@ import urllib.error
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-VERSION = "1.5.2"
+VERSION = "1.6.0"
 API_URL = "http://127.0.0.1:11434/v1/chat/completions"
 API_KEY = None
 MODEL = "local-model"
@@ -100,6 +100,84 @@ SUBAGENT_SUMMARY_LIMIT = 20_000  # task: sub-agent final summary (chars)
 TODO_BLOCK_LIMIT = 8_000  # todo render + reminder injection (chars)
 MEMORY_BLOCK_LIMIT = 12_000  # memory notes injected into the system prompt (chars)
 AGENTS_MD_LIMIT = 20_000  # AGENTS.md appended to the system prompt (chars)
+# Context compaction: the answer to "the context is full". Older turns are
+# replaced by one model-written handoff note and the recent turns stay verbatim.
+# Two triggers: proactive (usage crosses COMPACT_THRESHOLD_PCT of CONTEXT_WINDOW)
+# and reactive (the server rejects the prompt as too long). Nothing is lost for
+# good — every message is journaled to the session log (see below).
+CONTEXT_WINDOW = 0  # window in tokens (probed or --context-window); 0 = unknown
+AUTO_COMPACT = True  # compact automatically; --no-auto-compact / /auto-compact off
+COMPACT_THRESHOLD_PCT = 85  # auto-compact once usage reaches this % of the window
+COMPACT_THRESHOLD_CEILING = 99  # sanity clamp for --compact-threshold
+COMPACT_KEEP_TOKENS_PCT = 25  # verbatim tail budget, as a % of the window
+COMPACT_KEEP_MIN_MESSAGES = 6  # floor on the verbatim tail (message count)
+COMPACT_MIN_MESSAGES = 8  # below this many messages, refuse to compact
+COMPACT_PRUNE_TOOL_RESULTS = True  # elide tool results that fall out of the tail
+COMPACT_TOOL_RESULT_KEEP = 1_500  # chars kept of an elided tool result (head+tail)
+COMPACT_DROP_REASONING = True  # stop replaying reasoning_content of old turns
+COMPACT_SUMMARY_LIMIT = 4_000  # chars kept from the generated handoff note
+COMPACT_MAX_ATTEMPTS = 1  # compact-and-retry budget after a reactive overflow
+# Said out loud when the summarizing request itself failed: the turns were still
+# dropped (that is what made room), so the session must know the note is missing.
+COMPACT_FALLBACK_NOTE = (
+    "(no model summary: the summarizing request failed, so the earlier turns "
+    "were dropped without being rewritten — the full transcript is in the "
+    "session log)"
+)
+CONTEXT_OVERFLOW_CODE = 3  # exit code: context full, and compaction could not help
+# Given to the model to write the note that replaces the turns about to go. The
+# todo list and memory notes are re-injected by the harness anyway, so the note
+# must not spend its budget restating them.
+COMPACT_SUMMARY_PROMPT = (
+    "You are compacting an agent session that ran out of context. The "
+    "conversation below is about to be replaced by the note you write; the last "
+    "few turns will be kept as-is. Write the handoff note the agent continues "
+    "from. Cover, in dense bullets under 400 words: the goal; decisions taken "
+    "and why; files touched (exact paths, with line numbers where it matters); "
+    "facts and results worth keeping; the current state; open problems and the "
+    "next step. Do not call tools. Do not restate the todo list or the memory "
+    "notes — the harness supplies those separately. Reply with the note only."
+)
+# Marks the summary as harness-generated inside the conversation, so the model
+# never mistakes it for something the user said.
+COMPACT_SUMMARY_HEADER = (
+    "[harnless compacted this session: the earlier turns above were replaced by "
+    "the note below]"
+)
+# Session log: every conversation is journaled as it happens — the exact message
+# objects the harness replays to the API, one JSON object per line, plus a header
+# record per log and a usage record per LLM call. <id>.jsonl holds the top-level
+# conversation; each sub-agent run gets its own file named after where it sits in
+# the delegation chain (<id>.1.jsonl, <id>.1.2.jsonl). Nothing a session says is
+# ever lost, which is what compaction can lean on — and what --resume / /resume
+# rebuilds a conversation from. Enabled by main(); tests keep it off unless they
+# point SESSION_DIR at a temp dir and turn it on.
+SESSION_DIR = os.environ.get("HARNLESS_SESSIONS_DIR") or os.path.join(
+    CWD, ".harnless", "sessions"
+)
+SESSION_LOG = False  # journal messages as they enter the conversation (main() enables)
+SESSION_ID = ""  # <YYYYmmdd-HHMMSS>-<rand>, one per session (set in main())
+SESSION_MODE = "interactive"  # recorded in each log's header ("interactive" / "one-shot")
+SESSION_WARNED = False  # a journaling failure is reported once, not per record
+SESSION_URL_KEEP = 300  # chars of a content part's URL kept (base64 image data is elided)
+SESSION_LIST_LIMIT = 30  # sessions listed by /resume / /sessions (count)
+SESSION_RECORD_LIMIT = 50_000  # records read from one journal file (sanity ceiling)
+SESSION_KEEP_CEILING = 10_000  # sanity clamp for --resume-last
+# Said instead of a result for a tool call the log recorded but never answered
+# (the session ended while it was running): a server rejects a dangling call.
+SESSION_UNANSWERED_NOTE = (
+    "[harnless: this tool call was still running when the session ended, so the "
+    "session log has no result for it]"
+)
+_SESSION_META_KEYS = ("type", "seq", "ts", "chars")  # journal envelope, not message keys
+# Journal state, keyed like _record_usage keys a conversation: MAIN_CONV_ID for
+# the top-level conversation, a per-run conv id for a sub-agent, else id(messages).
+SESSION_FILES: dict = {}  # conversation key -> the .jsonl it is appending to
+SESSION_SEQ: dict = {}  # conversation key -> next record seq (a stable message id:
+# compaction can later name the turns it replaced by their seq, and a resumed run
+# picks up where the log left off)
+AGENT_LOG_ID = ""  # delegation chain id of the agent currently running ("" = top level)
+SUBAGENT_CHILDREN: dict = {}  # parent chain id -> how many sub-agent runs it started
 # Server-reported token usage per conversation, keyed by conversation id
 # (MAIN_CONV_ID for the top-level conversation, unique counters for
 # sub-agents — see _record_usage).
@@ -417,6 +495,389 @@ def _clip_line(line: str, limit: int) -> str:
     if len(line) <= limit:
         return line
     return line[:limit] + f" …[+{len(line) - limit} chars on this line]"
+
+
+# ------------------------------------------------------------ session journal
+
+
+def _session_stamp() -> str:
+    """Timestamp for a journal record (local time, whole seconds — `seq` is what
+    orders records inside the same second)."""
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _session_new_id() -> str:
+    """Session id: <YYYYmmdd-HHMMSS>-<rand>. Deliberately dot-free, so a journal
+    file's first dot separates the session id from the dotted sub-agent chain id
+    (<id>.1.2.jsonl)."""
+    return f"{time.strftime('%Y%m%d-%H%M%S')}-{os.urandom(3).hex()}"
+
+
+def _session_path(session_id: str = "", subagent_id: str = "") -> str:
+    """Journal file for a conversation: <session-id>.jsonl for the top-level
+    conversation, <session-id>.<chain>.jsonl for a sub-agent run ('1', '1.2', …
+    — the name shows how the run was delegated)."""
+    sid = session_id or SESSION_ID
+    name = f"{sid}.{subagent_id}" if subagent_id else sid
+    return os.path.join(SESSION_DIR, name + ".jsonl")
+
+
+def _session_disable(error) -> None:
+    """Journaling is best effort: a log that cannot be written is dropped (said
+    out loud once) and the session carries on without it."""
+    global SESSION_LOG, SESSION_WARNED
+    SESSION_LOG = False
+    if not SESSION_WARNED:
+        SESSION_WARNED = True
+        print(colorize(f"{icon('error')} session log disabled: {error}", "error"))
+
+
+def _session_append(key, record: dict) -> None:
+    """Append one record to conversation `key`'s journal. A conversation that was
+    never opened — a test driving run_agent directly, a --no-session-log run — is
+    silently skipped, which is how the journal stays off by default."""
+    if not SESSION_LOG:
+        return
+    path = SESSION_FILES.get(key)
+    if not path:
+        return
+    seq = SESSION_SEQ.get(key, 0)
+    record = {**record, "seq": seq, "ts": _session_stamp()}  # envelope last: a
+    # journal field can never be shadowed by a key the server put in the message
+    try:
+        os.makedirs(SESSION_DIR, exist_ok=True)
+        with open(path, "a", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except (OSError, TypeError, ValueError) as e:
+        _session_disable(e)
+        return
+    SESSION_SEQ[key] = seq + 1
+
+
+def _session_elide(content):
+    """Keep base64 megabytes out of the log: an inline image data URL becomes a
+    note naming it (the record's `chars` still reports the real size). A short
+    URL — a remote image reference — is kept as it is."""
+    if not isinstance(content, list):
+        return content
+    kept = []
+    for part in content:
+        if isinstance(part, dict) and part.get("type") == "image_url":
+            url = ((part.get("image_url") or {}).get("url") or "")
+            if len(url) > SESSION_URL_KEEP:
+                kept.append({
+                    "type": "text",
+                    "text": f"[image elided in the session log: {url.split(',', 1)[0]}, {len(url)} chars]",
+                })
+            else:
+                kept.append(part)
+        else:
+            kept.append(part)
+    return kept
+
+
+def _session_message(msg: dict, key) -> None:
+    """Journal one message exactly as the harness replays it to the API (role,
+    content, tool_calls, tool_call_id, reasoning_content … whatever the message
+    actually carries)."""
+    record = dict(msg)
+    if "content" in record:
+        record["content"] = _session_elide(record.get("content"))
+    record["chars"] = _content_chars(msg.get("content"))
+    record["type"] = "message"
+    _session_append(key, record)
+
+
+def _session_messages(messages: list, key) -> None:
+    """Journal a batch of messages in order."""
+    for msg in messages:
+        _session_message(msg, key)
+
+
+def _session_open(key, path: str, header: dict) -> None:
+    """Start conversation `key`'s journal at `path`, headed by what the run was."""
+    if not SESSION_LOG:
+        return
+    SESSION_FILES[key] = path
+    SESSION_SEQ[key] = 0
+    _session_append(key, {
+        "harnless": VERSION,
+        "session_id": SESSION_ID,
+        "mode": SESSION_MODE,
+        "cwd": CWD,
+        "api_url": API_URL,
+        "model": MODEL,
+        **header,
+        "type": "session",
+    })
+
+
+def _session_continue(key, path: str, start_seq: int, record: dict) -> None:
+    """Point conversation `key`'s journal at an already-written file and keep its
+    numbering, then mark the continuation in the log itself."""
+    if not SESSION_LOG:
+        return
+    SESSION_FILES[key] = path
+    SESSION_SEQ[key] = max(0, start_seq)
+    _session_append(key, record)
+
+
+def start_session(mode: str = "") -> str:
+    """Begin a new top-level session: a fresh id, a fresh journal, its header."""
+    global SESSION_ID, SESSION_MODE
+    if mode:
+        SESSION_MODE = mode
+    SESSION_ID = _session_new_id()
+    _session_open(MAIN_CONV_ID, _session_path(), {"depth": 0, "subagent_id": None})
+    return _session_path()
+
+
+def _session_note() -> str:
+    """The line that tells you where this run's transcript is going (banner,
+    /status): sub-agent runs get their own files alongside it."""
+    if not SESSION_LOG:
+        return "session log: off (--no-session-log)"
+    return f"session log: {_session_path()} (sub-agents: {_session_path(SESSION_ID, '1')}, …)"
+
+
+def _session_mtime_str(path: str) -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(path)))
+    except OSError:
+        return "?"
+
+
+def _session_files() -> list:
+    """Every journal file in SESSION_DIR, newest first."""
+    try:
+        names = os.listdir(SESSION_DIR)
+    except OSError:
+        return []
+    paths = []
+    for name in names:
+        if not name.endswith(".jsonl"):
+            continue
+        path = os.path.join(SESSION_DIR, name)
+        if os.path.isfile(path):
+            paths.append(path)
+    paths.sort(key=_session_mtime_key, reverse=True)
+    return paths
+
+
+def _session_mtime_key(path: str) -> float:
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def _session_main_files() -> list:
+    """Top-level conversation journals only (a session id contains no dot, so a
+    main log has exactly one), newest first."""
+    return [
+        p for p in _session_files()
+        if os.path.basename(p)[: -len(".jsonl")].find(".") == -1
+    ]
+
+
+def _session_id_of(path: str) -> str:
+    """Session part of a journal file name: <id>.1.2.jsonl → <id>.1.2 (the chain
+    keeps its place, so continuing that log continues that chain)."""
+    return os.path.basename(path)[: -len(".jsonl")]
+
+
+def _session_read(path: str) -> tuple:
+    """Read one journal: (header record, message records in order, last seq)."""
+    header: dict = {}
+    messages = []
+    last_seq = -1
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for index, line in enumerate(f):
+                if index >= SESSION_RECORD_LIMIT:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                seq = rec.get("seq")
+                if isinstance(seq, int):
+                    last_seq = max(last_seq, seq)
+                kind = rec.get("type")
+                if kind == "session" and not header:
+                    header = rec
+                elif kind == "message":
+                    messages.append(rec)
+    except OSError as e:
+        _session_disable(e)
+        return {}, [], -1
+    return header, messages, last_seq
+
+
+def _session_rebuild(records: list) -> list:
+    """Turn journal records back into a conversation a server will accept.
+
+    A run recorded mid tool-call is the interesting case: its calls were never
+    answered, and a server rejects an assistant message whose tool calls are
+    unanswered — so those get answered with a note. Tool results whose call is
+    missing (cut off by --resume-last, or a log written by an older build) are
+    dropped, and so is an assistant message with neither content nor tool calls
+    (an interrupted mid-thinking partial — the server rejects those too). System
+    messages are dropped as well: the resumed run supplies its own.
+    """
+    messages = []
+    pending = []  # tool_call ids the log never answered
+
+    def _close_pending():
+        for call_id in pending:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": SESSION_UNANSWERED_NOTE,
+                }
+            )
+
+    for rec in records:
+        msg = {k: v for k, v in rec.items() if k not in _SESSION_META_KEYS}
+        role = msg.get("role")
+        if role == "tool":
+            call_id = msg.get("tool_call_id")
+            if call_id in pending:
+                pending.remove(call_id)
+                messages.append(msg)
+            continue  # an answer to a call this rebuild never asked about
+        _close_pending()  # the log moved on without answering them
+        pending = []
+        if role not in ("user", "assistant"):
+            continue  # system (and anything unexpected) — the run builds its own
+        if role == "assistant" and not msg.get("content") and not msg.get("tool_calls"):
+            continue
+        messages.append(msg)
+        if role == "assistant":
+            pending = [
+                tc.get("id")
+                for tc in (msg.get("tool_calls") or [])
+                if isinstance(tc, dict) and tc.get("id")
+            ]
+    _close_pending()  # the log ended on an unanswered call
+    return messages
+
+
+def _session_resolve(spec: str) -> tuple:
+    """Resolve a resume spec to a journal file: 'latest', a session id, an
+    '<id>.<chain>' sub-agent log, or a path. Returns (path, error)."""
+    spec = (spec or "").strip()
+    if not spec:
+        return "", "usage: /resume <session-id> (with no argument, lists recent sessions)"
+    if spec.lower() in ("latest", "last", "newest", "-"):
+        files = _session_main_files()
+        if not files:
+            return "", f"no session logs in {SESSION_DIR}"
+        return files[0], ""
+    if spec.endswith(".jsonl") or os.sep in spec or "/" in spec or spec.startswith("~"):
+        base = os.path.expanduser(spec)
+        for candidate in (base, base + ".jsonl"):
+            if os.path.isfile(candidate):
+                return candidate, ""
+        return "", f"no session log at: {spec}"
+    path = os.path.join(SESSION_DIR, spec + ".jsonl")
+    if os.path.isfile(path):
+        return path, ""
+    known = [_session_id_of(p) for p in _session_files()[:3]]
+    hint = f" recent sessions: {', '.join(known)}" if known else ""
+    return "", f"no session log for '{spec}' in {SESSION_DIR};{hint} (see /sessions)"
+
+
+def resume_session(spec: str, keep: int = 0, mode: str = "") -> tuple:
+    """Continue a recorded session: rebuild its conversation from the journal.
+
+    Returns (messages, note), or (None, error) when nothing matches. The resumed
+    run keeps appending to that same journal — one continuous transcript — so the
+    restored messages are deliberately *not* re-journaled: only what the resumed
+    run adds from here on, and it picks up the log's `seq` numbering where it
+    stopped instead of restarting it (a log that re-recorded its own restored
+    messages would double on every resume).
+    """
+    global SESSION_ID, SESSION_MODE
+    path, error = _session_resolve(spec)
+    if not path:
+        return None, error
+    header, records, last_seq = _session_read(path)
+    if keep:
+        # Cut the records, not the rebuilt messages: a cut landing inside a
+        # tool-call batch leaves answers whose call is gone, and _session_rebuild
+        # is what drops them.
+        records = records[-keep:]
+    messages = _session_rebuild(records)
+    if not messages:
+        return None, f"no messages to resume in {os.path.basename(path)}"
+    if mode:
+        SESSION_MODE = mode
+    SESSION_ID = _session_id_of(path)
+    _session_continue(
+        MAIN_CONV_ID,
+        path,
+        last_seq + 1,
+        {
+            "harnless": VERSION,
+            "session_id": SESSION_ID,
+            "mode": SESSION_MODE,
+            "resumed_file": path,
+            "restored": len(messages),
+            "recorded": len(records),
+            "model": MODEL,
+            "type": "resume",
+        },
+    )
+    note = f"resumed session {SESSION_ID}: {len(messages)} messages from {path}"
+    if keep:
+        note += f" (kept the last {keep} of {last_seq + 1} records)"
+    return messages, note
+
+
+def format_sessions(limit: int = SESSION_LIST_LIMIT) -> str:
+    """Describe the recorded sessions (newest first) for /resume and /sessions."""
+    files = _session_files()
+    if not files:
+        return f"no session logs in {SESSION_DIR}"
+    sessions: dict = {}
+    for path in files:
+        name = os.path.basename(path)[: -len(".jsonl")]
+        session_id, _, chain = name.partition(".")
+        info = sessions.setdefault(
+            session_id, {"log": path, "header": {}, "messages": 0, "sub_logs": 0}
+        )
+        header, records, _ = _session_read(path)
+        if chain:
+            info["sub_logs"] += 1
+        else:
+            info["log"] = path
+            info["header"] = header
+            info["messages"] = len(records)
+    lines = [f"session logs in {SESSION_DIR} (newest first):"]
+    for session_id, info in list(sessions.items())[: max(1, limit)]:
+        header = info["header"] or {}
+        bits = [
+            header.get("ts") or _session_mtime_str(info["log"]),
+            f"{header.get('mode', '?')} ({header.get('model', '?')})",
+            f"{info['messages']} messages",
+        ]
+        if info["sub_logs"]:
+            bits.append(f"{info['sub_logs']} sub-agent logs")
+        if header.get("cwd"):
+            bits.append(header["cwd"])
+        lines.append(f"  {session_id}  {'  '.join(bits)}")
+    shown = min(len(sessions), max(1, limit))
+    if len(sessions) > shown:
+        lines.append(f"  … {len(sessions) - shown} more (increase with the SESSION_LIST_LIMIT constant)")
+    lines.append("resume one with: /resume <session-id>  —  or --resume <session-id> at startup")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------- tools
@@ -1176,15 +1637,37 @@ def tool_task(args: dict) -> str:
         {"role": "system", "content": system},
         {"role": "user", "content": task},
     ]
-    global OUTPUT_INDENT, TODO_LAST_INJECTED, _NEXT_CONV_ID
+    global OUTPUT_INDENT, TODO_LAST_INJECTED, _NEXT_CONV_ID, AGENT_LOG_ID, SUBAGENT_CHILDREN
     old_indent = OUTPUT_INDENT
     old_todo_state = TODO_LAST_INJECTED
+    old_log_id = AGENT_LOG_ID
     conv_id = _NEXT_CONV_ID
     _NEXT_CONV_ID += 1
+    # A sub-agent's log is named after where it sits in the delegation chain: the
+    # session's first sub-agent is '1', the next is '2', and one of them
+    # delegating again is '1.1' — so <session>.1.2.jsonl says who delegated it.
+    parent_log_id = AGENT_LOG_ID
+    child_n = SUBAGENT_CHILDREN.get(parent_log_id, 0) + 1
+    SUBAGENT_CHILDREN[parent_log_id] = child_n
+    log_id = f"{parent_log_id}.{child_n}" if parent_log_id else str(child_n)
     OUTPUT_INDENT = old_indent + "  "
+    AGENT_LOG_ID = log_id
+    _session_open(
+        conv_id,
+        _session_path(SESSION_ID, log_id),
+        {
+            "depth": _AGENT_DEPTH + 1,
+            "mode": "sub-agent",
+            "subagent_id": log_id,
+            "parent_log": _session_path(SESSION_ID, parent_log_id),
+            "task": task,
+        },
+    )
+    _session_messages(messages, conv_id)  # what this sub-agent was told, in its own log
     interrupted = False
     interrupt_note = ""
     step_limited = False
+    code = None  # None until run_agent answers: an end record only if it did
     try:
         try:
             code = run_agent(
@@ -1208,9 +1691,27 @@ def tool_task(args: dict) -> str:
     finally:
         OUTPUT_INDENT = old_indent
         TODO_LAST_INJECTED = old_todo_state
+        AGENT_LOG_ID = old_log_id
+        if code is not None:
+            # The sub-agent's own log closes with how it ended: a reader (and the
+            # next compaction pass) can tell a clean exit from a stop.
+            _session_append(
+                conv_id,
+                {
+                    "exit_code": code,
+                    "interrupted": interrupted,
+                    "step_limited": step_limited,
+                    "type": "end",
+                },
+            )
         # The sub-agent's messages list is freed on return; drop its usage
         # entry so the address can't be recycled and resurrect stale usage.
         USAGE_BY_CONV.pop(conv_id, None)
+        # Same for its journal state: the file stays on disk, but the conversation
+        # key is free again (an id() fallback could otherwise land on it later).
+        SESSION_FILES.pop(conv_id, None)
+        SESSION_SEQ.pop(conv_id, None)
+        SUBAGENT_CHILDREN.pop(log_id, None)
         # An `exit(message=...)` argument is the sub-agent's own closing
         # statement: _agent_loop prints it, and only here does it reach the
         # parent.
@@ -1372,12 +1873,13 @@ def tool_todo(args: dict) -> str:
     return "todo list:\n" + _todo_block()
 
 
-def _todo_reminder(messages: list):
+def _todo_reminder(messages: list, conv_key=None):
     """Append a reminder with the current todo list if it changed since the last injection.
 
     Sent as a *user* message, not system: some chat templates (e.g. Qwen) forbid
     system messages anywhere but the first position, and a mid-conversation system
-    reminder would make the server reject the whole request.
+    reminder would make the server reject the whole request. It is journaled like
+    any other message the model is about to see — the log is the conversation.
     """
     global TODO_LAST_INJECTED
     if not TODO_ITEMS:
@@ -1387,6 +1889,7 @@ def _todo_reminder(messages: list):
     if state == TODO_LAST_INJECTED:
         return
     messages.append({"role": "user", "content": "Current todo list:\n" + _todo_block()})
+    _session_message(messages[-1], conv_key)
     TODO_LAST_INJECTED = state
 
 
@@ -3619,9 +4122,18 @@ def _record_usage(messages: list, usage, conv_id: int = None) -> None:
     freed sub-agent messages list can be reallocated at the same address,
     which would make /status resurrect stale sub-agent usage. Sub-agent
     entries are deleted when the sub-agent finishes (tool_task).
+
+    The same key journals the call: a `usage` record is the log's record of
+    how full the context was at that point — what a compaction trigger, and a
+    post-mortem, both need.
     """
     if isinstance(usage, dict) and usage.get("prompt_tokens"):
-        USAGE_BY_CONV[conv_id if conv_id is not None else id(messages)] = usage
+        key = conv_id if conv_id is not None else id(messages)
+        USAGE_BY_CONV[key] = usage
+        _session_append(
+            key,
+            {"messages": len(messages), "usage": usage, "type": "usage"},
+        )
 
 
 class _UploadProgress:
@@ -4663,6 +5175,7 @@ def format_status(messages: list, context_window: int = 0, conv_id: int = None) 
         ctx,
         f"api url: {API_URL}",
         f"tools: {tool_names}",
+        f"session: {SESSION_ID or '(no session id)'}  {_session_note()}",
     ]
     if MCP_CLIENTS:
         mcp_lines = []
@@ -4677,9 +5190,11 @@ def format_status(messages: list, context_window: int = 0, conv_id: int = None) 
 
 
 REPL_COMMANDS = [
-    ("/new", "clear session history and start over"),
+    ("/new", "clear session history and start over (in a new session log)"),
     ("/clear-screen", "clear the terminal screen"),
     ("/status", "show context usage, api url, and tools"),
+    ("/sessions", "list the recorded session logs"),
+    ("/resume", "continue a recorded session: /resume <session-id> (no argument lists them)"),
     ("/tools", "interactive tool menu: up/down move, space toggle, enter apply, esc cancel"),
     ("/auto-send", "on: Enter submits (default); off: Enter inserts a newline, Ctrl+Enter sends"),
     ("/help", "show this help"),
@@ -4847,7 +5362,10 @@ def _agent_loop(
     # off at the top of this loop has usually just finished a tool-call turn, so
     # stopping cold would leave tool_task with no summary to hand the parent.
     closing_turn = False
-
+    # Journal key: the same key _record_usage keys this conversation's usage by —
+    # MAIN_CONV_ID / a sub-agent conv id, else id(messages) — so a conversation's
+    # records land in that conversation's log (and nowhere else if it has one).
+    conv_key = conv_id if conv_id is not None else id(messages)
     def _step_limited() -> None:
         print(
             OUTPUT_INDENT
@@ -4873,6 +5391,7 @@ def _agent_loop(
                 )
             )
             messages.append({"role": "user", "content": STEP_LIMIT_CLOSE_PROMPT})
+            _session_message(messages[-1], conv_key)
         steps += 1
         message = None
         streamed = False
@@ -4897,6 +5416,7 @@ def _agent_loop(
             message.pop("tool_calls", None)
             if message.get("content"):
                 messages.append(message)
+                _session_message(message, conv_key)  # what was said before the stop
             if is_subagent:
                 # Hand the stop to whoever delegated us: tool_task turns it
                 # into a stopped-sub-agent result and re-raises, so the whole
@@ -4928,6 +5448,7 @@ def _agent_loop(
                 return 1
             message = data["choices"][0]["message"]
         messages.append(message)
+        _session_message(message, conv_key)  # the model's answer, as recorded
 
         reasoning = message.get("reasoning_content")
         if reasoning and not streamed:
@@ -4972,23 +5493,22 @@ def _agent_loop(
                 # Answer the exit call and everything queued behind it, so the
                 # batch never leaves tool_calls unanswered (as the interrupt
                 # branch below does) — harmless today, since this agent's
-                # conversation ends here, but it is a broken request waiting to
-                # happen if a caller ever resumes it.
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": f"exiting with code {e.code}",
-                    }
-                )
-                for pending in tool_calls[index + 1:]:
-                    messages.append(
+                # conversation ends here, but a broken request waiting to happen
+                # for anything that replays the conversation later (a resumed
+                # session closes such dangling calls — see _session_rebuild).
+                answered = [
+                    {"role": "tool", "tool_call_id": tc["id"], "content": f"exiting with code {e.code}"},
+                    *[
                         {
                             "role": "tool",
                             "tool_call_id": pending["id"],
                             "content": f"skipped: the agent exited with code {e.code}",
                         }
-                    )
+                        for pending in tool_calls[index + 1:]
+                    ],
+                ]
+                messages.extend(answered)
+                _session_messages(answered, conv_key)
                 if closing_turn:
                     _step_limited()  # a capped run reports itself capped
                 return e.code
@@ -5001,15 +5521,15 @@ def _agent_loop(
                 note = ((e.message or {}).get("content") or "").strip()
                 if not note:
                     note = "interrupted by user"
-                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": note})
-                for pending in tool_calls[index + 1:]:
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": pending["id"],
-                            "content": "interrupted by user",
-                        }
-                    )
+                answered = [
+                    {"role": "tool", "tool_call_id": tc["id"], "content": note},
+                    *[
+                        {"role": "tool", "tool_call_id": pending["id"], "content": "interrupted by user"}
+                        for pending in tool_calls[index + 1:]
+                    ],
+                ]
+                messages.extend(answered)
+                _session_messages(answered, conv_key)
                 if is_subagent:
                     raise
                 return 0
@@ -5020,19 +5540,20 @@ def _agent_loop(
                     "result",
                 )
             )
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": result,
-                }
-            )
-        _todo_reminder(messages)
+            tool_result = {
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "content": result,
+            }
+            messages.append(tool_result)
+            _session_message(tool_result, conv_key)
+        _todo_reminder(messages, conv_key)
 
 
 def main():
     global API_URL, API_KEY, MODEL, TEMPERATURE, MAX_SUBAGENT_DEPTH, VISION_ENABLED
     global INTERRUPT_ENABLED, SHELL_PREFERRED, SUBAGENT_STEP_LIMIT
+    global SESSION_LOG, SESSION_DIR, SESSION_MODE
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[reportAttributeAccessIssue]
@@ -5104,6 +5625,36 @@ def main():
         help="model context window size in tokens, shown as a percentage in /status (0 = not shown)",
     )
     parser.add_argument(
+        "--no-session-log",
+        action="store_true",
+        help=(
+            "do not journal the session (the .jsonl transcript under "
+            "SESSION_DIR: .harnless/sessions unless overridden)"
+        ),
+    )
+    parser.add_argument(
+        "--sessions-dir",
+        default=None,
+        metavar="DIR",
+        help="where session logs are written (default: .harnless/sessions, or HARNLESS_SESSIONS_DIR)",
+    )
+    parser.add_argument(
+        "--resume",
+        default=None,
+        metavar="SESSION_ID",
+        help=(
+            "continue a recorded session: a session id, an '<id>.<chain>' "
+            "sub-agent log, 'latest', or a path to a .jsonl log"
+        ),
+    )
+    parser.add_argument(
+        "--resume-last",
+        type=int,
+        default=0,
+        metavar="N",
+        help=f"with --resume: keep only the last N recorded messages of that session (0 = all, max {SESSION_KEEP_CEILING})",
+    )
+    parser.add_argument(
         "--no-color",
         action="store_true",
         help="disable ANSI color output (also auto-disabled for piped output and NO_COLOR)",
@@ -5158,6 +5709,9 @@ def main():
     SUBAGENT_STEP_LIMIT = _clamp_int(args.max_subagent_steps, 0, SUBAGENT_STEPS_CEILING)
     VISION_ENABLED = not args.no_vision
     SHELL_PREFERRED = args.shell
+    SESSION_LOG = not args.no_session_log
+    if args.sessions_dir:
+        SESSION_DIR = os.path.abspath(os.path.expanduser(args.sessions_dir))
 
     context_window = args.context_window
     if context_window == 0 and args.prompt is None:
@@ -5232,11 +5786,33 @@ def main():
     if additions:
         system_prompt += "\n\n" + additions
     _todo_load()
-    messages = [{"role": "system", "content": system_prompt}]
+    SESSION_MODE = "one-shot" if args.prompt is not None else "interactive"
+    if args.resume:
+        resumed, note = resume_session(
+            args.resume,
+            keep=_clamp_int(args.resume_last, 0, SESSION_KEEP_CEILING),
+            mode=SESSION_MODE,
+        )
+        if resumed is None:
+            print(colorize(f"{icon('error')} {note}", "error"))
+            sys.exit(1)
+        # The transcript comes back; the system prompt does not. The resumed run
+        # describes itself as it is now (this version, current AGENTS.md, current
+        # memory notes) instead of replaying what an older run was told.
+        messages = [{"role": "system", "content": system_prompt}] + resumed
+        print(colorize(note, "dim"))
+    else:
+        start_session(SESSION_MODE)
+        messages = [{"role": "system", "content": system_prompt}]
+    # The log starts where the conversation does. Restored messages are not
+    # re-journaled: the file is one continuous transcript, not a copy per resume.
+    _session_message(messages[0], MAIN_CONV_ID)
 
     if args.prompt is not None:
         print(colorize(f"harnless {VERSION} one-shot in {CWD} (api: {API_URL})", "dim"))
+        print(colorize(_session_note(), "dim"))
         messages.append(build_user_message(args.prompt))
+        _session_message(messages[-1], MAIN_CONV_ID)
         sys.exit(
             run_agent(messages, args.model, temperature=args.temperature,
                       conv_id=MAIN_CONV_ID)
@@ -5255,6 +5831,7 @@ def main():
     )
     if INTERRUPT_ENABLED:
         banner += "press esc twice (within 2 s) to interrupt generation\n"
+    banner += _session_note() + "\n"
     print(colorize(banner, "dim"))
 
     while True:
@@ -5268,8 +5845,29 @@ def main():
         if user_input in ("/exit", "/quit"):
             break
         if user_input == "/new":
+            _session_append(MAIN_CONV_ID, {"next": "a new session id", "type": "cleared"})
+            # A cleared conversation is a new conversation, so it gets its own log:
+            # a later /resume then rebuilds one conversation, never two at once.
+            start_session()
             messages = [{"role": "system", "content": system_prompt}]
-            print(colorize("session cleared — starting over\n", "dim"))
+            _session_message(messages[0], MAIN_CONV_ID)
+            print(colorize(f"session cleared — starting over ({_session_note()})\n", "dim"))
+            continue
+        if user_input == "/sessions":
+            print(colorize(format_sessions(), "dim"))
+            continue
+        if user_input == "/resume" or user_input.startswith("/resume "):
+            spec = user_input[len("/resume"):].strip()
+            if not spec:
+                print(colorize(format_sessions(), "dim"))
+                continue
+            resumed, note = resume_session(spec)
+            if resumed is None:
+                print(colorize(f"{icon('error')} {note}", "error"))
+                continue
+            messages = [{"role": "system", "content": system_prompt}] + resumed
+            _session_message(messages[0], MAIN_CONV_ID)
+            print(colorize(note, "dim"))
             continue
         if user_input == "/clear-screen":
             os.system("cls" if os.name == "nt" else "clear")
@@ -5310,6 +5908,7 @@ def main():
             print(colorize(format_help(), "dim"))
             continue
         messages.append(build_user_message(user_input))
+        _session_message(messages[-1], MAIN_CONV_ID)
         run_agent(
             messages,
             args.model,

@@ -5059,6 +5059,8 @@ class TestNoVisionCli(Base):
                 "--no-vision",
                 "--context-window",
                 "1000",
+                "--sessions-dir",
+                os.path.join(self.tmp, "sessions"),  # keep the repo's own log dir clean
             ],
             input="/exit\n",
             capture_output=True,
@@ -5625,6 +5627,515 @@ class TestContextProgress(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+
+class TestSessionLog(unittest.TestCase):
+    """The session journal: every message the harness replays to the API, in one
+    file per conversation (sub-agents in their own), and what --resume / /resume
+    makes of such a file. Like TestSubagents, these drive the real
+    run_agent/_agent_loop with a scripted stream_once: a script that returned
+    streamed=False would send run_agent to chat(), i.e. a live request, so h.chat
+    is patched to raise."""
+
+    ATTRS = (
+        "SESSION_LOG", "SESSION_ID", "SESSION_MODE", "SESSION_WARNED", "SESSION_DIR",
+        "AGENT_LOG_ID", "OUTPUT_INDENT", "MODEL", "TEMPERATURE", "_AGENT_DEPTH",
+        "MAX_SUBAGENT_DEPTH", "SUBAGENT_STEP_LIMIT", "_NEXT_CONV_ID", "chat",
+        "stream_once", "_session_new_id", "TODO_FILE",
+    )
+
+    def setUp(self):
+        self.tmp = "./_test_tmp"
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        os.makedirs(self.tmp, exist_ok=True)
+        self.sessions = os.path.join(self.tmp, "sessions")
+        self._saved = {name: getattr(h, name) for name in self.ATTRS}
+        self._saved_state = (
+            dict(h.SESSION_FILES), dict(h.SESSION_SEQ), dict(h.SUBAGENT_CHILDREN),
+        )
+        h.SESSION_DIR = self.sessions
+        h.SESSION_LOG = True
+        h.SESSION_WARNED = False
+        h.SESSION_ID = ""
+        h._session_new_id = lambda: "test-session"  # predictable file names
+        h.AGENT_LOG_ID = ""
+        h.OUTPUT_INDENT = ""
+        h.MODEL = "test-model"
+        h.TEMPERATURE = 0.2
+        h._AGENT_DEPTH = 0
+        h.MAX_SUBAGENT_DEPTH = 3
+        h.SUBAGENT_STEP_LIMIT = 0
+        h.TODO_FILE = os.path.join(self.tmp, ".harnless", "todo.md")
+
+        def no_live_api(*args, **kwargs):
+            raise AssertionError("tests must not reach a live LLM server")
+
+        h.chat = no_live_api
+
+    def tearDown(self):
+        for name, value in self._saved.items():
+            setattr(h, name, value)
+        files, seq, children = self._saved_state
+        h.SESSION_FILES.clear()
+        h.SESSION_FILES.update(files)
+        h.SESSION_SEQ.clear()
+        h.SESSION_SEQ.update(seq)
+        h.SUBAGENT_CHILDREN.clear()
+        h.SUBAGENT_CHILDREN.update(children)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # ---- helpers
+
+    def _call(self, name, args, call_id=None):
+        return {
+            "id": call_id or f"call-{name}",
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args)},
+        }
+
+    def _tool_turn(self, name, args, call_id=None):
+        return {"role": "assistant", "content": "", "tool_calls": [self._call(name, args, call_id)]}
+
+    def _scripted(self, decide):
+        """Install a scripted stream_once: decide(messages, depth, turn) -> (msg, True)."""
+        seen = {}
+
+        def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
+            depth = h._AGENT_DEPTH
+            turn = seen.get(depth, 0)
+            seen[depth] = turn + 1
+            return decide(messages, depth, turn)
+
+        h.stream_once = fake_stream_once
+
+    def _run(self, extra_messages=True, **kw):
+        """An interactive top-level run against the conversation journal."""
+        h.start_session(kw.pop("mode", "interactive"))
+        messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "go"}]
+        h._session_messages(messages, h.MAIN_CONV_ID)
+        code = h.run_agent(
+            messages, "test-model", interactive=True, temperature=0.2, conv_id=h.MAIN_CONV_ID
+        )
+        return code, messages
+
+    def _log(self, name="test-session.jsonl"):
+        with open(os.path.join(self.sessions, name), "r", encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def _jmessages(self, name="test-session.jsonl"):
+        return [r for r in self._log(name) if r.get("type") == "message"]
+
+    def _write_log(self, name, records):
+        os.makedirs(self.sessions, exist_ok=True)
+        with open(os.path.join(self.sessions, name), "w", encoding="utf-8") as f:
+            for rec in records:
+                f.write(json.dumps(rec) + "\n")
+
+    def _names(self):
+        return sorted(os.listdir(self.sessions))
+
+    # ---- what gets journaled
+
+    def test_conversation_is_journaled_in_order(self):
+        self._scripted(
+            lambda m, d, t: (self._tool_turn("get_cwd", {}, "c1"), True)
+            if t == 0 else ({"role": "assistant", "content": "done"}, True)
+        )
+        code, _ = self._run()
+        self.assertEqual(code, 0)
+        records = self._log()
+        self.assertEqual(records[0]["type"], "session")
+        self.assertEqual(records[0]["session_id"], "test-session")
+        self.assertEqual(records[0]["mode"], "interactive")
+        self.assertEqual(records[0]["depth"], 0)
+        self.assertEqual(records[0]["model"], "test-model")
+        self.assertEqual([r.get("type") for r in records],
+                         ["session"] + ["message"] * 5)
+        self.assertEqual([r["role"] for r in records[1:]],
+                         ["system", "user", "assistant", "tool", "assistant"])
+        self.assertEqual([r["seq"] for r in records], list(range(len(records))))
+        self.assertTrue(all(r.get("ts") for r in records))
+        self.assertEqual(records[4]["content"], h.CWD)  # the get_cwd result
+        self.assertEqual(records[3]["tool_calls"][0]["function"]["arguments"], "{}")
+        self.assertEqual(records[4]["chars"], len(h.CWD))
+
+    def test_journal_is_untouched_when_no_session_was_opened(self):
+        self._scripted(lambda m, d, t: ({"role": "assistant", "content": "done"}, True))
+        messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "go"}]
+        self.assertEqual(h.run_agent(
+            messages, "test-model", interactive=True, temperature=0.2, conv_id=h.MAIN_CONV_ID
+        ), 0)
+        self.assertFalse(os.path.isdir(self.sessions))
+
+    def test_logging_off_writes_nothing(self):
+        h.SESSION_LOG = False
+        self._scripted(lambda m, d, t: ({"role": "assistant", "content": "done"}, True))
+        self.assertEqual(self._run()[0], 0)
+        self.assertFalse(os.path.isdir(self.sessions))
+
+    def test_usage_is_recorded_per_llm_call(self):
+        h.start_session()
+        h._record_usage(
+            [{"role": "user", "content": "hi"}],
+            {"prompt_tokens": 1200, "completion_tokens": 3, "total_tokens": 1203},
+            conv_id=h.MAIN_CONV_ID,
+        )
+        h._record_usage([{"role": "user", "content": "hi"}], None, conv_id=h.MAIN_CONV_ID)
+        records = self._log()
+        self.assertEqual([r.get("type") for r in records], ["session", "usage"])
+        self.assertEqual(records[1]["usage"]["prompt_tokens"], 1200)
+        self.assertEqual(records[1]["messages"], 1)
+
+    def test_todo_reminder_is_journaled(self):
+        h.start_session()
+        h.tool_todo({"action": "add", "text": "write the log"})
+        messages = [{"role": "system", "content": "s"}]
+        h._todo_reminder(messages, h.MAIN_CONV_ID)
+        self.assertEqual(self._jmessages()[-1]["role"], "user")
+        self.assertIn("write the log", self._jmessages()[-1]["content"])
+
+    def test_inline_image_data_does_not_land_in_the_log(self):
+        h.start_session()
+        big = "data:image/png;base64," + "A" * 4000
+        h._session_message(
+            {"role": "user", "content": [
+                {"type": "text", "text": "see"},
+                {"type": "image_url", "image_url": {"url": big}},
+            ]},
+            h.MAIN_CONV_ID,
+        )
+        record = self._jmessages()[0]
+        dumped = json.dumps(record)
+        self.assertNotIn("AAAA", dumped)
+        self.assertIn("image elided in the session log", dumped)
+        self.assertEqual(record["chars"], len("see") + len(big))  # real size, still known
+        self.assertEqual(record["content"][0]["text"], "see")
+
+    def test_interrupted_partial_is_journaled(self):
+        def interrupted(messages, model, interactive=False, temperature=0.2, conv_id=None):
+            raise h.StreamInterrupted(
+                {"role": "assistant", "content": "half a sentence", "tool_calls": [self._call("get_cwd", {})]}
+            )
+
+        h.stream_once = interrupted
+        h.start_session()
+        messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "go"}]
+        h._session_messages(messages, h.MAIN_CONV_ID)
+        self.assertEqual(h.run_agent(
+            messages, "test-model", interactive=True, temperature=0.2, conv_id=h.MAIN_CONV_ID
+        ), 0)
+        last = self._jmessages()[-1]
+        self.assertEqual(last["role"], "assistant")
+        self.assertEqual(last["content"], "half a sentence")
+        self.assertNotIn("tool_calls", last)  # half-formed calls are never replayed
+
+    def test_a_log_that_cannot_be_written_does_not_break_the_session(self):
+        blocker = os.path.join(self.tmp, "not-a-directory")
+        with open(blocker, "w", encoding="utf-8") as f:
+            f.write("SESSION_DIR points at this file")
+        h.SESSION_DIR = blocker
+        self._scripted(lambda m, d, t: ({"role": "assistant", "content": "done"}, True))
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            # Already the header is where it fails: nothing can be created inside
+            # a file. The session must carry on regardless.
+            h.start_session()
+            messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "go"}]
+            h._session_messages(messages, h.MAIN_CONV_ID)
+            code = h.run_agent(
+                messages, "test-model", interactive=True, temperature=0.2, conv_id=h.MAIN_CONV_ID
+            )
+        self.assertEqual(code, 0)  # the agent carries on with no journal at all
+        self.assertFalse(h.SESSION_LOG)
+        self.assertIn("session log disabled", out.getvalue())
+        self.assertEqual(out.getvalue().count("session log disabled"), 1)  # reported once
+
+    # ---- sub-agents get their own logs
+
+    def test_sub_agent_run_gets_its_own_log(self):
+        def decide(messages, depth, turn):
+            if depth == 0:
+                if turn == 0:
+                    return self._tool_turn("task", {"task": "explore the repo"}, "t1"), True
+                return {"role": "assistant", "content": "parent done"}, True
+            return {"role": "assistant", "content": "what the sub-agent found"}, True
+
+        self._scripted(decide)
+        self._run()
+        self.assertEqual(set(self._names()), {"test-session.jsonl", "test-session.1.jsonl"})
+
+        sub = self._log("test-session.1.jsonl")
+        header = sub[0]
+        self.assertEqual(header["type"], "session")
+        self.assertEqual(header["mode"], "sub-agent")
+        self.assertEqual(header["subagent_id"], "1")
+        self.assertEqual(header["depth"], 1)
+        self.assertEqual(header["task"], "explore the repo")
+        self.assertEqual(header["parent_log"], os.path.join(self.sessions, "test-session.jsonl"))
+        self.assertEqual([r["role"] for r in sub[1:-1] if r.get("type") == "message"],
+                         ["system", "user", "assistant"])
+        self.assertEqual(self._jmessages("test-session.1.jsonl")[1]["content"], "explore the repo")
+        self.assertEqual(sub[-1]["type"], "end")
+        self.assertEqual(sub[-1]["exit_code"], 0)
+
+        parent = self._log()
+        # The parent's log holds its own side of the hand-off: the delegation call
+        # and the summary back — not the sub-agent's system prompt or its turns.
+        self.assertEqual([r["role"] for r in parent[1:] if r.get("type") == "message"],
+                         ["system", "user", "assistant", "tool", "assistant"])
+        self.assertEqual([r["content"] for r in parent[1:] if r["role"] == "user"], ["go"])
+        self.assertIn("exit code: 0", parent[4]["content"])
+        self.assertIn("what the sub-agent found", parent[4]["content"])
+
+    def test_nested_runs_chain_their_log_names(self):
+        def decide(messages, depth, turn):
+            if turn == 0 and depth < 2:
+                return self._tool_turn("task", {"task": f"deeper from level {depth}"}, f"t{depth}"), True
+            return {"role": "assistant", "content": f"level {depth} done"}, True
+
+        self._scripted(decide)
+        self._run()
+        self.assertEqual(
+            set(self._names()),
+            {"test-session.jsonl", "test-session.1.jsonl", "test-session.1.1.jsonl"},
+        )
+        grandchild = self._log("test-session.1.1.jsonl")[0]
+        self.assertEqual(grandchild["subagent_id"], "1.1")
+        self.assertEqual(grandchild["depth"], 2)
+        self.assertEqual(
+            grandchild["parent_log"], os.path.join(self.sessions, "test-session.1.jsonl")
+        )
+
+    def test_sibling_runs_do_not_share_a_log(self):
+        def decide(messages, depth, turn):
+            if depth == 0 and turn < 2:
+                return self._tool_turn("task", {"task": f"job {turn}"}, f"t{turn}"), True
+            return {"role": "assistant", "content": "done"}, True
+
+        self._scripted(decide)
+        self._run()
+        self.assertEqual(
+            set(self._names()),
+            {"test-session.1.jsonl", "test-session.2.jsonl", "test-session.jsonl"},
+        )
+        self.assertEqual(self._log("test-session.1.jsonl")[0]["task"], "job 0")
+        self.assertEqual(self._log("test-session.2.jsonl")[0]["task"], "job 1")
+
+    def test_a_refused_delegation_logs_nothing(self):
+        h.MAX_SUBAGENT_DEPTH = 0
+        out = h.tool_task({"task": "no nesting allowed"})
+        self.assertTrue(out.startswith("error: sub-agent depth limit reached"))
+        self.assertFalse(os.path.isdir(self.sessions))  # a refused call opens no log
+
+    # ---- resuming a session
+
+    def test_resume_rebuilds_the_recorded_conversation(self):
+        self._scripted(
+            lambda m, d, t: (self._tool_turn("get_cwd", {}, "c1"), True)
+            if t == 0 else ({"role": "assistant", "content": "done"}, True)
+        )
+        self._run()
+        messages, note = h.resume_session("test-session")
+        self.assertIsNotNone(messages)
+        self.assertIn("resumed session test-session", note)
+        # Journal envelope keys are gone, and so is the old system message: the
+        # resumed run supplies its own (current version, AGENTS.md, memory).
+        self.assertEqual([m["role"] for m in messages], ["user", "assistant", "tool", "assistant"])
+        self.assertEqual(set(messages[0]), {"role", "content"})
+        self.assertEqual(messages[-1]["content"], "done")
+        self.assertEqual(h.SESSION_ID, "test-session")
+        self.assertEqual(h._session_path(), os.path.join(self.sessions, "test-session.jsonl"))
+
+    def test_resume_latest_picks_the_newest_top_level_log(self):
+        self._write_log("older.jsonl", [
+            {"type": "session", "seq": 0, "ts": "t", "session_id": "older"},
+            {"type": "message", "seq": 1, "ts": "t", "role": "user", "content": "old run"},
+        ])
+        self._write_log("newer.jsonl", [
+            {"type": "session", "seq": 0, "ts": "t", "session_id": "newer"},
+            {"type": "message", "seq": 1, "ts": "t", "role": "user", "content": "new run"},
+        ])
+        # A sub-agent log of the newer session is newer than both main logs, and
+        # 'latest' still means a conversation, not one sub-agent run of it.
+        self._write_log("newer.1.jsonl", [
+            {"type": "session", "seq": 0, "ts": "t", "session_id": "newer", "subagent_id": "1"},
+            {"type": "message", "seq": 1, "ts": "t", "role": "user", "content": "sub run"},
+        ])
+        future = time.time() + 60
+        for name in ("newer.jsonl", "newer.1.jsonl"):
+            os.utime(os.path.join(self.sessions, name), (future, future))
+        messages, note = h.resume_session("latest")
+        self.assertEqual(messages[0]["content"], "new run")
+        self.assertEqual(h.SESSION_ID, "newer")
+
+    def test_resume_continues_the_same_log_without_recording_it_twice(self):
+        self._scripted(
+            lambda m, d, t: (self._tool_turn("get_cwd", {}, "c1"), True)
+            if t == 0 else ({"role": "assistant", "content": "done"}, True)
+        )
+        self._run()
+        before = len(self._jmessages())
+        last_seq = self._log()[-1]["seq"]
+        messages, _ = h.resume_session("test-session")
+        # A resumed run appends a `resume` marker, then only what it adds itself:
+        # re-recording the restored messages would double the log at every resume.
+        h._session_messages([{"role": "system", "content": "new system"}], h.MAIN_CONV_ID)
+        h._session_messages([{"role": "user", "content": "carry on"}], h.MAIN_CONV_ID)
+        records = self._log()
+        self.assertEqual(len([r for r in records if r.get("type") == "message"]), before + 2)
+        self.assertEqual(records[before + 1]["type"], "resume")
+        self.assertEqual(records[before + 1]["restored"], len(messages))
+        self.assertEqual(records[-1]["seq"], last_seq + 3)  # numbering continues, not restarts
+        self.assertEqual(records[-1]["content"], "carry on")
+
+    def test_resume_closes_a_tool_call_the_log_left_unanswered(self):
+        self._write_log("half.jsonl", [
+            {"type": "session", "seq": 0, "ts": "t", "session_id": "half"},
+            {"type": "message", "seq": 1, "ts": "t", "role": "user", "content": "go"},
+            {
+                "type": "message", "seq": 2, "ts": "t", "role": "assistant", "content": "",
+                "tool_calls": [self._call("run_shell", {"command": "sleep"}, "a1")],
+            },
+        ])
+        messages, _ = h.resume_session("half")
+        self.assertEqual([m["role"] for m in messages], ["user", "assistant", "tool"])
+        answer = messages[-1]
+        self.assertEqual(answer["tool_call_id"], "a1")
+        self.assertIn(h.SESSION_UNANSWERED_NOTE, answer["content"])
+
+    def test_resume_drops_orphans_and_contentless_partials(self):
+        self._write_log("dirty.jsonl", [
+            {"type": "session", "seq": 0, "ts": "t", "session_id": "dirty"},
+            {"type": "message", "seq": 1, "ts": "t", "role": "system", "content": "old system"},
+            {"type": "message", "seq": 2, "ts": "t", "role": "tool", "tool_call_id": "ghost",
+             "content": "an answer nobody asked for"},
+            {"type": "message", "seq": 3, "ts": "t", "role": "user", "content": "go"},
+            {"type": "message", "seq": 4, "ts": "t", "role": "assistant",
+             "reasoning_content": "interrupted mid-thinking"},
+            {"type": "message", "seq": 5, "ts": "t", "role": "user", "content": "again"},
+            {"type": "message", "seq": 6, "ts": "t", "role": "assistant",
+             "content": "", "reasoning_content": "thinking",
+             "tool_calls": [self._call("get_cwd", {}, "ok1")]},
+            {"type": "message", "seq": 7, "ts": "t", "role": "tool", "tool_call_id": "ok1",
+             "content": "here"},
+        ])
+        messages, _ = h.resume_session("dirty")
+        self.assertEqual([m["role"] for m in messages],
+                         ["user", "user", "assistant", "tool"])
+        self.assertNotIn("reasoning_content", messages[0])  # contentless partial dropped
+        self.assertEqual(messages[-1]["content"], "here")
+
+    def test_resume_last_keeps_the_tail_of_a_long_session(self):
+        records = [{"type": "session", "seq": 0, "ts": "t", "session_id": "long"}]
+        records.append({"type": "message", "seq": 1, "ts": "t", "role": "user", "content": "early"})
+        records.append({
+            "type": "message", "seq": 2, "ts": "t", "role": "assistant", "content": "",
+            "tool_calls": [self._call("get_cwd", {}, "c")],
+        })
+        records.append({"type": "message", "seq": 3, "ts": "t", "role": "tool",
+                        "tool_call_id": "c", "content": "cwd"})
+        records.append({"type": "message", "seq": 4, "ts": "t", "role": "assistant", "content": "late"})
+        self._write_log("long.jsonl", records)
+        messages, note = h.resume_session("long", keep=3)
+        self.assertEqual([m["role"] for m in messages], ["assistant", "tool", "assistant"])
+        self.assertEqual(messages[1]["content"], "cwd")  # the call and its answer stay together
+        self.assertIn("kept the last 3", note)
+        # A cut that lands between a tool call and its answer drops the orphaned
+        # answer: the tail has to be a conversation a server will accept.
+        self._write_log("cut.jsonl", [
+            {"type": "session", "seq": 0, "ts": "t", "session_id": "cut"},
+            {"type": "message", "seq": 1, "ts": "t", "role": "user", "content": "go"},
+            {
+                "type": "message", "seq": 2, "ts": "t", "role": "assistant", "content": "",
+                "tool_calls": [self._call("get_cwd", {}, "c2")],
+            },
+            {"type": "message", "seq": 3, "ts": "t", "role": "tool", "tool_call_id": "c2",
+             "content": "the cwd"},
+        ])
+        messages, note = h.resume_session("cut", keep=1)
+        self.assertIsNone(messages)
+        self.assertIn("no messages to resume", note)
+
+    def test_resume_of_an_unknown_session_names_what_it_tried(self):
+        messages, note = h.resume_session("nope")
+        self.assertIsNone(messages)
+        self.assertIn("no session log for 'nope'", note)
+        self.assertIn("/sessions", note)
+        messages, note = h.resume_session("")
+        self.assertIsNone(messages)
+        self.assertIn("lists recent sessions", note)
+
+    def test_resuming_a_sub_agent_log_continues_that_chain(self):
+        self._write_log("chain.1.2.jsonl", [
+            {"type": "session", "seq": 0, "ts": "t", "session_id": "chain", "subagent_id": "1.2"},
+            {"type": "message", "seq": 1, "ts": "t", "role": "user", "content": "nested task"},
+        ])
+        messages, _ = h.resume_session("chain.1.2")
+        self.assertEqual(h.SESSION_ID, "chain.1.2")
+        # The chain keeps its place: a sub-agent of the resumed run nests under it.
+        self.assertEqual(h._session_path(h.SESSION_ID, "1"),
+                         os.path.join(self.sessions, "chain.1.2.1.jsonl"))
+        self.assertEqual(messages[0]["content"], "nested task")
+
+    def test_sessions_are_listed_newest_first(self):
+        def decide(messages, depth, turn):
+            if depth == 0 and turn == 0:
+                return self._tool_turn("task", {"task": "sub work"}, "t1"), True
+            return {"role": "assistant", "content": "done"}, True
+
+        self._scripted(decide)
+        self._run()
+        out = h.format_sessions()
+        self.assertIn("test-session", out)
+        self.assertIn("1 sub-agent logs", out)
+        self.assertIn("5 messages", out)  # system, user, the task call, its result, the reply
+        self.assertIn("/resume <session-id>", out)
+        h.SESSION_FILES.pop(h.MAIN_CONV_ID, None)
+        h.SESSION_ID = ""
+        for name in os.listdir(self.sessions):
+            os.remove(os.path.join(self.sessions, name))
+        self.assertEqual(h.format_sessions(), f"no session logs in {self.sessions}")
+
+    def test_status_reports_the_session_and_its_log(self):
+        h.start_session("one-shot")
+        out = h.format_status([{"role": "user", "content": "hi"}])
+        self.assertIn("session: test-session", out)
+        self.assertIn("test-session.jsonl", out)
+        self.assertIn("sub-agents:", out)
+        h.SESSION_LOG = False
+        self.assertIn("session log: off", h.format_status([{"role": "user", "content": "hi"}]))
+
+    # ---- CLI plumbing
+
+    def test_cli_session_flags(self):
+        import subprocess
+
+        base = [sys.executable, "harnless.py", "--no-color", "--context-window", "1000"]
+        log_dir = os.path.join(self.tmp, "cli-sessions")
+        proc = subprocess.run(
+            base + ["--sessions-dir", log_dir], input="/exit\n",
+            capture_output=True, text=True, encoding="utf-8", timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("session log:", proc.stdout)
+        self.assertIn(os.path.abspath(log_dir), proc.stdout)  # the banner names the journal
+        self.assertTrue(any(n.endswith(".jsonl") for n in os.listdir(log_dir)))
+
+        off_dir = os.path.join(self.tmp, "cli-sessions-off")
+        proc = subprocess.run(
+            base + ["--sessions-dir", off_dir, "--no-session-log"], input="/exit\n",
+            capture_output=True, text=True, encoding="utf-8", timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("session log: off", proc.stdout)
+        self.assertFalse(os.path.exists(off_dir))
+
+        missing = os.path.join(self.tmp, "cli-sessions-empty")
+        proc = subprocess.run(
+            base + ["--sessions-dir", missing, "--resume", "no-such-session"], input="/exit\n",
+            capture_output=True, text=True, encoding="utf-8", timeout=120,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("no session log for 'no-such-session'", proc.stdout)
 
 
 if __name__ == "__main__":

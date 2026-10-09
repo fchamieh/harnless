@@ -14,6 +14,7 @@ Pure Python standard library — **no dependencies, no venv, no build step**.
 - **File & shell tools** — read/write/patch/search files and run shell commands (PowerShell on Windows, bash on POSIX)
 - **Sub-agents** — the `task` tool delegates self-contained work to a nested agent (configurable depth) and hands the result back as the sub-agent's closing summary
 - **State tools** — `todo` (task list) and `memory` (persistent notes) survive across turns
+- **Session log** — every message of a conversation is journaled as JSON Lines under `.harnless/sessions/` (each sub-agent run in its own file), and `--resume` / `/resume` continues a recorded session
 - **Streaming** — token-by-token output with Markdown rendering; press `ESC` twice to interrupt a running generation (it stops sub-agents and their parents too)
 - **MCP support** — plug in external tools via [Model Context Protocol](https://modelcontextprotocol.io) servers (stdio or HTTP)
 - **Standalone binaries** — build a self-contained executable for Windows, Linux, or macOS with Nuitka
@@ -43,11 +44,13 @@ python harnless.py --prompt "summarize the files in this directory"
 
 | Command | Effect |
 |---|---|
-| `/new` | Clear the session history |
+| `/new` | Clear the session history and start over (in a new session log) |
 | `/clear-screen` | Clear the terminal |
 | `/tools` | Toggle tools on/off (interactive menu; MCP tools are grouped under their server, collapsed by default — `+`/`=` expands, `-` collapses — and space on the server row toggles all of its tools) |
 | `/tools <name>` | Toggle a specific tool on/off (`mcp:<server>` toggles all of a server's tools) |
 | `/status` | Show context usage, model, enabled tools, and MCP servers |
+| `/sessions` | List the recorded session logs (newest first) |
+| `/resume <id>` | Continue a recorded session (`/resume` with no argument lists them) |
 | `/exit` | Quit (alias: `/quit`) |
 
 Other REPL behaviors:
@@ -73,7 +76,48 @@ Other REPL behaviors:
 | `--max-subagent-steps N` | Model turns a single sub-agent may take before its run is stopped (default `40`; `0` = unlimited; top-level agents are never capped) |
 | `--shell MODE` | Windows shell for `run_shell`: `auto` / `pwsh` / `powershell` / `cmd` (default `auto`, ignored off-Windows) |
 | `--context-window N` | Context window size in tokens (shown in `/status`); probed from the API's `/models` endpoint if omitted |
+| `--sessions-dir DIR` | Where session logs are written (default `.harnless/sessions`, or `HARNLESS_SESSIONS_DIR`) |
+| `--no-session-log` | Do not journal the session |
+| `--resume SPEC` | Continue a recorded session: a session id, a `"<id>.<chain>"` sub-agent log, `latest`, or a path to a `.jsonl` |
+| `--resume-last N` | With `--resume`: keep only the last N recorded messages of that session (0 = all) |
 | `--version` | Print the version and exit |
+
+### Session log
+
+Every conversation is journaled as it happens — the exact message objects the harness
+replays to the model, one JSON object per line:
+
+```
+.harnless/sessions/20261009-110041-a4c68b.jsonl      the top-level conversation
+.harnless/sessions/20261009-110041-a4c68b.1.jsonl    its first sub-agent run
+.harnless/sessions/20261009-110041-a4c68b.1.2.jsonl  a sub-agent of that sub-agent
+```
+
+The dotted chain id in a sub-agent file says who delegated it. Each line is one record:
+
+| `type` | What it holds |
+|---|---|
+| `session` | First line: version, session id, mode, cwd, API URL, model — and for a sub-agent log, its `depth`, `subagent_id`, `parent_log` and the `task` text it was given |
+| `message` | One message: `role`, `content`, `tool_calls`, `tool_call_id`, `reasoning_content`, plus the harness envelope (`seq`, `ts`, `chars`) |
+| `usage` | One per model call: message count and the server-reported token usage (how full the context was at that point) |
+| `end` | How a sub-agent's run ended: its exit code, `interrupted`, `step_limited` |
+| `resume` / `cleared` | Written when a log is resumed or when `/new` starts a new session |
+
+`seq` numbers a conversation's records from 0 and keeps counting across a resume — a
+stable id for each message, which is what a later compaction pass refers to. Inline
+images (`@[cwd://img.png]`) are recorded as a note naming them rather than as base64
+megabytes (`chars` still reports their real size). A log that cannot be written is
+dropped with one warning and the session continues without it. Nothing is written when
+`--no-session-log` is given.
+
+**Resuming** (`--resume <id|latest|path>`, or `/resume <id>` in the REPL) reads such a
+file back and continues that conversation: the recorded turns are replayed, the *system
+prompt is not* (the new run supplies its own, with the current AGENTS.md and memory
+notes), and any tool call the log left unanswered gets a note as its answer, so the
+rebuilt conversation is one a server will accept. The resumed run keeps appending to the
+same file — one continuous transcript, restored messages not recorded a second time.
+`--resume-last N` cuts the tail off a long session before rebuilding it (a cut landing
+inside a tool-call batch drops the orphaned answer). `/sessions` lists what is recorded.
 
 ### MCP servers
 
