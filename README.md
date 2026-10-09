@@ -203,6 +203,21 @@ in the working directory (case-insensitive) is auto-loaded and appended to the s
 `grep` and `glob` match with **exact case** by default — pass `case_sensitive: false` to ignore
 case (`grep` applies it to both the search pattern and `file_pattern`).
 
+They also skip what a **`.gitignore`** would hide: the same rules git applies in that
+directory, including nested `.gitignore` files (a nearer one outranks a shallower), `!`
+re-includes, `**`, and case-insensitive matching where the filesystem is. No `git` needed —
+the engine is in `harnless.py`, so it behaves the same outside a repository and on every
+platform. `list_dir` still reports what is really on disk.
+
+```
+grep  {"path": "./", "pattern": "TODO"}                        # .gitignored files skipped
+grep  {"path": "./", "pattern": "TODO", "respect_gitignore": false}   # search them anyway
+```
+
+A file you name explicitly as `path` is searched whatever git thinks of it, and when the
+skipping is what made an answer empty, the result says so:
+`no matches` + `... [2 gitignored paths skipped per .gitignore; pass respect_gitignore:false to include them]`.
+
 `run_shell` waits for the command **and everything it started**. At `timeout` (default 120s,
 max 3600s) the whole process tree is killed and whatever it printed so far is returned as
 `[partial output]` — no orphaned test runners, no drain that never finishes.

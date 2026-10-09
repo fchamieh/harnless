@@ -7,7 +7,9 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import unittest
 import urllib.error
@@ -569,6 +571,459 @@ class TestGlob(Base):
         self.w("a.txt", "x")
         out = self.glob("*.txt", path=os.path.join(self.tmp, "nope").replace("\\", "/"))
         self.assertEqual(out, "error: path not found: ./_test_tmp/nope")
+
+
+class TestGitignoreRules(unittest.TestCase):
+    """The .gitignore semantics grep/glob apply, asserted line by line. Each
+    expectation was read off `git check-ignore` (gitignore(5) is not precise
+    enough about `**` and precedence); TestGitignoreAgainstGit below is the live
+    differential against git itself.
+
+    `_is_ignored` judges one entry — a name and whether it is a directory. A
+    directory verdict is what prunes a whole subtree, so "the contents of an
+    ignored directory are gone" is a property of the walk (asserted in
+    TestGitignoreTools and the differential), not of the rule matching a path
+    inside it.
+    """
+
+    @staticmethod
+    def _view(patterns):
+        """One synthetic .gitignore, as the rules applied at a search root."""
+        return [
+            (regex, negate, dir_only, "")
+            for regex, negate, dir_only, _ in h._gitignore_rules("\n".join(patterns), "")
+        ]
+
+    def hidden(self, pattern, path, is_dir=False):
+        """Would one directory entry (name + kind) be refused by that pattern?"""
+        return h._is_ignored(self._view([pattern]), path, is_dir)
+
+    def survive(self, patterns, entries):
+        """Which entries a walk of the directory holding these rules yields, with
+        ignored directories pruned (`entries`: list of (path, is_dir))."""
+        view = [(regex, negate, dir_only, "") for regex, negate, dir_only, _
+                in h._gitignore_rules("\n".join(patterns), "")]
+        kept, pruned = [], set()
+        for path, is_dir in entries:
+            parent = path.rsplit("/", 1)[0] if "/" in path else ""
+            if any(p and (parent == p or parent.startswith(p + "/")) for p in pruned):
+                continue  # its directory was pruned: the walk never gets there
+            if h._is_ignored(view, path, is_dir):
+                if is_dir:
+                    pruned.add(path)
+                continue
+            if not is_dir:
+                kept.append(path)  # a walk yields files, not the directories it passed through
+        return kept
+
+    def test_comments_and_blank_lines_are_not_rules(self):
+        self.assertEqual(h._gitignore_rules("# dist/\n\n   \ndist/\n", ""),
+                         h._gitignore_rules("dist/\n", ""))
+
+    def test_a_bare_pattern_matches_at_any_depth(self):
+        self.assertTrue(self.hidden("foo", "foo"))
+        self.assertTrue(self.hidden("foo", "foo", is_dir=True))  # a bare rule matches dirs too
+        self.assertTrue(self.hidden("foo", "a/foo", is_dir=True))
+        self.assertFalse(self.hidden("foo", "foo.txt"))
+
+    def test_a_directory_rule_matches_at_any_depth_and_takes_its_contents(self):
+        self.assertTrue(self.hidden("dist/", "dist", is_dir=True))
+        self.assertTrue(self.hidden("dist/", "nested/dist", is_dir=True))
+        self.assertFalse(self.hidden("dist/", "nested/other", is_dir=True))
+        entries = [("dist", True), ("dist/a.txt", False), ("nested", True),
+                   ("nested/dist", True), ("nested/dist/b.txt", False),
+                   ("keep", True), ("keep/c.txt", False)]
+        self.assertEqual(self.survive(["dist/"], entries), ["keep/c.txt"])
+
+    def test_a_leading_slash_anchors_the_pattern_to_its_own_directory(self):
+        self.assertTrue(self.hidden("/build.txt", "build.txt"))
+        self.assertFalse(self.hidden("/build.txt", "deep/build.txt"))
+
+    def test_a_separator_inside_a_pattern_anchors_it(self):
+        self.assertTrue(self.hidden("nested/keep.me", "nested/keep.me"))
+        self.assertFalse(self.hidden("nested/keep.me", "tree/nested/keep.me"))
+
+    def test_a_trailing_slash_only_restricted_to_directories_does_not_anchor(self):
+        self.assertTrue(self.hidden("sl_only/", "sl_only", is_dir=True))
+        self.assertFalse(self.hidden("sl_only/", "sl_only"))  # a file of that name survives
+        self.assertTrue(self.hidden("sl_only/", "a/sl_only", is_dir=True))
+
+    def test_a_pattern_with_a_star_at_the_end_of_a_name_stays_inside_it(self):
+        # git: '**' crosses directories only when it is a whole path component
+        self.assertTrue(self.hidden("**suf/O.txt", "suf/O.txt"))
+        self.assertFalse(self.hidden("**suf/O.txt", "a/suf/O.txt"))
+        self.assertTrue(self.hidden("O**/S.txt", "Oq/S.txt"))
+        self.assertTrue(self.hidden("O**/S.txt", "O/S.txt"))
+        self.assertFalse(self.hidden("O**/S.txt", "O/a/S.txt"))
+
+    def test_double_star_over_directory_segments(self):
+        for path in ("L1.txt", "a/L1.txt", "a/b/c/L1.txt"):
+            self.assertTrue(self.hidden("**/L1.txt", path), path)
+        for path in ("p/M.txt", "p/a/M.txt", "p/a/b/M.txt"):
+            self.assertTrue(self.hidden("p/**/M.txt", path), path)
+        self.assertTrue(self.hidden("a/**/b.txt", "a/x/y/b.txt"))
+        self.assertFalse(self.hidden("a/**/b.txt", "q/a/b.txt"))  # anchored by its separator
+        self.assertFalse(self.hidden("dir/**", "dir", is_dir=True))  # the directory survives
+        self.assertTrue(self.hidden("dir/**", "dir/x"))
+        self.assertTrue(self.hidden("dir/**", "dir/x/y"))
+        for path in ("top.txt", "a/b/here.txt"):
+            self.assertTrue(self.hidden("**", path), path)
+
+    def test_single_star_and_question_mark_never_cross_a_separator(self):
+        self.assertTrue(self.hidden("q?x.txt", "qax.txt"))
+        self.assertFalse(self.hidden("q?x.txt", "qzy.txt"))
+        self.assertTrue(self.hidden("star*dir/", "starAdir", is_dir=True))
+        self.assertFalse(self.hidden("plain*end", "plainendX"))
+
+    def test_character_classes(self):
+        self.assertTrue(self.hidden("[ab]class.txt", "aclass.txt"))
+        self.assertFalse(self.hidden("[ab]class.txt", "cclass.txt"))
+        self.assertTrue(self.hidden("cls[a-c]z.txt", "clsaz.txt"))
+        self.assertFalse(self.hidden("cls[a-c]z.txt", "clsdz.txt"))
+        self.assertTrue(self.hidden("cls[!a-c]z.txt", "clsdz.txt"))
+        self.assertTrue(self.hidden("[!ab]x.txt", "!x.txt"))  # a negated class matches '!'
+
+    def test_the_last_matching_line_of_a_file_decides(self):
+        self.assertTrue(h._is_ignored(self._view(["!first.log", "*.log"]), "first.log", False))
+        self.assertFalse(
+            h._is_ignored(self._view(["*.log", "!important.log"]), "important.log", False)
+        )
+        self.assertFalse(
+            h._is_ignored(self._view(["*.log", "!important.log"]), "a/important.log", False)
+        )
+
+    def test_escapes_make_hash_and_bang_ordinary_characters(self):
+        self.assertTrue(self.hidden("\\#hash.txt", "#hash.txt"))
+        self.assertFalse(self.hidden("\\#hash.txt", "hash.txt"))
+        self.assertTrue(self.hidden("\\!lit.txt", "!lit.txt"))  # an escaped '!' is not a negation
+
+    def test_trailing_blanks_are_dropped_but_an_escaped_one_is_kept(self):
+        self.assertTrue(self.hidden("trail  ", "trail"))
+        self.assertTrue(self.hidden("esc\\ ", "esc "))
+
+    def test_a_pattern_git_cannot_use_is_dropped(self):
+        # git check-ignore matches nothing at all for these, so neither does harnless
+        self.assertEqual(h._gitignore_rules("[ab\n[z-a].txt\n", ""), [])
+        self.assertFalse(self.hidden("[ab", "[ab"))
+        self.assertFalse(self.hidden("[z-a].txt", "azz.txt"))
+        self.assertEqual(h._gitignore_rules("\n", ""), [])
+
+    def test_case_follows_the_filesystem(self):
+        # git's core.ignorecase defaults to true where the filesystem is
+        # case-insensitive, false elsewhere — the ignore match follows it.
+        with mock.patch.object(h.os, "name", "nt"):
+            self.assertTrue(self.hidden("dist/", "DIST", is_dir=True))
+            self.assertTrue(self.hidden("*.log", "BUILD.LOG"))
+        with mock.patch.object(h.os, "name", "posix"):
+            self.assertFalse(self.hidden("dist/", "DIST", is_dir=True))
+            self.assertTrue(self.hidden("dist/", "dist", is_dir=True))
+            self.assertFalse(self.hidden("*.log", "BUILD.LOG"))
+
+
+class TestGitignoreTools(Base):
+    """grep/glob skip what .gitignore hides, and say so when that empties the answer."""
+
+    NOTE = "; pass respect_gitignore:false to include them]"
+
+    def tree(self):
+        self.w("ig/.gitignore", "logs/\n*.log\n!keep.log\nonly_dir/\n")
+        self.w("ig/src/app.py", "NEEDLE\n")
+        self.w("ig/logs/app.log", "NEEDLE\n")  # hidden twice: the directory, then *.log
+        self.w("ig/ignored.log", "NEEDLE\n")  # hidden by *.log
+        self.w("ig/keep.log", "NEEDLE\n")  # brought back by '!keep.log'
+        self.w("ig/only_dir/hidden.txt", "NEEDLE\n")  # inside a pruned directory
+        self.w("ig/deep/deep.txt", "NEEDLE\n")  # nothing gitignore has against it
+        return f"{self.tmp}/ig"
+
+    def grep(self, **kw):
+        args = {"path": kw.pop("path", self.tree()), "pattern": "NEEDLE"}
+        args.update(kw)
+        return h.tool_grep(args)
+
+    def glob(self, pattern, **kw):
+        args = {"path": kw.pop("path", self.tree()), "pattern": pattern}
+        args.update(kw)
+        return h.tool_glob(args)
+
+    @staticmethod
+    def matched(out):
+        return sorted(line.split(":")[0] for line in out.split("\n") if line.endswith(": NEEDLE"))
+
+    def test_ignored_paths_are_skipped_by_default(self):
+        self.assertEqual(self.matched(self.grep()), [
+            "_test_tmp/ig/deep/deep.txt",
+            "_test_tmp/ig/keep.log",
+            "_test_tmp/ig/src/app.py",
+        ])
+
+    def test_respect_gitignore_false_searches_them_too(self):
+        self.assertEqual(self.matched(self.grep(respect_gitignore=False)), [
+            "_test_tmp/ig/deep/deep.txt",
+            "_test_tmp/ig/ignored.log",
+            "_test_tmp/ig/keep.log",
+            "_test_tmp/ig/logs/app.log",
+            "_test_tmp/ig/only_dir/hidden.txt",
+            "_test_tmp/ig/src/app.py",
+        ])
+
+    def test_the_knob_accepts_the_strings_models_send(self):
+        for value in ("false", "no", "0", False):
+            self.assertIn("only_dir/hidden.txt", self.grep(respect_gitignore=value), repr(value))
+        for value in ("true", "yes", "1", True):
+            self.assertNotIn("only_dir/hidden.txt", self.grep(respect_gitignore=value), repr(value))
+
+    def test_an_empty_answer_says_what_was_skipped(self):
+        self.w("ig3/.gitignore", "build/\n")
+        self.w("ig3/build/x.txt", "NEEDLE\n")
+        self.w("ig3/notes.txt", "nothing here\n")
+        out = self.grep(path=f"{self.tmp}/ig3")
+        self.assertEqual(out, "no matches\n... [1 gitignored path skipped per .gitignore" + self.NOTE)
+        self.w("ig3/backup.dat", "NEEDLE\n")
+        self.w("ig3/.gitignore", "build/\n*.dat\n")
+        out = self.grep(path=f"{self.tmp}/ig3")
+        self.assertEqual(out, "no matches\n... [2 gitignored paths skipped per .gitignore" + self.NOTE)
+
+    def test_a_search_that_found_something_carries_no_note(self):
+        out = self.grep()  # ignored paths were skipped here too, but the answer is not empty
+        self.assertNotIn("gitignored", out)
+        self.assertEqual(len(self.matched(out)), 3)
+
+    def test_glob_applies_the_same_filter(self):
+        self.assertEqual(self.glob("**/*"), "\n".join([
+            "_test_tmp/ig/.gitignore",
+            "_test_tmp/ig/deep/deep.txt",
+            "_test_tmp/ig/keep.log",
+            "_test_tmp/ig/src/app.py",
+        ]))
+        self.assertEqual(self.glob("**/*.log"), "_test_tmp/ig/keep.log")
+
+    def test_glob_opt_out_and_note(self):
+        hidden = "no files matched\n... [3 gitignored paths skipped per .gitignore" + self.NOTE
+        self.assertEqual(self.glob("**/logs/*"), hidden)
+        self.assertEqual(self.glob("**/logs/*", respect_gitignore=False),
+                         "_test_tmp/ig/logs/app.log")
+
+    def test_a_named_directory_is_pruned_by_nothing_but_its_files_are_still_judged(self):
+        # respect_gitignore governs what the walk descends into: a directory the
+        # agent named is never pruned, but the rules still judge the files inside
+        # it, and '!'/no-knob is the way to see one that they refuse.
+        tree = self.tree()
+        self.w("ig/logs/plain.txt", "NEEDLE\n")
+        self.assertEqual(self.grep(path=f"{tree}/logs"), "_test_tmp/ig/logs/plain.txt:1: NEEDLE")
+        out = self.grep(path=f"{tree}/logs", respect_gitignore=False)
+        self.assertIn("_test_tmp/ig/logs/app.log:1: NEEDLE", out)
+        self.assertIn("_test_tmp/ig/logs/plain.txt:1: NEEDLE", out)
+        self.assertEqual(self.glob("**/*", path=f"{tree}/only_dir"),
+                         "_test_tmp/ig/only_dir/hidden.txt")
+
+    def test_an_explicit_path_is_searched_whatever_git_thinks_of_it(self):
+        tree = self.tree()
+        self.assertEqual(
+            self.grep(path=f"{tree}/logs/app.log"), "_test_tmp/ig/logs/app.log:1: NEEDLE"
+        )
+        self.assertEqual(
+            self.glob("**/*.txt", path=f"{tree}/only_dir/hidden.txt"),
+            "_test_tmp/ig/only_dir/hidden.txt",
+        )
+
+    def test_an_ancestor_gitignore_reaches_a_subdirectory_search(self):
+        self.w(".gitignore", "pkg_build/\n")  # above the searched directory
+        self.w("ig/pkg_build/x.txt", "NEEDLE\n")
+        self.assertNotIn("pkg_build", self.grep())
+        self.assertIn("_test_tmp/ig/pkg_build/x.txt", self.grep(respect_gitignore=False))
+
+    def test_a_nested_gitignore_outranks_the_parent(self):
+        tree = self.tree()  # the parent file hides '*.log'
+        self.w("ig/sub/.gitignore", "!keep2.log\n")
+        self.w("ig/sub/keep2.log", "NEEDLE\n")
+        self.w("ig/sub/other.log", "NEEDLE\n")
+        self.assertIn("_test_tmp/ig/sub/keep2.log", self.grep())
+        self.assertNotIn("ig/sub/other.log", self.grep())
+        self.assertIn("_test_tmp/ig/sub/other.log", self.grep(respect_gitignore=False))
+
+    def test_a_pruned_directory_cannot_be_reentered_by_a_negation_inside_it(self):
+        self.w("ig3/.gitignore", "skipme/\n!skipme/keep.txt\n")
+        self.w("ig3/skipme/keep.txt", "NEEDLE\n")
+        self.assertEqual(
+            self.grep(path=f"{self.tmp}/ig3"),
+            "no matches\n... [1 gitignored path skipped per .gitignore" + self.NOTE,
+        )
+
+    def test_names_that_are_always_skipped_stay_skipped_on_the_opt_out(self):
+        tree = self.tree()
+        self.w("ig/node_modules/pkg/p.js", "NEEDLE\n")
+        self.w("ig/__pycache__/m.py", "NEEDLE\n")
+        out = self.grep(respect_gitignore=False)
+        self.assertNotIn("node_modules", out)
+        self.assertNotIn("__pycache__", out)
+
+    def test_list_dir_still_reports_what_is_on_disk(self):
+        self.tree()
+        self.assertIn("logs/", h.tool_list_dir({"path": f"{self.tmp}/ig"}))
+
+
+class TestGitignoreAgainstGit(unittest.TestCase):
+    """Differential check of the engine against real git, because gitignore(5)
+    leaves `**` and precedence open to reading. Each fixture tree is created
+    outside the repository and `git init` makes it its own work tree (so nothing
+    above it applies); git's own answer — `git ls-files --others --exclude-standard`,
+    the set of files git can see — must equal what `_iter_files` yields, both for
+    the whole tree and for a search rooted inside it. A fresh repo's
+    `.git/info/exclude` holds no rules and the global/system config is pinned off,
+    so the comparison is .gitignore-only, which is what the harness implements.
+    Skipped where git is not installed."""
+
+    CASES = [
+        {
+            "name": "patterns",
+            "ignore": {
+                "": "# a comment\n"
+                    "\n"
+                    "dist/\n"
+                    "/build.txt\n"
+                    "*.log\n"
+                    "!important.log\n"
+                    "sub/\n"
+                    "foo\n"
+                    "logs/**\n"
+                    "nested/keep.me\n"
+                    "**/deep/target.txt\n"
+                    "src/**\n"
+                    "parent-excluded/\n"
+                    "!parent-excluded/inner.txt\n"
+                    "q?x.txt\n"
+                    "[ab]class.txt\n"
+                    "\\#hash.txt\n"
+                    "mid/part/\n"
+                    "star*dir/\n"
+                    "dironly\n"
+                    "plain*end\n"
+            },
+            "files": "dist/a.txt nested/dist/a.txt sub/x.txt foo/x.txt foo.txt a/foo/x.txt "
+                     "logs/x.txt logs/deep/y.txt build.txt deep/build.txt important.log "
+                     "a/important.log nested/keep.me tree/nested/keep.me src/a.txt src/a/b.txt "
+                     "parent-excluded/inner.txt qax.txt aclass.txt cclass.txt #hash.txt hash.txt "
+                     "mid/part/f.txt tree/mid/part/f.txt starAdir/x.txt dironly/f.txt plainAend "
+                     "tree/dist/dist.log keepme/visible.txt".split(),
+        },
+        {
+            "name": "stars",
+            "ignore": {"": "**/L1.txt\np/**/M.txt\ndir/**\n**/one/two/R.txt\n**suf/O.txt\nO**/S.txt\n"},
+            "files": "L1.txt a/L1.txt a/b/L1.txt a/b/c/L1.txt p/M.txt p/a/M.txt p/a/b/M.txt "
+                     "dir/f.txt dir/sub/f.txt one/two/R.txt a/one/two/R.txt a/b/one/two/R.txt "
+                     "suf/O.txt asuf/O.txt Oq/S.txt O/S.txt O/a/S.txt".split(),
+        },
+        {
+            "name": "precedence",
+            "ignore": {
+                "": "!first.log\n*.log\nsl_only/\nsl_dir/\ntop_only\n!keep.deep\n",
+                "tree": "keep.deep\n!top_only\n",
+                "keepme/sub": "!reinclude.txt\n",
+            },
+            "files": "first.log log.txt x/log.txt sl_only sl_dir/inner.txt top_only x/top_only "
+                     "keep.deep tree/keep.deep tree/log.txt tree/top_only keepme/ignoreme.txt "
+                     "keepme/sub/reinclude.txt".split(),
+        },
+        {
+            "name": "anchors",
+            "ignore": {"": "/*\n"},
+            "files": "top.txt sub/child.txt sub/deep/f.txt".split(),
+        },
+        {
+            "name": "ignore_everything",
+            "ignore": {"": "**\n"},
+            "files": "top.txt sub/child.txt".split(),
+        },
+        {
+            "name": "pruned_then_negated",
+            "ignore": {"": "skip/\n!skip/keep.txt\n"},
+            "files": "skip/keep.txt skip/other.txt".split(),
+        },
+        {
+            "name": "negation_only",
+            "ignore": {"": "!keep.log\n"},
+            "files": "keep.log a.log".split(),
+        },
+        {
+            "name": "patterns_git_drops",
+            "ignore": {"": "[z-a].txt\nfoo[\nunterminated\n\\!literal.txt\nbare\n"},
+            "files": "[z-a].txt foo[/f.txt unterminated/f.txt !literal.txt bare".split(),
+        },
+        {
+            # git matches ignoring case-insensitively where the filesystem is
+            # (core.ignorecase), so this fixture means the opposite on each side.
+            "name": "case_of_a_directory_name",
+            "ignore": {"": "dist/\n"},
+            "files": "DIST/b.txt Distdir/c.txt".split(),
+        },
+    ]
+
+    def setUp(self):
+        if shutil.which("git") is None:
+            self.skipTest("git is not installed")
+        self.tree = tempfile.mkdtemp(prefix="harnless-gi-")
+        self.git("init", "-q", ".")
+
+    def tearDown(self):
+        shutil.rmtree(self.tree, ignore_errors=True)
+
+    def git(self, *args, check=True):
+        env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
+        return subprocess.run(
+            ["git", *args], cwd=self.tree, capture_output=True, env=env, check=check
+        )
+
+    def git_prunes(self, root, rel):
+        """True when git would not descend into `rel` (relative to `root`)."""
+        return self.git("-C", root, "check-ignore", "-q", "--", rel, check=False).returncode == 0
+
+    def git_visible(self, where):
+        """The files git itself would show under `where`, in git-ignorecase mode."""
+        out = self.git(
+            "-c", f"core.ignorecase={'true' if os.name == 'nt' else 'false'}",
+            "-C", where, "ls-files", "-z", "--others", "--exclude-standard", "--", ".",
+        ).stdout
+        return {p for p in out.decode("utf-8", "replace").split("\0") if p}
+
+    def harness_visible(self, where):
+        return {
+            os.path.relpath(fp, where).replace("\\", "/") for fp in h._iter_files(where)
+        }
+
+    def test_git_and_harnless_see_the_same_files(self):
+        for case in self.CASES:
+            root = os.path.join(self.tree, case["name"])
+            for rel, text in case["ignore"].items():
+                self._write(os.path.join(root, rel, ".gitignore"), text)
+            for rel in case["files"]:
+                self._write(os.path.join(root, rel), "")
+            pairs = [root] + [
+                os.path.join(root, sub)
+                for sub in ("src", "a", "tree", "keepme", "dist")
+                if os.path.isdir(os.path.join(root, sub))
+            ]
+            for where in pairs:
+                rel = os.path.relpath(where, root).replace("\\", "/")
+                if where != root and self.git_prunes(root, rel):
+                    # git never descends here. Harnless does not prune a directory
+                    # the agent named, though it still judges the files inside it —
+                    # a documented difference, not a mismatch to fix.
+                    continue
+                git_side, harness_side = self.git_visible(where), self.harness_visible(where)
+                label = f"{case['name']} @ {os.path.relpath(where, self.tree)}"
+                self.assertEqual(
+                    harness_side, git_side,
+                    f"{label}: harnless extra {sorted(harness_side - git_side)}, "
+                    f"missing {sorted(git_side - harness_side)}",
+                )
+
+    @staticmethod
+    def _write(path, content):
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
 
 
 class TestDirOps(Base):

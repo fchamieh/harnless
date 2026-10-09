@@ -22,7 +22,7 @@ import urllib.error
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-VERSION = "1.7.2"
+VERSION = "1.8.0"
 API_URL = "http://127.0.0.1:11434/v1/chat/completions"
 API_KEY = None
 MODEL = "local-model"
@@ -102,6 +102,12 @@ MEMORY_BLOCK_LIMIT = 12_000  # memory notes injected into the system prompt (cha
 AGENTS_MD_LIMIT = 20_000  # AGENTS.md appended to the system prompt (chars)
 SESSION_READ_LIMIT = 30_000  # sessions: transcript text returned from the log (chars)
 SESSION_RECORD_CHARS = 2_000  # sessions: chars kept of one recorded message
+# Search filtering: grep/glob skip what git would not have shown in the same
+# directory. GITIGNORE_ANCESTOR_SCAN bounds how far up from the searched
+# directory those files are looked for (it stops earlier at the .git directory).
+GITIGNORE_NAME = ".gitignore"
+GITIGNORE_SKIP_NAMES = (".git", "node_modules", "__pycache__")  # always skipped
+GITIGNORE_ANCESTOR_SCAN = 16
 # Context compaction: the answer to "the context is full". Older turns are
 # replaced by one model-written handoff note and the recent turns stay verbatim.
 # Two triggers: proactive (usage crosses COMPACT_THRESHOLD_PCT of CONTEXT_WINDOW)
@@ -2103,22 +2109,253 @@ def tool_write_file(args: dict) -> str:
     return f"inserted {len(content_lines)} line(s) before line {offset} in {path}"
 
 
-def _iter_files(root: str):
+# ---------------------------------------------------------------- gitignore
+#
+# grep/glob skip what git itself would not have shown in the same directory.
+# The ignore engine is re-implemented here rather than asked of `git
+# check-ignore`/`git ls-files`: no subprocess, no dependency on git being
+# installed or on CWD being a work tree, and the same verdict on every platform
+# the tests run on (including the Linux build container, where git refuses the
+# mounted repo). Semantics follow git's own, verified against `git check-ignore`:
+# a bare pattern matches at any depth, a pattern holding a separator is anchored
+# to the file's directory, a trailing slash only restricts a rule to directories,
+# `**` crosses directories only as a whole path component, the last matching line
+# of the nearest .gitignore decides, and a pruned directory is never re-entered
+# by a negation written inside it.
+
+
+def _ignore_case_flag() -> int:
+    """git matches ignore patterns case-insensitively where the filesystem is
+    (its `core.ignorecase` defaults to true on Windows, false on POSIX)."""
+    return re.IGNORECASE if os.name == "nt" else 0
+
+
+def _gitignore_glob_re(pattern: str) -> str:
+    """Translate one gitignore pattern into regex source, without anchors.
+
+    `**` crosses directories only when it is a whole path component (`**/`, a
+    trailing `/**`, or a bare `**`) — git treats `a**/b` like `a*/b`. `*` and `?`
+    never cross a separator, `[abc]`/`[!abc]` classes and backslash escapes work.
+    Returns None when the pattern can never match, so the rule is dropped: git
+    ignores a pattern whose `[` class is never closed (verified with
+    `git check-ignore`).
+    """
+    out = []
+    i, n = 0, len(pattern)
+    while i < n:
+        c = pattern[i]
+        if c == "*":
+            j = i
+            while j < n and pattern[j] == "*":
+                j += 1
+            component = (i == 0 or pattern[i - 1] == "/") and (
+                j == n or pattern[j] == "/"
+            )
+            if component and j < n:
+                out.append("(?:.*/)?")  # '**/' over zero or more directories
+                i = j + 1
+            elif component:
+                out.append(".*")  # a trailing '/**', or a bare '**'
+                i = j
+            else:
+                out.append("[^/]*")  # '**' inside a name segment: behaves like '*'
+                i = j
+        elif c == "?":
+            out.append("[^/]")
+            i += 1
+        elif c == "\\" and i + 1 < n:
+            out.append(re.escape(pattern[i + 1]))
+            i += 2
+        elif c == "[":
+            k, neg = i + 1, False
+            if k < n and pattern[k] in "!^":
+                neg, k = True, k + 1
+            cls = ""
+            if k < n and pattern[k] == "]":
+                cls, k = "]", k + 1  # a ']' in the first position is a literal
+            while k < n and pattern[k] != "]":
+                cls += pattern[k]
+                k += 1
+            if k >= n:
+                return None  # never closed: git drops the whole pattern, it matches nothing
+            else:
+                out.append("[" + ("^" if neg else "") + cls + "]")
+                i = k + 1
+        else:
+            out.append(re.escape(c))
+            i += 1
+    return "".join(out)
+
+
+def _gitignore_rules(text: str, base: str) -> list:
+    """Compile the lines of one .gitignore into `(regex, negate, dir_only, base)`.
+
+    git decides with the **last** matching line of a file, so the rules come back
+    reversed: the first match found against them is the one that decided. `base`
+    is the directory the file sits in — patterns match paths relative to it.
+    """
+    rules = []
+    for raw in text.splitlines():
+        line = re.sub(r"(?<!\\)\s+$", "", raw)  # git drops unescaped trailing blanks
+        if not line or line.startswith("#"):
+            continue
+        negate = line.startswith("!")
+        if negate:
+            line = line[1:]
+        if not line:
+            continue
+        dir_only = line.endswith("/")
+        if dir_only:
+            line = line[:-1]
+            if not line:
+                continue
+        anchored = "/" in line  # a trailing slash alone does not anchor a pattern
+        if line.startswith("/"):
+            line = line[1:]  # the anchor is the file's own directory, not a literal '/'
+        if not line:
+            continue
+        body = _gitignore_glob_re(line)
+        if body is None:
+            continue  # an unclosed '[' class: git drops the pattern entirely
+        try:
+            regex = re.compile(
+                "^" + (body if anchored else "(?:.*/)?" + body) + "$", _ignore_case_flag()
+            )
+        except re.error:
+            continue  # a pattern re cannot parse (e.g. [z-a]) is dropped, not fatal
+        rules.append((regex, negate, dir_only, base))
+    rules.reverse()
+    return rules
+
+
+def _gitignore_file(dir_abs: str):
+    """The rules declared by `dir_abs/.gitignore`, or None if it has no such file."""
+    try:
+        with open(
+            os.path.join(dir_abs, GITIGNORE_NAME), "r", encoding="utf-8", errors="replace"
+        ) as f:
+            return _gitignore_rules(f.read(), dir_abs)
+    except OSError:
+        return None
+
+
+def _gitignore_ancestors(root: str) -> list:
+    """The rules of the .gitignore files **above** a searched directory.
+
+    git applies those too — a `dist/` in the repository root hides `src/dist/` —
+    so walk up from `root`, stopping at the directory holding `.git` (a work-tree
+    root; in a linked work tree that is a file) or after GITIGNORE_ANCESTOR_SCAN
+    levels, whichever is nearer. A nested .gitignore outranks a shallower one, so
+    the rules come back deepest-first.
+    """
+    d = os.path.dirname(os.path.abspath(root))
+    if os.path.exists(os.path.join(os.path.abspath(root), ".git")):
+        return []  # the searched directory is itself a work-tree root: nothing above applies
+    chain = []
+    for _ in range(GITIGNORE_ANCESTOR_SCAN):
+        if not d:
+            break
+        chain.append(d)
+        if os.path.exists(os.path.join(d, ".git")):
+            break
+        parent = os.path.dirname(d)
+        if parent == d:
+            break  # the filesystem root
+        d = parent
+    rules = []
+    for base in reversed(chain):  # shallowest first: the nearer files end up in front
+        found = _gitignore_file(base)
+        if found:
+            rules = found + rules
+    return rules
+
+
+def _ignore_view(rules: list, dir_abs: str) -> list:
+    """The rules that can reach entries of `dir_abs`, as
+    `(regex, negate, dir_only, prefix)`, where `prefix` is `dir_abs` expressed
+    relative to the directory each rule's file sits in."""
+    view = []
+    for regex, negate, dir_only, base in rules:
+        rel = os.path.relpath(dir_abs, base).replace("\\", "/")
+        if rel.startswith(".."):
+            continue  # this rule's file does not cover this directory
+        view.append((regex, negate, dir_only, "" if rel == "." else rel))
+    return view
+
+
+def _is_ignored(view: list, name: str, is_dir: bool) -> bool:
+    """git's verdict for one entry: the first matching rule decides (deepest file
+    first, then the last line in it), and a dir-only rule cannot match a file."""
+    for regex, negate, dir_only, prefix in view:
+        if dir_only and not is_dir:
+            continue
+        if regex.match(name if not prefix else f"{prefix}/{name}"):
+            return not negate
+    return False
+
+
+def _gitignored_note(ignored: int) -> str:
+    """Say why a search that found nothing may have missed the file: ignored
+    paths were skipped, and here is how to look at them anyway."""
+    if not ignored:
+        return ""
+    return (
+        f"\n... [{ignored} gitignored path{'s' if ignored != 1 else ''} skipped per "
+        f"{GITIGNORE_NAME}; pass respect_gitignore:false to include them]"
+    )
+
+
+def _iter_files(root: str, respect_gitignore: bool = True, ignored: list = None):
     """Yield the files to scan for grep/glob.
 
-    `root` itself when it is a file, otherwise every file under it, skipping
-    .git/node_modules/__pycache__. A missing path yields nothing (callers
-    check existence first so they can report it explicitly).
+    `root` itself when it is a file: a path the agent named explicitly is
+    searched whatever git thinks of it. (Naming a *directory* only spares that
+    directory from being pruned; the rules still judge the files beneath it.)
+    Otherwise every file under it, skipping
+    `.git`/`node_modules`/`__pycache__` always and — unless `respect_gitignore`
+    is false — everything the .gitignore files covering the tree ignore. An
+    ignored directory is pruned rather than entered, as git prunes it, so a
+    `build/` or `.venv/` costs nothing to skip; `ignored`, a one-slot list when
+    given, counts the paths refused. A missing path yields nothing (callers check
+    existence first so they can report it explicitly).
     """
     if os.path.isfile(root):
         yield root
         return
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [
-            d for d in dirnames if d not in (".git", "node_modules", "__pycache__")
-        ]
-        for name in filenames:
-            yield os.path.join(dirpath, name)
+    rules = []
+    if respect_gitignore:
+        rules = _gitignore_ancestors(root)
+        local = _gitignore_file(root)
+        if local:
+            rules = local + rules
+    pending = [(root, rules)]
+    while pending:
+        dir_abs, inherited = pending.pop()
+        view = _ignore_view(inherited, dir_abs) if inherited else None
+        try:
+            entries = sorted(os.scandir(dir_abs), key=lambda e: e.name)
+        except OSError:
+            continue
+        subdirs = []
+        for entry in entries:
+            if entry.name in GITIGNORE_SKIP_NAMES:
+                continue
+            try:
+                is_dir = entry.is_dir()
+            except OSError:
+                continue
+            if view is not None and _is_ignored(view, entry.name, is_dir):
+                if ignored is not None:
+                    ignored[0] += 1
+                continue
+            if is_dir:
+                if entry.is_symlink():
+                    continue  # os.walk(followlinks=False): a linked dir is not descended
+                local = _gitignore_file(entry.path)
+                subdirs.append((entry.path, local + inherited if local else inherited))
+            else:
+                yield entry
+        pending.extend(reversed(subdirs))  # keep the subtrees in directory order
 
 
 def tool_grep(args: dict) -> str:
@@ -2129,6 +2366,8 @@ def tool_grep(args: dict) -> str:
     pattern = re.compile(args["pattern"], _case_flags(case_sensitive))
     context = max(0, int(args.get("context", 0)))
     limit = _limit_arg(args, "limit", GREP_MATCH_LIMIT, MAX_COUNT_LIMIT)
+    ignored = [0]
+    walk = _iter_files(root, _bool_arg(args, "respect_gitignore", True), ignored)
     file_pattern = args.get("file_pattern")
     file_re = (
         _glob_to_regex(file_pattern, case_sensitive) if file_pattern else None
@@ -2147,7 +2386,7 @@ def tool_grep(args: dict) -> str:
             stat, "narrow the pattern or file_pattern, or raise limit"
         )
 
-    for fp in _iter_files(root):
+    for fp in walk:
         rel = _rel_to_cwd(fp, roots)
         if file_re is not None and not (
             file_re.search(rel) or file_re.search(os.path.basename(rel))
@@ -2185,7 +2424,11 @@ def tool_grep(args: dict) -> str:
                 return capped()
             matches.append(entry)
             used += len(entry)
-    return "\n".join(matches) if matches else "no matches"
+    # A capped answer already carries its own recover-the-rest hint; the empty
+    # one is the case where the agent might conclude a file is not there at all.
+    if not matches:
+        return "no matches" + _gitignored_note(ignored[0])
+    return "\n".join(matches)
 
 
 def tool_patch_file(args: dict) -> str:
@@ -2247,12 +2490,14 @@ def tool_glob(args: dict) -> str:
     regex = _glob_to_regex(pattern, case_sensitive)
     results = []
     roots = _cwd_roots()
-    for fp in _iter_files(root):
+    ignored = [0]
+    walk = _iter_files(root, _bool_arg(args, "respect_gitignore", True), ignored)
+    for fp in walk:
         rel = _rel_to_cwd(fp, roots)
         if regex.search(rel):
             results.append(rel)
     if not results:
-        return "no files matched"
+        return "no files matched" + _gitignored_note(ignored[0])
     limit = _limit_arg(args, "limit", LIST_LIMIT, MAX_COUNT_LIMIT)
     return _cap_count(
         sorted(results), limit, unit="files", hint="narrow the pattern, or raise limit"
@@ -2995,7 +3240,7 @@ TOOLS = {
             "type": "function",
             "function": {
                 "name": "grep",
-                "description": "Search file contents with a regex pattern (case-sensitive by default; case_sensitive=false ignores case). path may be a directory (searched recursively) or a single file.",
+                "description": "Search file contents with a regex pattern (case-sensitive by default; case_sensitive=false ignores case). path may be a directory (searched recursively) or a single file. Files git would ignore (.gitignore) are skipped unless respect_gitignore is false.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -3021,6 +3266,13 @@ TOOLS = {
                         "file_pattern": {
                             "type": "string",
                             "description": "Optional glob (e.g. *.py) or regex matched against relative file paths to restrict files scanned (obeys case_sensitive)",
+                        },
+                        "respect_gitignore": {
+                            "type": "boolean",
+                            "description": (
+                                "Skip paths that .gitignore rules hide (default true); "
+                                "set false to search them too"
+                            ),
                         },
                         "limit": {
                             "type": "integer",
@@ -3081,7 +3333,7 @@ TOOLS = {
             "type": "function",
             "function": {
                 "name": "glob",
-                "description": "Find files by glob pattern (e.g. **/*.py) or regex, matched against relative file paths with exact case by default (case_sensitive=false ignores case). path may be a directory (searched recursively) or a single file.",
+                "description": "Find files by glob pattern (e.g. **/*.py) or regex, matched against relative file paths with exact case by default (case_sensitive=false ignores case). path may be a directory (searched recursively) or a single file. Files git would ignore (.gitignore) are skipped unless respect_gitignore is false.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -3098,6 +3350,13 @@ TOOLS = {
                             "description": (
                                 "Match pattern with exact case (default true); "
                                 "set false to match paths ignoring case"
+                            ),
+                        },
+                        "respect_gitignore": {
+                            "type": "boolean",
+                            "description": (
+                                "Skip paths that .gitignore rules hide (default true); "
+                                "set false to list them too"
                             ),
                         },
                         "limit": {
