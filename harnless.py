@@ -32,8 +32,8 @@ SUBAGENT_DEPTH_CEILING = 10  # sanity clamp for --max-subagents
 # Runaway guard: how many model turns (API calls) a single sub-agent may take
 # before its run is stopped; 0 disables the guard. Only sub-agents are capped —
 # a top-level agent is steered by the user, who can always double-ESC it.
-SUBAGENT_STEP_LIMIT = 40
-SUBAGENT_STEPS_CEILING = 1_000  # sanity clamp for --max-subagent-steps
+SUBAGENT_STEP_LIMIT = 500
+SUBAGENT_STEPS_CEILING = 10_000  # sanity clamp for --max-subagent-steps
 SUBAGENT_STEP_LIMIT_CODE = 4  # exit code reported to the parent when the guard fires
 # A capped sub-agent gets one closing turn instead of stopping cold: a run that
 # ends on a tool-call turn leaves tool_task with no text to hand the parent.
