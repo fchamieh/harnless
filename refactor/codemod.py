@@ -113,6 +113,7 @@ STAGES = {
         "tool_move_file", "tool_copy_file",
     ]},
     "lineedit": {"lineedit": [
+        "commands_menu",
         "_windows_ctrl_held", "_windows_key_token", "_iter_keys_windows",
         "_iter_keys_windows_poll", "_parse_csi_seq", "_set_raw_input", "_iter_keys_posix",
         "_iter_keys_posix_poll", "_iter_keys_interrupt", "check_double_esc",
@@ -140,6 +141,13 @@ STAGES = {
     "shell": {"shell": [
         "_resolve_shell", "_taskkill_cmd", "_kill_tree", "_drain_killed",
         "_shell_timeout", "tool_run_shell",
+    ]},
+    "tools": {"toolkit": [
+        "tool_get_cwd", "tool_exit", "_prompt_line", "_print_question", "tool_ask_user",
+        "tool_mkdir", "tool_read_file", "tool_write_file",
+        "_HTMLTextExtractor", "_html_to_text", "tool_fetch_url", "tool_task",
+        "_builtin_tool_names", "execute_tool", "format_tools", "toggle_tools", "tools_menu",
+        "DISPATCH",
     ]},
     "agent": {"agent": [
         "run_agent", "_agent_loop", "_closing_summary", "_active_tools", "_all_tool_names",

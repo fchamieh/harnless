@@ -1,3 +1,6 @@
+import urllib.request
+import urllib.error
+import http.client
 """Talking to the model server: request building, non-streaming and streaming
 completions, SSE parsing, progress reporting and the context-window probe."""
 

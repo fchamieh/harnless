@@ -1,4 +1,15 @@
-"""shell: part of harnless (see harnless.py)."""
+"""run_shell: running a command, and stopping everything it started.
+
+The shell is chosen once per process (`_resolve_shell`) and cached: the command is what the
+model asked for, and only the argv in front of it depends on the platform. A timeout or an
+interrupt has to reach further than the shell itself — a `pwsh -Command` that spawned a build
+leaves the build running when the shell dies — so the process tree is walked and killed root
+down (real child links on Windows via the toolhelp snapshot, a process group on POSIX), and
+the output kept is the window around whatever the harness stopped: the tail of a long build if
+it ran to the end, the head of a hung one.
+
+Cancellation is separate from the timeout on purpose: ESC in the REPL must stop a run even in
+a one-shot call that has no watcher thread of its own."""
 
 import os
 import shutil

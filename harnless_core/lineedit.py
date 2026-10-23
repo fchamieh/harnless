@@ -3,6 +3,7 @@ cursor-editing line editor behind `readline_prompt`, and the console-side watche
 agent loop uses (ESC handling, the context-usage meter, upload progress)."""
 
 import os
+import shutil
 import sys
 import threading
 import time
@@ -623,3 +624,77 @@ def readline_prompt(prompt: str, menu=None) -> str:
     line = _edit_line(prompt, keys, menu)
     context._history_add(line)
     return line
+
+
+def commands_menu(keys=None) -> str | None:
+    """Interactive REPL command menu, opened by typing / on an empty line.
+
+    Up/down move the cursor, enter selects the highlighted command (returned),
+    esc (or ctrl+c/ctrl+d) cancels (returns None). Draws below the prompt
+    line and restores the cursor to it on exit.
+    """
+    names = [name for name, _ in config.REPL_COMMANDS]
+    descs = [desc for _, desc in config.REPL_COMMANDS]
+    cursor = 0
+    width = shutil.get_terminal_size((80, 24)).columns
+
+    def build_lines():
+        lines = [render.colorize("commands — up/down: move, enter: select, esc: cancel", "dim")]
+        for i, name in enumerate(names):
+            if i == cursor:
+                lines.append(render.colorize(f"> {name}", "tool"))
+            else:
+                lines.append(f"  {name}")
+        desc = descs[cursor]
+        if len(desc) > width - 1:
+            desc = desc[: width - 4] + "..."
+        lines.append(render.colorize(desc, "dim"))
+        return lines
+
+    drawn = 0
+
+    def draw():
+        nonlocal drawn
+        lines = build_lines()
+        for line in lines:
+            sys.stdout.write("\r\x1b[2K" + line + "\n")
+        if lines:
+            sys.stdout.write(f"\x1b[{len(lines)}A")
+        sys.stdout.flush()
+        drawn = len(lines)
+
+    if keys is None:
+        keys = _iter_keys_windows() if os.name == "nt" else _iter_keys_posix()
+    # Start on the line below the prompt (the cursor sits at its end).
+    sys.stdout.write("\r\n")
+    sys.stdout.flush()
+    draw()
+    try:
+        while True:
+            token = next(keys)
+            if token == "up":
+                cursor = max(0, cursor - 1)
+            elif token == "down":
+                cursor = min(len(names) - 1, cursor + 1)
+            elif token in ("enter", "ctrl_enter"):
+                return names[cursor]
+            elif token in ("esc", "ctrl_c", "ctrl_d"):
+                return None
+            draw()
+    except StopIteration:
+        return None
+    finally:
+        close = getattr(keys, "close", None)
+        if close is not None:
+            close()
+        if drawn:
+            # Cursor is on the first menu line: clear each menu line, then
+            # return to the prompt line.
+            out = ""
+            for i in range(drawn):
+                out += "\x1b[2K"
+                if i < drawn - 1:
+                    out += "\x1b[B"
+            out += f"\x1b[{drawn}A"
+            sys.stdout.write(out)
+            sys.stdout.flush()

@@ -267,3 +267,18 @@ _MD_TABLE_SEP = re.compile(r"^\s{0,3}\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?\s*$")
 _MD_PIPE_SPLIT = re.compile(r"(?<!\\)\|")
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _TABLE_MIN_COL = 3
+
+
+REPL_COMMANDS = [
+    ("/new", "clear session history and start over (in a new session log)"),
+    ("/clear-screen", "clear the terminal screen"),
+    ("/status", "show context usage, api url, and tools"),
+    ("/sessions", "list the recorded session logs"),
+    ("/resume", "continue a recorded session: /resume <session-id> (no argument lists them)"),
+    ("/compact", "replace this session's older turns with a handoff note now"),
+    ("/auto-compact", "on|off, or 'threshold N': compact automatically as the context fills up"),
+    ("/tools", "interactive tool menu: up/down move, space toggle, enter apply, esc cancel"),
+    ("/auto-send", "on: Enter submits (default); off: Enter inserts a newline, Ctrl+Enter sends"),
+    ("/help", "show this help"),
+    ("/exit", "quit (alias: /quit)"),
+]

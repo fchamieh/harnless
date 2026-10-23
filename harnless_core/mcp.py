@@ -1,3 +1,4 @@
+import urllib.request
 """The MCP client: JSON-RPC over stdio or HTTP, tool discovery, and how a server's
 tools join the harness's own tool tables."""
 

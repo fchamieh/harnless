@@ -22,7 +22,7 @@ tests make.
 
 | module | what lives there |
 |---|---|
-| `config.py` | fixed tunables and the model-facing text (what is never changed after import) |
+| `config.py` | fixed tunables and the model-facing text (what is never changed after import), `REPL_COMMANDS` |
 | `state.py` | everything mutable after import: flags, session identity, journals, MCP state |
 | `errors.py` | `ExitSignal`, `ContextOverflow`, `StreamInterrupted`, the sub-agent signals |
 | `caps.py` | output ceilings and how a capped value says so |
@@ -32,14 +32,15 @@ tests make.
 | `toolspec.py` | the contract the model is shown: one OpenAI schema per built-in tool |
 | `journal.py` | the session journal: records, resume, replay, the `sessions` tool |
 | `context.py` | system prompt, `AGENTS.md`, memory, the todo block, `file://` refs, history |
-| `lineedit.py` | key iterators, the multi-line editor, `InterruptWatcher` |
+| `lineedit.py` | key iterators, the multi-line editor, `InterruptWatcher`, the `/` command menu |
 | `request.py` | request building, the abortable/counting opener, chat + streaming, SSE |
 | `compact.py` | the cut, the pruning, the handoff note, both triggers |
 | `search.py` | the walking/.gitignore engine and the grep, glob, list_dir, patch, move, copy tools |
 | `shell.py` | shell resolution, process-tree killing, timeouts, `run_shell` |
 | `mcp.py` | the MCP client: JSON-RPC over stdio or HTTP, discovery, registration |
 | `agent.py` | the loop: `run_agent`/`_agent_loop`, what a turn advertises, closing summaries |
-| `harnless.py` | the tools themselves, `DISPATCH`, `execute_tool`, the CLI/REPL, `main()` |
+| `toolkit.py` | the tools a model calls, `DISPATCH`, and `execute_tool` (the executor a run is handed) |
+| `harnless.py` | the CLI: argument parsing, the REPL loop, the status/help text, and the facade |
 
 Three rules keep the layers honest:
 
@@ -52,11 +53,12 @@ Three rules keep the layers honest:
   loop hands them `_active_tools(interactive)`, and a request meant only to write something
   (the compaction handoff note) is handed `None`.
 - **The loop is handed the thing that runs a tool call.** `run_agent(..., execute=...)` is
-  keyword-only and required: `harnless.py` passes its own `execute_tool`, and `tool_task`
-  passes it on so a sub-agent answers calls with the same executor. The tool table is split
-  the same way — `toolspec.SPECS` is the contract (data, ordered), `harnless.DISPATCH` is the
-  behaviour (name → function) — and a test asserts the two halves name the same tools in the
-  same order.
+  keyword-only and required: `main()` passes `toolkit.execute_tool`, and `tool_task` hands the
+  run it starts the executor its own module owns — so one table answers calls at every depth,
+  and the loop can be run over a tool name that exists nowhere in the harness (that is how
+  `TestAgentSeam` tests it). The tool halves are split too: `toolspec.SPECS` is the contract
+  (data, ordered), `toolkit.DISPATCH` is the behaviour (name → function), and a test asserts
+  the two name the same tools in the same order.
 
 ## Moving code
 
@@ -68,14 +70,22 @@ python refactor/codemod.py pre              # renames that must happen before a 
 python refactor/codemod.py extract <stage>  # create harnless_core/<stage>.py from its manifest
 python refactor/codemod.py move <module> <name> ...   # add names to a module that exists
 python refactor/codemod.py cycle            # relink + retarget tests + shadow audit
+python refactor/codemod.py facade           # rebuild the forwarding import block alone
 python refactor/codemod.py audit            # counts, facade writes left, duplicates
 ```
 
-It rewrites references (bare name → `module.name`), derives each file's imports from what
-it actually uses (including the entry point's by-name imports, which travel with the code
-that needs them), and refuses a local binding that would shadow a module alias. An extract
-is one-way: to undo one, `git checkout harnless.py tests.py refactor/registry.json` *and*
-delete the new `harnless_core/<module>.py`, or its names stay behind as duplicates
+It rewrites references (bare name → `module.name`, never an alias), derives each file's
+imports from what it actually uses (including the by-name imports a stage needs, which travel
+with the code that needs them), and **refuses a local binding that shadows a module alias** —
+a function with a local named `tools` would read that list every time the link stage wrote
+`tools.<name>`. `refactor/rename_local.py` (token-based, so keyword argument names and string
+literals are untouched) frees such a name; it is also why the tools module is called `toolkit`.
+`relink()` likewise refuses a module that uses a name still living in the entry point: that
+name moves down first, as `REPL_COMMANDS` (to config) and the `/` command menu (to lineedit)
+did for the tools stage.
+
+An extract is one-way: to undo one, `git checkout harnless.py tests.py refactor/registry.json`
+*and* delete the new `harnless_core/<module>.py`, or its names stay behind as duplicates
 (`audit` reports those).
 
 ## Notes

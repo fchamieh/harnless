@@ -1,8 +1,19 @@
-"""The agent itself: the tool tables and their dispatch, tool execution, sub-agent
-runs, and the conversation loop."""
+"""The agent loop: one run of the model, from the request it makes to the answer it leaves.
 
-import urllib
+`run_agent` decides what a turn advertises (`_active_tools`), when a context has to be cut
+before it is sent, and when a run has gone far enough (`SUBAGENT_STEP_LIMIT`); `_agent_loop`
+makes the calls, prints them, and feeds the results back. What it does *not* know is what any
+tool is: a run is handed an `execute` callable, which is why this module sits below the tools
+instead of beside them, and why a test can drive a whole run over a tool name that exists
+nowhere in the harness.
+
+`_closing_summary` is the note a sub-agent hands back — the same text the journal records, so
+what the parent reads and what a resumed session replays come from one place."""
+
+import urllib.error
+
 from harnless_core import compact, config, context, errors, journal, render, request, state, toolspec
+
 
 def _closing_summary(messages: list, exit_note: str) -> str:
     """The hand-off text a sub-agent leaves behind ("" when it left none).

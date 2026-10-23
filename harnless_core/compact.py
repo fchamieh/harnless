@@ -1,3 +1,4 @@
+import urllib.error
 """Context compaction: measuring what a request costs, cutting the oldest turns,
 and writing the handoff note the model is left with.
 

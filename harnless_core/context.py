@@ -1,3 +1,4 @@
+import urllib.request
 """What rides along with every request: the system prompt, AGENTS.md, the memory
 block, the todo list, `file://`/`http(s)://` references in the user's message, and the
 prompt history file."""

@@ -49,12 +49,12 @@ class Base(unittest.TestCase):
         return os.path.realpath(os.path.join(self.tmp, rel))
 
     def w(self, rel: str, content: str):
-        return h.tool_write_file({"path": os.path.join(self.tmp, rel).replace("\\", "/"), "content": content})
+        return h.toolkit.tool_write_file({"path": os.path.join(self.tmp, rel).replace("\\", "/"), "content": content})
 
     def r(self, rel: str, **kw) -> str:
         args = {"path": os.path.join(self.tmp, rel).replace("\\", "/"), "line_numbers": False}
         args.update(kw)
-        return h.tool_read_file(args)
+        return h.toolkit.tool_read_file(args)
 
 
 class TestSafeResolve(Base):
@@ -124,7 +124,7 @@ class TestSymlinkedCwd(Base):
         super().tearDown()
 
     def test_get_cwd_reports_the_link(self):
-        self.assertEqual(h.tool_get_cwd({}), self.link)
+        self.assertEqual(h.toolkit.tool_get_cwd({}), self.link)
 
     def test_safe_resolve_stays_inside_the_linked_cwd(self):
         self.assertEqual(h.paths.safe_resolve("./src/main.py"), self.p("realdir/src/main.py"))
@@ -157,10 +157,10 @@ class TestSymlinkedCwd(Base):
         self.assertEqual(h.search.tool_list_dir({"path": "./"}), "src/\ntop.txt")
 
     def test_write_then_read_through_the_link(self):
-        msg = h.tool_write_file({"path": "./new.txt", "content": "hello\n"})
+        msg = h.toolkit.tool_write_file({"path": "./new.txt", "content": "hello\n"})
         self.assertEqual(msg, f"wrote 6 chars to {self.p('realdir/new.txt')}")
         self.assertTrue(os.path.exists(os.path.join(self.link, "new.txt")))
-        self.assertEqual(h.tool_read_file({"path": "./new.txt", "line_numbers": False}), "hello")
+        self.assertEqual(h.toolkit.tool_read_file({"path": "./new.txt", "line_numbers": False}), "hello")
 
 
 class TestCwdPathHelpers(unittest.TestCase):
@@ -213,7 +213,7 @@ class TestReadFile(Base):
 
     def test_read_all_numbered(self):
         args = {"path": f"{self.tmp}/t.txt"}
-        self.assertEqual(h.tool_read_file(args), "1: a\n2: b\n3: c\n4: d")
+        self.assertEqual(h.toolkit.tool_read_file(args), "1: a\n2: b\n3: c\n4: d")
 
     def test_read_no_numbers(self):
         self.assertEqual(self.r("t.txt"), "a\nb\nc\nd")
@@ -268,7 +268,7 @@ class TestReadFile(Base):
 
 class TestWriteFile(Base):
     def test_full_overwrite(self):
-        msg = h.tool_write_file({"path": f"{self.tmp}/t.txt", "content": "a\nb\nc\nd\n"})
+        msg = h.toolkit.tool_write_file({"path": f"{self.tmp}/t.txt", "content": "a\nb\nc\nd\n"})
         self.assertEqual(msg, f"wrote 8 chars to {self.p('t.txt')}")
 
     def test_creates_parent_dirs(self):
@@ -282,7 +282,7 @@ class TestWriteFile(Base):
 
     def test_insert_before_line_2(self):
         self.w("t.txt", "a\nb\nc\nd\n")
-        msg = h.tool_write_file({"path": f"{self.tmp}/t.txt", "content": "x", "offset": 2, "lines": 0})
+        msg = h.toolkit.tool_write_file({"path": f"{self.tmp}/t.txt", "content": "x", "offset": 2, "lines": 0})
         self.assertEqual(msg, f"inserted 1 line(s) before line 2 in {self.p('t.txt')}")
         self.assertEqual(self.r("t.txt"), "a\nx\nb\nc\nd")
 
@@ -290,35 +290,35 @@ class TestWriteFile(Base):
         self.w("t.txt", "b\n")
         self.w("t.txt", "a")
         self.assertEqual(self.r("t.txt"), "a")
-        h.tool_write_file({"path": f"{self.tmp}/t.txt", "content": "z", "offset": 1, "lines": 0})
+        h.toolkit.tool_write_file({"path": f"{self.tmp}/t.txt", "content": "z", "offset": 1, "lines": 0})
         self.assertEqual(self.r("t.txt"), "z\na")
 
     def test_replace_range(self):
         self.w("t.txt", "a\nx\nb\nc\nd\n")
-        msg = h.tool_write_file({"path": f"{self.tmp}/t.txt", "content": "q\nr", "offset": 3, "lines": 2})
+        msg = h.toolkit.tool_write_file({"path": f"{self.tmp}/t.txt", "content": "q\nr", "offset": 3, "lines": 2})
         self.assertEqual(msg, f"replaced lines 3-4 of {self.p('t.txt')} with 2 line(s)")
         self.assertEqual(self.r("t.txt"), "a\nx\nq\nr\nd")
 
     def test_append_at_eof(self):
         self.w("t.txt", "a\nb\nc\n")
-        h.tool_write_file({"path": f"{self.tmp}/t.txt", "content": "end", "offset": 4})
+        h.toolkit.tool_write_file({"path": f"{self.tmp}/t.txt", "content": "end", "offset": 4})
         self.assertEqual(self.r("t.txt"), "a\nb\nc\nend")
 
     def test_offset_beyond_end(self):
         self.w("t.txt", "a\nb\n")
         self.assertEqual(
-            h.tool_write_file({"path": f"{self.tmp}/t.txt", "content": "z", "offset": 99}),
+            h.toolkit.tool_write_file({"path": f"{self.tmp}/t.txt", "content": "z", "offset": 99}),
             "error: offset 99 is beyond end of file (2 lines)")
 
     def test_offset_zero(self):
         self.w("t.txt", "a\n")
         self.assertEqual(
-            h.tool_write_file({"path": f"{self.tmp}/t.txt", "content": "z", "offset": 0}),
+            h.toolkit.tool_write_file({"path": f"{self.tmp}/t.txt", "content": "z", "offset": 0}),
             "error: offset must be >= 1 and lines must be >= 0")
 
     def test_missing_file_with_offset(self):
         self.assertEqual(
-            h.tool_write_file({"path": f"{self.tmp}/nope.txt", "content": "z", "offset": 1}),
+            h.toolkit.tool_write_file({"path": f"{self.tmp}/nope.txt", "content": "z", "offset": 1}),
             f"error: file does not exist, cannot modify line range: {self.p('nope.txt')}")
 
 
@@ -1045,11 +1045,11 @@ class TestGitignoreAgainstGit(unittest.TestCase):
 class TestDirOps(Base):
     def test_mkdir_nested(self):
         path = os.path.join(self.tmp, "x", "y", "z").replace("\\", "/")
-        self.assertEqual(h.tool_mkdir({"path": path}), f"created directory: {self.p('x/y/z')}")
+        self.assertEqual(h.toolkit.tool_mkdir({"path": path}), f"created directory: {self.p('x/y/z')}")
 
     def test_mkdir_existing_ok(self):
         os.makedirs(os.path.join(self.tmp, "x"))
-        h.tool_mkdir({"path": f"{self.tmp}/x"})
+        h.toolkit.tool_mkdir({"path": f"{self.tmp}/x"})
 
     def test_list_dir(self):
         os.makedirs(os.path.join(self.tmp, "st", "sub"))
@@ -1317,7 +1317,7 @@ class TestFetchUrl(unittest.TestCase):
         a = {"url": "https://example.com/page"}
         a.update(args)
         with mock.patch("urllib.request.urlopen", return_value=self._Resp(body, charset)):
-            return h.tool_fetch_url(a)
+            return h.toolkit.tool_fetch_url(a)
 
     def test_basic_fetch(self):
         self.assertEqual(self._fetch("hello world"), "hello world")
@@ -1340,28 +1340,28 @@ class TestFetchUrl(unittest.TestCase):
 
     def test_invalid_scheme(self):
         self.assertEqual(
-            h.tool_fetch_url({"url": "ftp://x"}), "error: url must be an http:// or https:// URL"
+            h.toolkit.tool_fetch_url({"url": "ftp://x"}), "error: url must be an http:// or https:// URL"
         )
         self.assertEqual(
-            h.tool_fetch_url({"url": "example.com"}), "error: url must be an http:// or https:// URL"
+            h.toolkit.tool_fetch_url({"url": "example.com"}), "error: url must be an http:// or https:// URL"
         )
 
     def test_http_error(self):
         err = urllib.error.HTTPError("https://x", 404, "Not Found", email.message.Message(), None)
         with mock.patch("urllib.request.urlopen", side_effect=err):
-            out = h.tool_fetch_url({"url": "https://x"})
+            out = h.toolkit.tool_fetch_url({"url": "https://x"})
         self.assertEqual(out, "error: HTTP 404 Not Found for https://x")
 
     def test_url_error(self):
         with mock.patch(
             "urllib.request.urlopen", side_effect=urllib.error.URLError("down")
         ):
-            out = h.tool_fetch_url({"url": "https://x"})
+            out = h.toolkit.tool_fetch_url({"url": "https://x"})
         self.assertTrue(out.startswith("error: could not fetch https://x:"))
 
     def test_bad_timeout(self):
-        self.assertEqual(h.tool_fetch_url({"url": "https://x", "timeout": 0}), "error: timeout must be > 0")
-        self.assertTrue(h.tool_fetch_url({"url": "https://x", "timeout": "abc"}).startswith("error:"))
+        self.assertEqual(h.toolkit.tool_fetch_url({"url": "https://x", "timeout": 0}), "error: timeout must be > 0")
+        self.assertTrue(h.toolkit.tool_fetch_url({"url": "https://x", "timeout": "abc"}).startswith("error:"))
 
     def test_unknown_charset_falls_back_to_utf8(self):
         self.assertEqual(self._fetch("hi", charset="no-such-codec"), "hi")
@@ -1388,7 +1388,7 @@ class TestFetchUrl(unittest.TestCase):
         interactive_names = [s["function"]["name"] for s in h.toolspec.OPENAI_TOOLS_INTERACTIVE]
         self.assertIn("fetch_url", all_names)
         self.assertIn("fetch_url", interactive_names)
-        self.assertIn("fetch_url", h.DISPATCH)
+        self.assertIn("fetch_url", h.toolkit.DISPATCH)
 
 
 class TestOutputCaps(unittest.TestCase):
@@ -1398,11 +1398,11 @@ class TestOutputCaps(unittest.TestCase):
         """SPECS (harnless_core/toolspec.py) and DISPATCH (harnless.py) are one table cut in
         two: a schema with no function is a tool the model can ask for and the harness
         cannot answer, a function with no schema is behaviour the model never hears about."""
-        self.assertEqual(list(h.toolspec.SPECS), list(h.DISPATCH))
+        self.assertEqual(list(h.toolspec.SPECS), list(h.toolkit.DISPATCH))
         for name, spec in h.toolspec.SPECS.items():
             self.assertEqual(spec["function"]["name"], name)
             self.assertTrue(spec["function"]["description"].strip())
-            self.assertTrue(callable(h.DISPATCH[name]))
+            self.assertTrue(callable(h.toolkit.DISPATCH[name]))
 
     def test_limit_arg_default_clamp_and_fallback(self):
         self.assertEqual(h.caps._limit_arg({}, "limit", 200, 5000), 200)
@@ -1450,9 +1450,9 @@ class TestOutputCaps(unittest.TestCase):
         self.assertEqual(h.caps._clip_line("short", 100), "short")
 
     def test_execute_tool_backstop_caps_any_result(self):
-        h.DISPATCH["_huge"] = lambda args: "h" * (h.config.TOOL_RESULT_LIMIT + 5_000)
-        self.addCleanup(h.DISPATCH.pop, "_huge", None)
-        out = h.execute_tool("_huge", "{}")
+        h.toolkit.DISPATCH["_huge"] = lambda args: "h" * (h.config.TOOL_RESULT_LIMIT + 5_000)
+        self.addCleanup(h.toolkit.DISPATCH.pop, "_huge", None)
+        out = h.toolkit.execute_tool("_huge", "{}")
         self.assertTrue(out.startswith("h" * h.config.TOOL_RESULT_LIMIT))
         self.assertIn(f"showing first {h.config.TOOL_RESULT_LIMIT};", out)
 
@@ -1463,7 +1463,7 @@ class TestOutputCaps(unittest.TestCase):
 
         h.state.MCP_DISPATCH["_huge_mcp"] = (HugeClient(), "huge")
         self.addCleanup(h.state.MCP_DISPATCH.pop, "_huge_mcp", None)
-        out = h.execute_tool("_huge_mcp", "{}")
+        out = h.toolkit.execute_tool("_huge_mcp", "{}")
         self.assertTrue(out.startswith("m" * h.config.TOOL_RESULT_LIMIT))
         self.assertIn("[truncated:", out)
 
@@ -1930,17 +1930,17 @@ class TestLoadAgentsMd(Base):
 
 class TestDispatch(Base):
     def test_get_cwd(self):
-        self.assertEqual(h.execute_tool("get_cwd", "{}"), h.state.CWD)
+        self.assertEqual(h.toolkit.execute_tool("get_cwd", "{}"), h.state.CWD)
 
     def test_invalid_json(self):
-        self.assertEqual(h.execute_tool("read_file", "{bad"), "error: invalid JSON arguments: {bad")
+        self.assertEqual(h.toolkit.execute_tool("read_file", "{bad"), "error: invalid JSON arguments: {bad")
 
     def test_unknown_tool(self):
-        self.assertEqual(h.execute_tool("nope", "{}"), "error: unknown tool: nope")
+        self.assertEqual(h.toolkit.execute_tool("nope", "{}"), "error: unknown tool: nope")
 
     def test_exit_signal_propagates(self):
         with self.assertRaises(h.errors.ExitSignal) as ctx:
-            h.execute_tool("exit", '{"code": 5, "message": "done"}')
+            h.toolkit.execute_tool("exit", '{"code": 5, "message": "done"}')
         self.assertEqual(ctx.exception.code, 5)
         self.assertEqual(ctx.exception.message, "done")
 
@@ -1953,7 +1953,7 @@ class TestDispatch(Base):
         )
 
     def test_tool_exception_caught(self):
-        self.assertTrue(h.execute_tool("read_file", '{"path": "nope.txt"}').startswith("error:"))
+        self.assertTrue(h.toolkit.execute_tool("read_file", '{"path": "nope.txt"}').startswith("error:"))
 
 
 class TestSubagents(unittest.TestCase):
@@ -2043,15 +2043,15 @@ class TestSubagents(unittest.TestCase):
         interactive_names = [s["function"]["name"] for s in h.toolspec.OPENAI_TOOLS_INTERACTIVE]
         self.assertIn("task", all_names)
         self.assertIn("task", interactive_names)
-        self.assertIn("task", h.DISPATCH)
+        self.assertIn("task", h.toolkit.DISPATCH)
 
     def test_task_empty(self):
-        self.assertEqual(h.tool_task({"task": "   "}), "error: empty task")
-        self.assertEqual(h.tool_task({}), "error: empty task")
+        self.assertEqual(h.toolkit.tool_task({"task": "   "}), "error: empty task")
+        self.assertEqual(h.toolkit.tool_task({}), "error: empty task")
 
     def test_task_depth_limit(self):
         h.state._AGENT_DEPTH = h.state.MAX_SUBAGENT_DEPTH
-        out = h.tool_task({"task": "do something"})
+        out = h.toolkit.tool_task({"task": "do something"})
         self.assertTrue(out.startswith("error: sub-agent depth limit reached"))
 
     def test_task_summary_capped(self):
@@ -2062,7 +2062,7 @@ class TestSubagents(unittest.TestCase):
         old = h.agent.run_agent
         h.agent.run_agent = fake_run_agent
         self.addCleanup(setattr, h.agent, "run_agent", old)
-        out = h.tool_task({"task": "do X"})
+        out = h.toolkit.tool_task({"task": "do X"})
         self.assertTrue(out.startswith("exit code: 0\n" + "s" * h.config.SUBAGENT_SUMMARY_LIMIT))
         self.assertIn(
             f"showing first {h.config.SUBAGENT_SUMMARY_LIMIT};",
@@ -2083,7 +2083,7 @@ class TestSubagents(unittest.TestCase):
         old = h.agent.run_agent
         h.agent.run_agent = fake_run_agent
         self.addCleanup(setattr, h.agent, "run_agent", old)
-        out = h.tool_task({"task": "do X"})
+        out = h.toolkit.tool_task({"task": "do X"})
         self.assertEqual(out, "exit code: 0\nsub summary")
         self.assertEqual(len(calls), 1)
         call = calls[0]
@@ -2103,7 +2103,7 @@ class TestSubagents(unittest.TestCase):
         h.agent.run_agent = boom
         self.addCleanup(setattr, h.agent, "run_agent", old)
         with self.assertRaises(RuntimeError):
-            h.tool_task({"task": "do X"})
+            h.toolkit.tool_task({"task": "do X"})
         self.assertEqual(h.state.OUTPUT_INDENT, "")
 
     def test_task_no_final_content(self):
@@ -2117,7 +2117,7 @@ class TestSubagents(unittest.TestCase):
         old = h.agent.run_agent
         h.agent.run_agent = fake_run_agent
         self.addCleanup(setattr, h.agent, "run_agent", old)
-        self.assertEqual(h.tool_task({"task": "do X"}), f"exit code: 2\n{h.config.NO_SUMMARY_NOTE}")
+        self.assertEqual(h.toolkit.tool_task({"task": "do X"}), f"exit code: 2\n{h.config.NO_SUMMARY_NOTE}")
 
     # --- the hand-off: what the parent actually receives as the summary ---
 
@@ -2139,7 +2139,7 @@ class TestSubagents(unittest.TestCase):
 
         self._scripted(decide)
         with contextlib.redirect_stdout(io.StringIO()):
-            out = h.tool_task({"task": "map the codebase"})
+            out = h.toolkit.tool_task({"task": "map the codebase"})
         self.assertEqual(out, f"exit code: 0\n{summary}")
         self.assertEqual(h.state.EXIT_NOTE_BY_CONV, {})  # popped, not left behind
 
@@ -2193,7 +2193,7 @@ class TestSubagents(unittest.TestCase):
 
         self._scripted(decide)
         with contextlib.redirect_stdout(io.StringIO()):
-            out = h.tool_task({"task": "map it"})
+            out = h.toolkit.tool_task({"task": "map it"})
         self.assertIn("main() at 4760", out)
         self.assertIn(h.config.SALVAGED_SUMMARY_NOTE, out)
         self.assertNotIn(h.config.NO_SUMMARY_NOTE, out)
@@ -2216,7 +2216,7 @@ class TestSubagents(unittest.TestCase):
 
         self._scripted(decide)
         with contextlib.redirect_stdout(io.StringIO()):
-            out = h.tool_task({"task": "map it"})
+            out = h.toolkit.tool_task({"task": "map it"})
         self.assertEqual(out, "exit code: 0\nouter hand-off")
         self.assertEqual(h.state.EXIT_NOTE_BY_CONV, {})
 
@@ -2240,7 +2240,7 @@ class TestSubagents(unittest.TestCase):
 
         messages, _ = self._scripted(decide)
         with contextlib.redirect_stdout(io.StringIO()):
-            code = h.agent.run_agent(messages, "m", execute=h.execute_tool)
+            code = h.agent.run_agent(messages, "m", execute=h.toolkit.execute_tool)
         self.assertEqual(code, 3)
         answered = {m["tool_call_id"]: m["content"] for m in messages if m["role"] == "tool"}
         self.assertEqual(sorted(answered), ["a", "b", "c"])
@@ -2258,7 +2258,7 @@ class TestSubagents(unittest.TestCase):
         old = h.agent.run_agent
         h.agent.run_agent = fake_run_agent
         self.addCleanup(setattr, h.agent, "run_agent", old)
-        h.tool_task({"task": "do X"})
+        h.toolkit.tool_task({"task": "do X"})
         # The sub-agent's usage entry must not survive the run: its
         # messages list is freed, and a recycled address would resurrect
         # the stale entry in /status.
@@ -2273,7 +2273,7 @@ class TestSubagents(unittest.TestCase):
         h.agent.run_agent = boom
         self.addCleanup(setattr, h.agent, "run_agent", old)
         with self.assertRaises(RuntimeError):
-            h.tool_task({"task": "do X"})
+            h.toolkit.tool_task({"task": "do X"})
         self.assertEqual(h.state.USAGE_BY_CONV, {})
 
     # --- depth accounting: _AGENT_DEPTH is scoped to each run_agent call ---
@@ -2281,7 +2281,7 @@ class TestSubagents(unittest.TestCase):
     def test_task_depth_limit_message_names_the_cap(self):
         h.state.MAX_SUBAGENT_DEPTH = 2
         h.state._AGENT_DEPTH = 2
-        out = h.tool_task({"task": "do something"})
+        out = h.toolkit.tool_task({"task": "do something"})
         self.assertTrue(out.startswith("error: sub-agent depth limit reached"))
         self.assertIn("capped at 2 level", out)
         self.assertIn("level 3", out)  # what the refused call's depth would have been
@@ -2304,7 +2304,7 @@ class TestSubagents(unittest.TestCase):
         messages, calls = self._scripted(decide)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            code = h.agent.run_agent(messages, "m", execute=h.execute_tool)
+            code = h.agent.run_agent(messages, "m", execute=h.toolkit.execute_tool)
         self.assertEqual(code, 0)
         results = [m["content"] for m in messages if m["role"] == "tool"]
         self.assertEqual(len(results), 2)  # both top-level delegations ran
@@ -2325,7 +2325,7 @@ class TestSubagents(unittest.TestCase):
 
         messages, _ = self._scripted(decide)
         with contextlib.redirect_stdout(io.StringIO()):
-            h.agent.run_agent(messages, "m", execute=h.execute_tool)
+            h.agent.run_agent(messages, "m", execute=h.toolkit.execute_tool)
         # 0: the parent's first turn, 1: the sub-agent's, 0: the parent's turn
         # after the sub-agent returned — the parent is back at level 0.
         self.assertEqual(depths, [0, 1, 0])
@@ -2349,7 +2349,7 @@ class TestSubagents(unittest.TestCase):
         h.request.stream_once = fake_stream_once
         self.addCleanup(setattr, h.request, "stream_once", old)
         with contextlib.redirect_stdout(io.StringIO()):
-            code = h.agent.run_agent([{"role": "user", "content": "go"}], "m", execute=h.execute_tool, depth=2)
+            code = h.agent.run_agent([{"role": "user", "content": "go"}], "m", execute=h.toolkit.execute_tool, depth=2)
         self.assertEqual(code, 7)
         self.assertEqual(depths, [2])
         self.assertEqual(h.state._AGENT_DEPTH, 0)
@@ -2363,7 +2363,7 @@ class TestSubagents(unittest.TestCase):
         self.addCleanup(setattr, h.request, "stream_once", old)
         with self.assertRaises(RuntimeError):
             with contextlib.redirect_stdout(io.StringIO()):
-                h.agent.run_agent([{"role": "user", "content": "go"}], "m", execute=h.execute_tool, depth=1)
+                h.agent.run_agent([{"role": "user", "content": "go"}], "m", execute=h.toolkit.execute_tool, depth=1)
         self.assertEqual(h.state._AGENT_DEPTH, 0)
 
     def test_task_failure_does_not_corrupt_parent_depth(self):
@@ -2378,7 +2378,7 @@ class TestSubagents(unittest.TestCase):
 
         messages, calls = self._scripted(decide)
         with contextlib.redirect_stdout(io.StringIO()):
-            code = h.agent.run_agent(messages, "m", execute=h.execute_tool)
+            code = h.agent.run_agent(messages, "m", execute=h.toolkit.execute_tool)
         self.assertEqual(code, 0)
         self.assertEqual(calls, [0, 1, 0])
         results = [m["content"] for m in messages if m["role"] == "tool"]
@@ -2399,7 +2399,7 @@ class TestSubagents(unittest.TestCase):
 
         self._fake_run_agent(fake_run_agent)
         with self.assertRaises(h.errors.SubagentInterrupted) as cm:
-            h.tool_task({"task": "do X"})
+            h.toolkit.tool_task({"task": "do X"})
         content = cm.exception.message["content"]
         self.assertIn(h.config.SUBAGENT_INTERRUPT_PREFIX, content)
         self.assertIn("half an answer", content)
@@ -2413,7 +2413,7 @@ class TestSubagents(unittest.TestCase):
 
         self._fake_run_agent(fake_run_agent)
         with self.assertRaises(h.errors.SubagentInterrupted):
-            h.execute_tool("task", json.dumps({"task": "do X"}))
+            h.toolkit.execute_tool("task", json.dumps({"task": "do X"}))
 
     def test_interrupt_stops_the_whole_turn(self):
         h.state.MAX_SUBAGENT_DEPTH = 2
@@ -2436,7 +2436,7 @@ class TestSubagents(unittest.TestCase):
         messages, calls = self._scripted(decide)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            code = h.agent.run_agent(messages, "m", execute=h.execute_tool)
+            code = h.agent.run_agent(messages, "m", execute=h.toolkit.execute_tool)
         self.assertEqual(code, 0)
         self.assertEqual(calls, [0, 1])  # the parent does not ask the LLM again
         answered = {m["tool_call_id"]: m["content"] for m in messages if m["role"] == "tool"}
@@ -2458,7 +2458,7 @@ class TestSubagents(unittest.TestCase):
 
         messages, calls = self._scripted(decide)
         with contextlib.redirect_stdout(io.StringIO()):
-            code = h.agent.run_agent(messages, "m", execute=h.execute_tool)
+            code = h.agent.run_agent(messages, "m", execute=h.toolkit.execute_tool)
         self.assertEqual(code, 0)
         self.assertEqual(calls, [0, 1, 2])  # stopped all the way up, no retries
         results = [m["content"] for m in messages if m["role"] == "tool"]
@@ -2479,7 +2479,7 @@ class TestSubagents(unittest.TestCase):
         self.addCleanup(setattr, h.request, "stream_once", old)
         messages = [{"role": "user", "content": "go"}]
         with contextlib.redirect_stdout(io.StringIO()):
-            code = h.agent.run_agent(messages, "m", execute=h.execute_tool)
+            code = h.agent.run_agent(messages, "m", execute=h.toolkit.execute_tool)
         self.assertEqual(code, 0)
         self.assertEqual(messages[-1], {"role": "assistant", "content": "partial answer"})
         self.assertEqual(h.state._AGENT_DEPTH, 0)
@@ -2500,7 +2500,7 @@ class TestSubagents(unittest.TestCase):
         self.addCleanup(setattr, h.request, "stream_once", old)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            out = h.tool_task({"task": "never ends"})
+            out = h.toolkit.tool_task({"task": "never ends"})
         self.assertEqual(depths, [1, 1, 1, 1])  # SUBAGENT_STEP_LIMIT turns + the closing one
         self.assertTrue(out.startswith(f"exit code: {h.config.SUBAGENT_STEP_LIMIT_CODE}"), out)
         self.assertIn("step limit", out)
@@ -2528,7 +2528,7 @@ class TestSubagents(unittest.TestCase):
         self._scripted(decide)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            out = h.tool_task({"task": "never ends"})
+            out = h.toolkit.tool_task({"task": "never ends"})
         self.assertTrue(out.startswith(f"exit code: {h.config.SUBAGENT_STEP_LIMIT_CODE}"), out)
         self.assertIn("Partial findings: X at 1, Y at 2", out)
         self.assertIn("this summary may be incomplete", out)
@@ -2557,7 +2557,7 @@ class TestSubagents(unittest.TestCase):
 
         self._scripted(decide)
         with contextlib.redirect_stdout(io.StringIO()):
-            out = h.tool_task({"task": "keep going"})
+            out = h.toolkit.tool_task({"task": "keep going"})
         self.assertEqual(out, "exit code: 0\nsub done")
         self.assertEqual(len(turns), 5)
 
@@ -2573,7 +2573,7 @@ class TestSubagents(unittest.TestCase):
 
         messages, _ = self._scripted(decide)
         with contextlib.redirect_stdout(io.StringIO()):
-            code = h.agent.run_agent(messages, "m", execute=h.execute_tool)
+            code = h.agent.run_agent(messages, "m", execute=h.toolkit.execute_tool)
         self.assertEqual(code, 0)
         self.assertEqual(turns, [0] * 6)  # 5 tool turns + the finishing one, uncapped
 
@@ -2583,7 +2583,7 @@ class TestSubagents(unittest.TestCase):
             return h.config.SUBAGENT_STEP_LIMIT_CODE  # the sub-agent's own `exit` code collides
 
         self._fake_run_agent(fake_run_agent)
-        out = h.tool_task({"task": "do X"})
+        out = h.toolkit.tool_task({"task": "do X"})
         self.assertEqual(out, f"exit code: {h.config.SUBAGENT_STEP_LIMIT_CODE}\ndone")
         self.assertNotIn("step limit", out)
 
@@ -2596,7 +2596,7 @@ class TestSubagents(unittest.TestCase):
 
         _, calls = self._scripted(decide)
         with contextlib.redirect_stdout(io.StringIO()):
-            out = h.tool_task({"task": "never ends"})
+            out = h.toolkit.tool_task({"task": "never ends"})
         self.assertEqual(calls, [1, 1, 1])  # limit + the closing turn, then the guard fired
         self.assertIn("step limit", out)
         self.assertEqual(h.state._AGENT_DEPTH, 0)
@@ -2621,7 +2621,7 @@ class TestSubagents(unittest.TestCase):
         self.addCleanup(setattr, h.request, "stream_once", old)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            code = h.agent.run_agent([{"role": "user", "content": "go"}], "m", execute=h.execute_tool)
+            code = h.agent.run_agent([{"role": "user", "content": "go"}], "m", execute=h.toolkit.execute_tool)
         self.assertEqual(code, 7)
         self.assertIn("done", buf.getvalue())
 
@@ -3933,9 +3933,9 @@ class TestRawInputMode(unittest.TestCase):
 class TestEndToEndScenario(Base):
     def test_agent_workflow(self):
         proj = os.path.join(self.tmp, "proj").replace("\\", "/")
-        h.tool_write_file({"path": f"{proj}/src/main.py", "content": "def calc(x):\n    return x + 1\n\nprint(calc(5))\n"})
-        h.tool_write_file({"path": f"{proj}/src/util.py", "content": "def other():\n    pass\n"})
-        h.tool_write_file({"path": f"{proj}/README.md", "content": "# demo\n"})
+        h.toolkit.tool_write_file({"path": f"{proj}/src/main.py", "content": "def calc(x):\n    return x + 1\n\nprint(calc(5))\n"})
+        h.toolkit.tool_write_file({"path": f"{proj}/src/util.py", "content": "def other():\n    pass\n"})
+        h.toolkit.tool_write_file({"path": f"{proj}/README.md", "content": "# demo\n"})
 
         found = h.search.tool_grep({"path": proj, "pattern": "def calc"})
         self.assertEqual(found, "_test_tmp/proj/src/main.py:1: def calc(x):")
@@ -4156,7 +4156,7 @@ class TestMcpRegister(Base):
     def test_the_agent_layer_hands_its_own_names_down(self):
         """_builtin_tool_names() is the other half of the seam: what startup passes as
         `taken`, so a server cannot shadow a built-in tool."""
-        builtins = h._builtin_tool_names()
+        builtins = h.toolkit._builtin_tool_names()
         for name in ("read_file", "run_shell", "task"):
             self.assertIn(name, builtins)
         self.assertNotIn("not_a_tool", builtins)
@@ -4248,7 +4248,7 @@ class TestMcpPending(Base):
             keys = ["down"] * n_rows + [("char", " "), "enter"]
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
-                applied = h.tools_menu(iter(keys))
+                applied = h.toolkit.tools_menu(iter(keys))
             self.assertTrue(applied)
             self.assertEqual(h.state.PENDING_MCP, [])
             self.assertIn("pw", [s["function"]["name"] for s in h.state.MCP_TOOLS])
@@ -4260,7 +4260,7 @@ class TestMcpPending(Base):
         h.state.PENDING_MCP.append(("pwserver", {"transport": "http", "url": "http://x/mcp"}))
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            h.tools_menu(iter(["enter"]))
+            h.toolkit.tools_menu(iter(["enter"]))
         out = buf.getvalue()
         self.assertIn("mcp servers (disabled in config):", out)
         self.assertIn("[ ] pwserver", out)
@@ -4295,7 +4295,7 @@ class TestMcpStdioIntegration(Base):
         h.mcp.register_mcp_tools([client])
         names = [s["function"]["name"] for s in h.state.MCP_TOOLS]
         self.assertIn("echo", names)
-        self.assertEqual(h.execute_tool("echo", '{"msg": "yo"}'), "echo: yo")
+        self.assertEqual(h.toolkit.execute_tool("echo", '{"msg": "yo"}'), "echo: yo")
 
 
 class TestMcpStdioShellShim(Base):
@@ -4626,7 +4626,7 @@ class TestToolsToggle(unittest.TestCase):
         return {"name": name, "description": desc, "inputSchema": {"type": "object", "properties": {}}}
 
     def test_format_tools_all_on(self):
-        out = h.format_tools()
+        out = h.toolkit.format_tools()
         lines = out.split("\n")
         self.assertTrue(lines)
         for l in lines:
@@ -4636,22 +4636,22 @@ class TestToolsToggle(unittest.TestCase):
 
     def test_format_tools_reflects_disabled(self):
         h.state.DISABLED_TOOLS.add("read_file")
-        out = h.format_tools()
+        out = h.toolkit.format_tools()
         self.assertIn("[ ] read_file — ", out)
         self.assertIn("[X] grep — ", out)
 
     def test_toggle_off_and_on(self):
-        self.assertEqual(h.toggle_tools(["read_file"]), [("read_file", "off")])
+        self.assertEqual(h.toolkit.toggle_tools(["read_file"]), [("read_file", "off")])
         self.assertIn("read_file", h.state.DISABLED_TOOLS)
-        self.assertEqual(h.toggle_tools(["read_file"]), [("read_file", "on")])
+        self.assertEqual(h.toolkit.toggle_tools(["read_file"]), [("read_file", "on")])
         self.assertNotIn("read_file", h.state.DISABLED_TOOLS)
 
     def test_toggle_unknown(self):
-        self.assertEqual(h.toggle_tools(["nope"]), [("nope", "unknown")])
+        self.assertEqual(h.toolkit.toggle_tools(["nope"]), [("nope", "unknown")])
         self.assertEqual(h.state.DISABLED_TOOLS, set())
 
     def test_toggle_multiple(self):
-        res = h.toggle_tools(["read_file", "grep", "nope"])
+        res = h.toolkit.toggle_tools(["read_file", "grep", "nope"])
         self.assertEqual(res, [("read_file", "off"), ("grep", "off"), ("nope", "unknown")])
         self.assertEqual(h.state.DISABLED_TOOLS, {"read_file", "grep"})
 
@@ -4663,7 +4663,7 @@ class TestToolsToggle(unittest.TestCase):
 
     def test_execute_tool_rejects_disabled(self):
         h.state.DISABLED_TOOLS.add("get_cwd")
-        out = h.execute_tool("get_cwd", "{}")
+        out = h.toolkit.execute_tool("get_cwd", "{}")
         self.assertTrue(out.startswith("error: tool 'get_cwd' is disabled"))
 
     def test_status_reflects_disabled(self):
@@ -4675,24 +4675,24 @@ class TestToolsToggle(unittest.TestCase):
 
     def test_toggle_mcp_server_prefix(self):
         self._register("srv", [self._mcp_tool("t1"), self._mcp_tool("t2")])
-        self.assertEqual(h.toggle_tools(["mcp:srv"]), [("mcp:srv", "off")])
+        self.assertEqual(h.toolkit.toggle_tools(["mcp:srv"]), [("mcp:srv", "off")])
         self.assertEqual(h.state.DISABLED_TOOLS, {"t1", "t2"})
-        self.assertEqual(h.toggle_tools(["mcp:srv"]), [("mcp:srv", "on")])
+        self.assertEqual(h.toolkit.toggle_tools(["mcp:srv"]), [("mcp:srv", "on")])
         self.assertEqual(h.state.DISABLED_TOOLS, set())
 
     def test_toggle_mcp_server_prefix_mixed(self):
         self._register("srv", [self._mcp_tool("t1"), self._mcp_tool("t2")])
         h.state.DISABLED_TOOLS.add("t2")
-        self.assertEqual(h.toggle_tools(["mcp:srv"]), [("mcp:srv", "on")])
+        self.assertEqual(h.toolkit.toggle_tools(["mcp:srv"]), [("mcp:srv", "on")])
         self.assertEqual(h.state.DISABLED_TOOLS, set())
 
     def test_toggle_mcp_server_prefix_unknown(self):
-        self.assertEqual(h.toggle_tools(["mcp:nope"]), [("mcp:nope", "unknown")])
+        self.assertEqual(h.toolkit.toggle_tools(["mcp:nope"]), [("mcp:nope", "unknown")])
         self.assertEqual(h.state.DISABLED_TOOLS, set())
 
     def test_format_tools_groups_mcp(self):
         self._register("srv", [self._mcp_tool("t1", "d1"), self._mcp_tool("t2", "d2")])
-        out = h.format_tools()
+        out = h.toolkit.format_tools()
         lines = out.split("\n")
         self.assertIn("mcp servers:", lines)
         self.assertIn("[X] mcp: srv (2 tools)", lines)
@@ -4703,7 +4703,7 @@ class TestToolsToggle(unittest.TestCase):
     def test_format_tools_mcp_mixed_mark(self):
         self._register("srv", [self._mcp_tool("t1", "d1"), self._mcp_tool("t2", "d2")])
         h.state.DISABLED_TOOLS.add("t2")
-        out = h.format_tools()
+        out = h.toolkit.format_tools()
         self.assertIn("[-] mcp: srv (2 tools)", out)
         self.assertIn("  [X] t1 — d1", out)
         self.assertIn("  [ ] t2 — d2", out)
@@ -4711,7 +4711,7 @@ class TestToolsToggle(unittest.TestCase):
     def test_format_tools_mcp_all_off_mark(self):
         self._register("srv", [self._mcp_tool("t1"), self._mcp_tool("t2")])
         h.state.DISABLED_TOOLS.update({"t1", "t2"})
-        out = h.format_tools()
+        out = h.toolkit.format_tools()
         self.assertIn("[ ] mcp: srv (2 tools)", out)
 
 
@@ -4746,7 +4746,7 @@ class TestToolsMenu(unittest.TestCase):
         from contextlib import redirect_stdout
         buf = io.StringIO()
         with redirect_stdout(buf):
-            applied = h.tools_menu(iter(keys))
+            applied = h.toolkit.tools_menu(iter(keys))
         return applied, buf.getvalue()
 
     def sorted_names(self):
@@ -4929,28 +4929,28 @@ class TestCommandsMenu(unittest.TestCase):
         from contextlib import redirect_stdout
         buf = io.StringIO()
         with redirect_stdout(buf):
-            selected = h.commands_menu(iter(keys))
+            selected = h.lineedit.commands_menu(iter(keys))
         return selected, buf.getvalue()
 
     def test_enter_selects_first(self):
         selected, _ = self.menu(["enter"])
-        self.assertEqual(selected, h.REPL_COMMANDS[0][0])
+        self.assertEqual(selected, h.config.REPL_COMMANDS[0][0])
 
     def test_ctrl_enter_selects(self):
         selected, _ = self.menu(["ctrl_enter"])
-        self.assertEqual(selected, h.REPL_COMMANDS[0][0])
+        self.assertEqual(selected, h.config.REPL_COMMANDS[0][0])
 
     def test_down_moves_cursor(self):
         selected, _ = self.menu(["down", "enter"])
-        self.assertEqual(selected, h.REPL_COMMANDS[1][0])
+        self.assertEqual(selected, h.config.REPL_COMMANDS[1][0])
 
     def test_up_at_top_stays(self):
         selected, _ = self.menu(["up", "up", "enter"])
-        self.assertEqual(selected, h.REPL_COMMANDS[0][0])
+        self.assertEqual(selected, h.config.REPL_COMMANDS[0][0])
 
     def test_down_clamps_at_end(self):
-        selected, _ = self.menu(["down"] * (len(h.REPL_COMMANDS) + 5) + ["enter"])
-        self.assertEqual(selected, h.REPL_COMMANDS[-1][0])
+        selected, _ = self.menu(["down"] * (len(h.config.REPL_COMMANDS) + 5) + ["enter"])
+        self.assertEqual(selected, h.config.REPL_COMMANDS[-1][0])
 
     def test_esc_cancels(self):
         selected, _ = self.menu(["esc"])
@@ -4979,7 +4979,7 @@ class TestCommandsMenu(unittest.TestCase):
 
     def test_exit_clears_menu_lines_and_returns_to_prompt(self):
         _, out = self.menu(["enter"])
-        n = 1 + len(h.REPL_COMMANDS) + 1  # header + commands + description
+        n = 1 + len(h.config.REPL_COMMANDS) + 1  # header + commands + description
         # On exit each menu line is cleared, then the cursor moves back up
         # to the prompt line.
         tail = "\x1b[2K\x1b[B" * (n - 1) + "\x1b[2K" + f"\x1b[{n}A"
@@ -5152,7 +5152,7 @@ class TestTodo(Base):
         messages = [{"role": "user", "content": "go"}]
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            code = h.agent.run_agent(messages, "m", execute=h.execute_tool)
+            code = h.agent.run_agent(messages, "m", execute=h.toolkit.execute_tool)
         self.assertEqual(code, 0)
         reminders = [m for m in messages if m.get("role") == "user" and "todo list" in (m.get("content") or "")]
         self.assertEqual(len(reminders), 1)
@@ -5267,13 +5267,13 @@ class TestStateToolsRegistered(unittest.TestCase):
         for name in ("todo", "memory"):
             self.assertIn(name, all_names)
             self.assertIn(name, interactive_names)
-            self.assertIn(name, h.DISPATCH)
+            self.assertIn(name, h.toolkit.DISPATCH)
 
     def test_gotcha_tool_removed(self):
         # pitfalls are recorded through the memory tool now, not a separate one
         for tools in (h.toolspec.OPENAI_TOOLS, h.toolspec.OPENAI_TOOLS_INTERACTIVE):
             self.assertNotIn("gotcha", [s["function"]["name"] for s in tools])
-        self.assertNotIn("gotcha", h.DISPATCH)
+        self.assertNotIn("gotcha", h.toolkit.DISPATCH)
         for name in ("tool_gotcha", "load_gotchas", "GOTCHAS_FILE", "GOTCHAS_LABEL"):
             self.assertFalse(hasattr(h, name))
 
@@ -5333,50 +5333,50 @@ class TestAskUser(Base):
         for name in ("ask_user",):
             self.assertIn(name, all_names)
             self.assertIn(name, interactive_names)
-            self.assertIn(name, h.DISPATCH)
+            self.assertIn(name, h.toolkit.DISPATCH)
 
     def test_system_prompt_mentions_interaction_tools(self):
         prompt = h.context.get_system_prompt("/x", "")
         self.assertIn("ask_user", prompt)
 
     def test_empty_question(self):
-        self.assertEqual(h.tool_ask_user({}), "error: empty question")
-        self.assertEqual(h.tool_ask_user({"question": "  "}), "error: empty question")
+        self.assertEqual(h.toolkit.tool_ask_user({}), "error: empty question")
+        self.assertEqual(h.toolkit.tool_ask_user({"question": "  "}), "error: empty question")
 
     def test_options_must_be_list(self):
-        out = self._call(h.tool_ask_user, {"question": "q", "options": "a"})
+        out = self._call(h.toolkit.tool_ask_user, {"question": "q", "options": "a"})
         self.assertEqual(out, "error: options must be a list of strings")
 
     def test_freeform_answer(self):
         self._respond("blue")
-        out = self._call(h.tool_ask_user, {"question": "favorite color?"})
+        out = self._call(h.toolkit.tool_ask_user, {"question": "favorite color?"})
         self.assertEqual(out, "user answered: blue")
 
     def test_select_option_by_number(self):
         self._respond("2")
         out = self._call(
-            h.tool_ask_user, {"question": "pick", "options": ["a", "b", "c"]}
+            h.toolkit.tool_ask_user, {"question": "pick", "options": ["a", "b", "c"]}
         )
         self.assertEqual(out, "user selected: b")
 
     def test_options_allow_custom_answer(self):
         self._respond("something else")
-        out = self._call(h.tool_ask_user, {"question": "pick", "options": ["a", "b"]})
+        out = self._call(h.toolkit.tool_ask_user, {"question": "pick", "options": ["a", "b"]})
         self.assertEqual(out, "user answered: something else")
 
     def test_out_of_range_option_is_answer(self):
         self._respond("9")
-        out = self._call(h.tool_ask_user, {"question": "pick", "options": ["a", "b"]})
+        out = self._call(h.toolkit.tool_ask_user, {"question": "pick", "options": ["a", "b"]})
         self.assertEqual(out, "user answered: 9")
 
     def test_empty_answer(self):
         self._respond("")
-        self.assertEqual(h.tool_ask_user({"question": "q"}), "user answered: (empty)")
+        self.assertEqual(h.toolkit.tool_ask_user({"question": "q"}), "user answered: (empty)")
 
     def test_cancel(self):
         self._raise(EOFError)
         self.assertEqual(
-            h.tool_ask_user({"question": "q"}), "user cancelled (no answer)"
+            h.toolkit.tool_ask_user({"question": "q"}), "user cancelled (no answer)"
         )
 
 
@@ -5962,7 +5962,7 @@ class TestInterrupt(Base):
         messages = [{"role": "user", "content": "go"}]
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            code = h.agent.run_agent(messages, "m", execute=h.execute_tool)
+            code = h.agent.run_agent(messages, "m", execute=h.toolkit.execute_tool)
         self.assertEqual(code, 0)
         self.assertEqual(messages[-1], {"role": "assistant", "content": "partial answer"})
 
@@ -5976,7 +5976,7 @@ class TestInterrupt(Base):
         messages = [{"role": "user", "content": "go"}]
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            code = h.agent.run_agent(messages, "m", execute=h.execute_tool)
+            code = h.agent.run_agent(messages, "m", execute=h.toolkit.execute_tool)
         self.assertEqual(code, 0)
         self.assertEqual(len(messages), 1)
 
@@ -5996,7 +5996,7 @@ class TestInterrupt(Base):
         messages = [{"role": "user", "content": "go"}]
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            code = h.agent.run_agent(messages, "m", execute=h.execute_tool)
+            code = h.agent.run_agent(messages, "m", execute=h.toolkit.execute_tool)
         self.assertEqual(code, 0)
         self.assertEqual(len(messages), 1)
 
@@ -6025,7 +6025,7 @@ class TestInterrupt(Base):
         messages = [{"role": "user", "content": "go"}]
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            code = h.agent.run_agent(messages, "m", execute=h.execute_tool)
+            code = h.agent.run_agent(messages, "m", execute=h.toolkit.execute_tool)
         self.assertEqual(code, 0)
         self.assertEqual(len(messages), 1)
 
@@ -6045,7 +6045,7 @@ class TestInterrupt(Base):
         messages = [{"role": "user", "content": "go"}]
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            code = h.agent.run_agent(messages, "m", execute=h.execute_tool)
+            code = h.agent.run_agent(messages, "m", execute=h.toolkit.execute_tool)
         self.assertEqual(code, 0)
         self.assertEqual(
             messages[-1],
@@ -6149,7 +6149,7 @@ class TestToolsArePassedDown(unittest.TestCase):
     def test_an_agent_turn_advertises_the_active_tools(self):
         calls = self._tool_names(
             h.agent.run_agent, [{"role": "user", "content": "go"}], "m",
-            execute=h.execute_tool, interactive=True, temperature=0.2,
+            execute=h.toolkit.execute_tool, interactive=True, temperature=0.2,
         )
         self.assertEqual(
             sorted(calls[0]), sorted(s["function"]["name"] for s in h.agent._active_tools(True))
@@ -6159,7 +6159,7 @@ class TestToolsArePassedDown(unittest.TestCase):
         h.state.DISABLED_TOOLS = {"fetch_url"}
         calls = self._tool_names(
             h.agent.run_agent, [{"role": "user", "content": "go"}], "m",
-            execute=h.execute_tool, interactive=True, temperature=0.2,
+            execute=h.toolkit.execute_tool, interactive=True, temperature=0.2,
         )
         self.assertNotIn("fetch_url", calls[0])
         self.assertIn("grep", calls[0])
@@ -6169,12 +6169,12 @@ class TestToolsArePassedDown(unittest.TestCase):
         # (OPENAI_TOOLS_INTERACTIVE), so the two turns advertise different sets.
         calls = self._tool_names(
             h.agent.run_agent, [{"role": "user", "content": "go"}], "m",
-            execute=h.execute_tool, interactive=False, temperature=0.2,
+            execute=h.toolkit.execute_tool, interactive=False, temperature=0.2,
         )
         self.assertIn("exit", calls[0])
         calls = self._tool_names(
             h.agent.run_agent, [{"role": "user", "content": "go"}], "m",
-            execute=h.execute_tool, interactive=True, temperature=0.2,
+            execute=h.toolkit.execute_tool, interactive=True, temperature=0.2,
         )
         self.assertNotIn("exit", calls[0])
 
@@ -6483,7 +6483,7 @@ class TestSessionLog(unittest.TestCase):
         messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "go"}]
         h.journal._session_messages(messages, h.state.MAIN_CONV_ID)
         code = h.agent.run_agent(
-            messages, "test-model", execute=h.execute_tool, interactive=True, temperature=0.2, conv_id=h.state.MAIN_CONV_ID
+            messages, "test-model", execute=h.toolkit.execute_tool, interactive=True, temperature=0.2, conv_id=h.state.MAIN_CONV_ID
         )
         return code, messages
 
@@ -6537,7 +6537,7 @@ class TestSessionLog(unittest.TestCase):
         self._scripted(lambda m, d, t: ({"role": "assistant", "content": "done"}, True))
         messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "go"}]
         self.assertEqual(h.agent.run_agent(
-            messages, "test-model", execute=h.execute_tool, interactive=True, temperature=0.2, conv_id=h.state.MAIN_CONV_ID
+            messages, "test-model", execute=h.toolkit.execute_tool, interactive=True, temperature=0.2, conv_id=h.state.MAIN_CONV_ID
         ), 0)
         self.assertFalse(os.path.isdir(self.sessions))
 
@@ -6596,7 +6596,7 @@ class TestSessionLog(unittest.TestCase):
         messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "go"}]
         h.journal._session_messages(messages, h.state.MAIN_CONV_ID)
         self.assertEqual(h.agent.run_agent(
-            messages, "test-model", execute=h.execute_tool, interactive=True, temperature=0.2, conv_id=h.state.MAIN_CONV_ID
+            messages, "test-model", execute=h.toolkit.execute_tool, interactive=True, temperature=0.2, conv_id=h.state.MAIN_CONV_ID
         ), 0)
         last = self._jmessages()[-1]
         self.assertEqual(last["role"], "assistant")
@@ -6616,7 +6616,7 @@ class TestSessionLog(unittest.TestCase):
             messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "go"}]
             h.journal._session_messages(messages, h.state.MAIN_CONV_ID)
             code = h.agent.run_agent(
-                messages, "test-model", execute=h.execute_tool, interactive=True, temperature=0.2, conv_id=h.state.MAIN_CONV_ID
+                messages, "test-model", execute=h.toolkit.execute_tool, interactive=True, temperature=0.2, conv_id=h.state.MAIN_CONV_ID
             )
         self.assertEqual(code, 0)  # the agent carries on with no journal at all
         self.assertFalse(h.state.SESSION_LOG)
@@ -6696,7 +6696,7 @@ class TestSessionLog(unittest.TestCase):
 
     def test_a_refused_delegation_logs_nothing(self):
         h.state.MAX_SUBAGENT_DEPTH = 0
-        out = h.tool_task({"task": "no nesting allowed"})
+        out = h.toolkit.tool_task({"task": "no nesting allowed"})
         self.assertTrue(out.startswith("error: sub-agent depth limit reached"))
         self.assertFalse(os.path.isdir(self.sessions))  # a refused call opens no log
 
@@ -7354,7 +7354,7 @@ class TestCompaction(unittest.TestCase):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             code = h.agent.run_agent(
-                messages, "test-model", execute=h.execute_tool, interactive=True, temperature=0.2,
+                messages, "test-model", execute=h.toolkit.execute_tool, interactive=True, temperature=0.2,
                 conv_id=h.state.MAIN_CONV_ID,
             )
         return code, messages, buf.getvalue()
@@ -7698,7 +7698,7 @@ class TestCompaction(unittest.TestCase):
     def test_the_sessions_tool_is_a_model_tool_too(self):
         names = [s["function"]["name"] for s in h.toolspec.OPENAI_TOOLS]
         self.assertIn("sessions", names)  # the way back has to be reachable from a turn
-        self.assertIn("sessions", h.DISPATCH)
+        self.assertIn("sessions", h.toolkit.DISPATCH)
 
     # ---- when the summarising request fails
 
@@ -8081,7 +8081,7 @@ class TestCompaction(unittest.TestCase):
         self._scripted(lambda m, d, t: ({"role": "assistant", "content": "sub done"}, True))
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            code = h.agent.run_agent(sub, "test-model", execute=h.execute_tool, interactive=False, temperature=0.2,
+            code = h.agent.run_agent(sub, "test-model", execute=h.toolkit.execute_tool, interactive=False, temperature=0.2,
                                depth=1, conv_id=conv_id)
         self.assertEqual(code, 0)
         self.assertEqual([r["reason"] for r in self._compacts("test-session.1.jsonl")],
@@ -8189,16 +8189,19 @@ class TestAgentSeam(Base):
             return self._call("task", {"task": "dig"}) if depth == 0 else self._call("made_up", {})
 
         self._scripted(decide)
-        seen, real = [], h.execute_tool
+        seen = []
+        real = h.toolkit.execute_tool
 
         def spy(name, raw_args):
             seen.append((h.state._AGENT_DEPTH, name))
-            return real(name, raw_args)
+            return real(name, raw_args)  # the real table, so `task` really delegates
 
-        old = h.execute_tool
-        h.execute_tool = spy
-        self.addCleanup(setattr, h, "execute_tool", old)
-        code = h.agent.run_agent([{"role": "user", "content": "go"}], "m", execute=h.execute_tool)
+        self.addCleanup(setattr, h.toolkit, "execute_tool", real)
+        h.toolkit.execute_tool = spy
+        # `task` does not build an executor for the run it starts: it hands over the table its
+        # own module owns — the one the parent run was given. One swap therefore covers the
+        # whole tree, and the nested call is answered by the spy as well.
+        code = h.agent.run_agent([{"role": "user", "content": "go"}], "m", execute=spy)
         self.assertEqual(code, 0)
         self.assertEqual(seen, [(0, "task"), (1, "made_up")])
 
