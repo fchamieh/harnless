@@ -157,15 +157,15 @@ test_empty (__main__.TestFetchUrl.test_empty) ... ok
 test_entities_decoded_when_stripping (__main__.TestFetchUrl.test_entities_decoded_when_stripping) ... ok
 test_http_error (__main__.TestFetchUrl.test_http_error) ... ok
 test_invalid_scheme (__main__.TestFetchUrl.test_invalid_scheme) ... ok
-test_max_chars_arg (__main__.TestFetchUrl.test_max_chars_arg) ... ok
+test_max_chars_arg (__main__.TestFetchUrl.test_max_chars_arg) ... C:\Python314\Lib\tempfile.py:484: ResourceWarning: Implicitly cleaning up <HTTPError 404: 'Not Found'>
+  _warnings.warn(self.warn_message, ResourceWarning)
+ok
 test_raw_html_kept_by_default (__main__.TestFetchUrl.test_raw_html_kept_by_default) ... ok
 test_registered (__main__.TestFetchUrl.test_registered) ... ok
 test_strip_html (__main__.TestFetchUrl.test_strip_html) ... ok
 test_strip_html_skips_script_and_style (__main__.TestFetchUrl.test_strip_html_skips_script_and_style) ... ok
 test_truncation (__main__.TestFetchUrl.test_truncation) ... ok
-test_unknown_charset_falls_back_to_utf8 (__main__.TestFetchUrl.test_unknown_charset_falls_back_to_utf8) ... C:\Python314\Lib\tempfile.py:484: ResourceWarning: Implicitly cleaning up <HTTPError 404: 'Not Found'>
-  _warnings.warn(self.warn_message, ResourceWarning)
-ok
+test_unknown_charset_falls_back_to_utf8 (__main__.TestFetchUrl.test_unknown_charset_falls_back_to_utf8) ... ok
 test_url_error (__main__.TestFetchUrl.test_url_error) ... ok
 test_build_user_message (__main__.TestFileRefs.test_build_user_message) ... ok
 test_cwd_escape_rejected (__main__.TestFileRefs.test_cwd_escape_rejected) ... ok
@@ -269,7 +269,7 @@ test_stream_once_interrupt_raises_with_partial (__main__.TestInterrupt.test_stre
 test_watcher_start_noop_without_tty (__main__.TestInterrupt.test_watcher_start_noop_without_tty) ... skipped 'stdin is a tty'
 test_backspace_across_newline (__main__.TestLineEditor.test_backspace_across_newline) ... ok
 test_backspace_and_delete (__main__.TestLineEditor.test_backspace_and_delete) ... ok
-test_commit_with_caret_mid_block_leaves_no_stale_rows (__main__.TestLineEditor.test_commit_with_caret_mid_block_leaves_no_stale_rows) ... ERROR
+test_commit_with_caret_mid_block_leaves_no_stale_rows (__main__.TestLineEditor.test_commit_with_caret_mid_block_leaves_no_stale_rows) ... ok
 test_ctrl_c_raises (__main__.TestLineEditor.test_ctrl_c_raises) ... ok
 test_ctrl_d_empty_raises_eof (__main__.TestLineEditor.test_ctrl_d_empty_raises_eof) ... ok
 test_ctrl_d_nonempty_submits (__main__.TestLineEditor.test_ctrl_d_nonempty_submits) ... ok
@@ -290,7 +290,7 @@ test_history_up_at_top_stays (__main__.TestLineEditor.test_history_up_at_top_sta
 test_history_up_down (__main__.TestLineEditor.test_history_up_down) ... ok
 test_home_end (__main__.TestLineEditor.test_home_end) ... ok
 test_ignore_tokens (__main__.TestLineEditor.test_ignore_tokens) ... ok
-test_multiline_block_stays_anchored_across_lines (__main__.TestLineEditor.test_multiline_block_stays_anchored_across_lines) ... ERROR
+test_multiline_block_stays_anchored_across_lines (__main__.TestLineEditor.test_multiline_block_stays_anchored_across_lines) ... ok
 test_multiline_cursor_does_not_reprint_previous_line (__main__.TestLineEditor.test_multiline_cursor_does_not_reprint_previous_line) ... ok
 test_multiline_render_does_not_reprint_lines (__main__.TestLineEditor.test_multiline_render_does_not_reprint_lines) ... ok
 test_newline_in_middle_of_line (__main__.TestLineEditor.test_newline_in_middle_of_line) ... ok
@@ -298,20 +298,20 @@ test_newline_token_inserts_newline (__main__.TestLineEditor.test_newline_token_i
 test_readline_prompt_falls_back_without_tty (__main__.TestLineEditor.test_readline_prompt_falls_back_without_tty) ... ok
 test_slash_menu_cancel_keeps_slash (__main__.TestLineEditor.test_slash_menu_cancel_keeps_slash) ... ok
 test_slash_menu_selection_is_extensible (__main__.TestLineEditor.test_slash_menu_selection_is_extensible) ... ok
-test_slash_nonempty_line_no_menu (__main__.TestLineEditor.test_slash_nonempty_line_no_menu) ... ERROR
-test_slash_on_empty_line_opens_menu (__main__.TestLineEditor.test_slash_on_empty_line_opens_menu) ... ERROR
-test_soft_wrap_boundary_cursor (__main__.TestLineEditor.test_soft_wrap_boundary_cursor) ... ERROR
+test_slash_nonempty_line_no_menu (__main__.TestLineEditor.test_slash_nonempty_line_no_menu) ... ok
+test_slash_on_empty_line_opens_menu (__main__.TestLineEditor.test_slash_on_empty_line_opens_menu) ... ok
+test_soft_wrap_boundary_cursor (__main__.TestLineEditor.test_soft_wrap_boundary_cursor) ... ok
 test_soft_wrap_clears_all_physical_lines (__main__.TestLineEditor.test_soft_wrap_clears_all_physical_lines) ... ok
 test_soft_wrap_cursor_move_across_wrap (__main__.TestLineEditor.test_soft_wrap_cursor_move_across_wrap) ... ok
-test_soft_wrap_exact_boundary_cursor (__main__.TestLineEditor.test_soft_wrap_exact_boundary_cursor) ... ERROR
+test_soft_wrap_exact_boundary_cursor (__main__.TestLineEditor.test_soft_wrap_exact_boundary_cursor) ... ok
 test_soft_wrap_then_newline_clears_all_rows (__main__.TestLineEditor.test_soft_wrap_then_newline_clears_all_rows) ... ok
 test_typing_and_enter (__main__.TestLineEditor.test_typing_and_enter) ... ok
 test_up_column_clamped_to_line_above (__main__.TestLineEditor.test_up_column_clamped_to_line_above) ... ok
 test_up_down_multiline_without_history (__main__.TestLineEditor.test_up_down_multiline_without_history) ... ok
 test_up_from_first_line_recalls_history_down_restores_draft (__main__.TestLineEditor.test_up_from_first_line_recalls_history_down_restores_draft) ... ok
 test_up_moves_caret_within_multiline_before_history (__main__.TestLineEditor.test_up_moves_caret_within_multiline_before_history) ... ok
-test_wrapped_line_stays_anchored_while_arrowing_left (__main__.TestLineEditor.test_wrapped_line_stays_anchored_while_arrowing_left) ... ERROR
-test_wrapped_line_stays_anchored_with_typing_and_arrows (__main__.TestLineEditor.test_wrapped_line_stays_anchored_with_typing_and_arrows) ... ERROR
+test_wrapped_line_stays_anchored_while_arrowing_left (__main__.TestLineEditor.test_wrapped_line_stays_anchored_while_arrowing_left) ... ok
+test_wrapped_line_stays_anchored_with_typing_and_arrows (__main__.TestLineEditor.test_wrapped_line_stays_anchored_with_typing_and_arrows) ... ok
 test_absent (__main__.TestLoadAgentsMd.test_absent) ... ok
 test_case_insensitive (__main__.TestLoadAgentsMd.test_case_insensitive) ... ok
 test_exact_name (__main__.TestLoadAgentsMd.test_exact_name) ... ok
@@ -395,12 +395,12 @@ test_register_mcp_client_connect_fail (__main__.TestMcpPending.test_register_mcp
 test_register_mcp_client_connects (__main__.TestMcpPending.test_register_mcp_client_connects) ... ok
 test_tools_menu_enables_pending (__main__.TestMcpPending.test_tools_menu_enables_pending) ... ok
 test_tools_menu_rendering_shows_pending (__main__.TestMcpPending.test_tools_menu_rendering_shows_pending) ... ok
-test_registers_and_collides (__main__.TestMcpRegister.test_registers_and_collides) ... ok
+test_registers_and_collides (__main__.TestMcpRegister.test_registers_and_collides) ... FAIL
 test_spec_shape (__main__.TestMcpRegister.test_spec_shape) ... ok
-test_connect_list_call (__main__.TestMcpStdioIntegration.test_connect_list_call) ... X:\Development\Fadi Projects\ai\fadiz-harness\harnless.py:2373: ResourceWarning: unclosed file <_io.TextIOWrapper name=5 encoding='cp1256'>
+test_connect_list_call (__main__.TestMcpStdioIntegration.test_connect_list_call) ... X:\Development\Fadi Projects\ai\fadiz-harness\harnless_core\mcp.py:173: ResourceWarning: unclosed file <_io.TextIOWrapper name=5 encoding='cp1256'>
   self._proc = None
 ResourceWarning: Enable tracemalloc to get the object allocation traceback
-X:\Development\Fadi Projects\ai\fadiz-harness\harnless.py:2373: ResourceWarning: unclosed file <_io.TextIOWrapper name=4 encoding='cp1256'>
+X:\Development\Fadi Projects\ai\fadiz-harness\harnless_core\mcp.py:173: ResourceWarning: unclosed file <_io.TextIOWrapper name=4 encoding='cp1256'>
   self._proc = None
 ResourceWarning: Enable tracemalloc to get the object allocation traceback
 ok
@@ -720,96 +720,30 @@ test_offset_zero (__main__.TestWriteFile.test_offset_zero) ... ok
 test_replace_range (__main__.TestWriteFile.test_replace_range) ... ok
 
 ======================================================================
-ERROR: test_commit_with_caret_mid_block_leaves_no_stale_rows (__main__.TestLineEditor.test_commit_with_caret_mid_block_leaves_no_stale_rows)
+FAIL: test_registers_and_collides (__main__.TestMcpRegister.test_registers_and_collides)
 ----------------------------------------------------------------------
 Traceback (most recent call last):
-  File "X:\Development\Fadi Projects\ai\fadiz-harness\tests.py", line 3269, in test_commit_with_caret_mid_block_leaves_no_stale_rows
-    snaps = self._drive([("char", c) for c in "0123456789ab"] + ["left"] * 9 + ["enter"])
-  File "X:\Development\Fadi Projects\ai\fadiz-harness\tests.py", line 3124, in _drive
-    line = h.lineedit._edit_line(prompt, feed(), menu)
-                                                 ^^^^
-NameError: name 'menu' is not defined
+  File "X:\Development\Fadi Projects\ai\fadiz-harness\tests.py", line 4129, in test_registers_and_collides
+    self.assertEqual(names, ["echo", "dup"])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Lists differ: ['read_file', 'echo', 'dup'] != ['echo', 'dup']
 
-======================================================================
-ERROR: test_multiline_block_stays_anchored_across_lines (__main__.TestLineEditor.test_multiline_block_stays_anchored_across_lines)
-----------------------------------------------------------------------
-Traceback (most recent call last):
-  File "X:\Development\Fadi Projects\ai\fadiz-harness\tests.py", line 3222, in test_multiline_block_stays_anchored_across_lines
-    snaps = self._drive(keys + ["enter"])
-  File "X:\Development\Fadi Projects\ai\fadiz-harness\tests.py", line 3124, in _drive
-    line = h.lineedit._edit_line(prompt, feed(), menu)
-                                                 ^^^^
-NameError: name 'menu' is not defined
+First differing element 0:
+'read_file'
+'echo'
 
-======================================================================
-ERROR: test_slash_nonempty_line_no_menu (__main__.TestLineEditor.test_slash_nonempty_line_no_menu)
-----------------------------------------------------------------------
-Traceback (most recent call last):
-  File "X:\Development\Fadi Projects\ai\fadiz-harness\tests.py", line 3550, in test_slash_nonempty_line_no_menu
-    self.assertEqual(calls, [])
-                     ^^^^^
-NameError: name 'calls' is not defined
+First list contains 1 additional elements.
+First extra element 2:
+'dup'
 
-======================================================================
-ERROR: test_slash_on_empty_line_opens_menu (__main__.TestLineEditor.test_slash_on_empty_line_opens_menu)
-----------------------------------------------------------------------
-Traceback (most recent call last):
-  File "X:\Development\Fadi Projects\ai\fadiz-harness\tests.py", line 3531, in test_slash_on_empty_line_opens_menu
-    self.assertEqual(calls, [1])
-                     ^^^^^
-NameError: name 'calls' is not defined
-
-======================================================================
-ERROR: test_soft_wrap_boundary_cursor (__main__.TestLineEditor.test_soft_wrap_boundary_cursor)
-----------------------------------------------------------------------
-Traceback (most recent call last):
-  File "X:\Development\Fadi Projects\ai\fadiz-harness\tests.py", line 3231, in test_soft_wrap_boundary_cursor
-    snaps = self._drive([("char", c) for c in "012345"] + ["left"] + ["enter"])
-  File "X:\Development\Fadi Projects\ai\fadiz-harness\tests.py", line 3124, in _drive
-    line = h.lineedit._edit_line(prompt, feed(), menu)
-                                                 ^^^^
-NameError: name 'menu' is not defined
-
-======================================================================
-ERROR: test_soft_wrap_exact_boundary_cursor (__main__.TestLineEditor.test_soft_wrap_exact_boundary_cursor)
-----------------------------------------------------------------------
-Traceback (most recent call last):
-  File "X:\Development\Fadi Projects\ai\fadiz-harness\tests.py", line 3246, in test_soft_wrap_exact_boundary_cursor
-    snaps = self._drive([("char", c) for c in "01234"] + ["left"] * 2 + ["enter"])
-  File "X:\Development\Fadi Projects\ai\fadiz-harness\tests.py", line 3124, in _drive
-    line = h.lineedit._edit_line(prompt, feed(), menu)
-                                                 ^^^^
-NameError: name 'menu' is not defined
-
-======================================================================
-ERROR: test_wrapped_line_stays_anchored_while_arrowing_left (__main__.TestLineEditor.test_wrapped_line_stays_anchored_while_arrowing_left)
-----------------------------------------------------------------------
-Traceback (most recent call last):
-  File "X:\Development\Fadi Projects\ai\fadiz-harness\tests.py", line 3202, in test_wrapped_line_stays_anchored_while_arrowing_left
-    snaps = self._drive([("char", c) for c in "abcdefghijklmnopqrstuvwxyz012345"]
-                        + ["left"] * 32)
-  File "X:\Development\Fadi Projects\ai\fadiz-harness\tests.py", line 3124, in _drive
-    line = h.lineedit._edit_line(prompt, feed(), menu)
-                                                 ^^^^
-NameError: name 'menu' is not defined
-
-======================================================================
-ERROR: test_wrapped_line_stays_anchored_with_typing_and_arrows (__main__.TestLineEditor.test_wrapped_line_stays_anchored_with_typing_and_arrows)
-----------------------------------------------------------------------
-Traceback (most recent call last):
-  File "X:\Development\Fadi Projects\ai\fadiz-harness\tests.py", line 3211, in test_wrapped_line_stays_anchored_with_typing_and_arrows
-    snaps = self._drive(keys + ["enter"])
-  File "X:\Development\Fadi Projects\ai\fadiz-harness\tests.py", line 3124, in _drive
-    line = h.lineedit._edit_line(prompt, feed(), menu)
-                                                 ^^^^
-NameError: name 'menu' is not defined
+- ['read_file', 'echo', 'dup']
++ ['echo', 'dup']
 
 ----------------------------------------------------------------------
-Ran 677 tests in 30.425s
+Ran 677 tests in 30.409s
 
-FAILED (errors=8, skipped=8)
-you> [1;31merr mcp tool 'read_file' (server 'a') collides with an existing tool; skipped[0m
-[1;31merr mcp tool 'dup' (server 'c') collides with an existing tool; skipped[0m
+FAILED (failures=1, skipped=8)
+you> [1;31merr mcp tool 'dup' (server 'c') collides with an existing tool; skipped[0m
 [1;33mtool get_cwd({})[0m
 [2mout X:\Development\Fadi Projects\ai\fadiz-harness[0m
 [1;33mtool task({"task": "deeper from level 0"})[0m

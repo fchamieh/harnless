@@ -293,6 +293,11 @@ PRE_RENAMES = [
     ('    context = max(0, int(args.get("context", 0)))', '    around = max(0, int(args.get("context", 0)))'),
     ('        if context > 0:', '        if around > 0:'),
     ('                    max(0, i - context), min(len(lines), i + context + 1)', '                    max(0, i - around), min(len(lines), i + around + 1)'),
+    # execute_tool() looked MCP tools up through a local named `mcp`, which would shadow the
+    # mcp module alias.
+    ('        mcp = state.MCP_DISPATCH.get(name)', '        entry = state.MCP_DISPATCH.get(name)'),
+    ('        if mcp is not None:', '        if entry is not None:'),
+    ('            client, tool_name = mcp', '            client, tool_name = entry'),
     # _session_files() built its own list named `paths`, shadowing the paths module.
     ("    paths = []", "    logs = []"),
     ("            paths.append(path)", "            logs.append(path)"),

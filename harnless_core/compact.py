@@ -7,7 +7,9 @@ stays in the journal (see harnless_core/journal.py) and the `compact` record nam
 seqs it replaced."""
 
 import urllib
+
 from harnless_core import caps, config, errors, journal, measure, render, request, state
+
 
 def _prune_text(text: str, keep: int) -> tuple:
     """Shrink a message body to its first and last `keep` characters.

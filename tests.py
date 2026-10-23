@@ -1456,12 +1456,12 @@ class TestOutputCaps(unittest.TestCase):
         self.assertIn("[truncated:", out)
 
     def test_mcp_text_result_capped(self):
-        out = h._mcp_content_to_text({"content": [{"type": "text", "text": "m" * 40_000}]})
+        out = h.mcp._mcp_content_to_text({"content": [{"type": "text", "text": "m" * 40_000}]})
         self.assertTrue(out.startswith("m" * h.config.MCP_RESULT_LIMIT))
         self.assertIn(f"showing first {h.config.MCP_RESULT_LIMIT};", out)
 
     def test_mcp_structured_content_capped(self):
-        out = h._mcp_content_to_text({"structuredContent": {"blob": "s" * 40_000}})
+        out = h.mcp._mcp_content_to_text({"structuredContent": {"blob": "s" * 40_000}})
         self.assertLess(len(out), h.config.MCP_RESULT_LIMIT + 200)
         self.assertIn("[truncated:", out)
 
@@ -3974,30 +3974,30 @@ main()
 class TestMcpContentToText(unittest.TestCase):
     def test_text_items(self):
         self.assertEqual(
-            h._mcp_content_to_text({"content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}),
+            h.mcp._mcp_content_to_text({"content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}),
             "a\nb",
         )
 
     def test_image(self):
         self.assertEqual(
-            h._mcp_content_to_text({"content": [{"type": "image", "mimeType": "image/png"}]}),
+            h.mcp._mcp_content_to_text({"content": [{"type": "image", "mimeType": "image/png"}]}),
             "[image: image/png]",
         )
 
     def test_structured(self):
-        out = h._mcp_content_to_text(
+        out = h.mcp._mcp_content_to_text(
             {"content": [{"type": "text", "text": "x"}], "structuredContent": {"k": 1}}
         )
         self.assertEqual(out, "x\nstructured: " + json.dumps({"k": 1}))
 
     def test_is_error(self):
         self.assertEqual(
-            h._mcp_content_to_text({"content": [{"type": "text", "text": "boom"}], "isError": True}),
+            h.mcp._mcp_content_to_text({"content": [{"type": "text", "text": "boom"}], "isError": True}),
             "error: boom",
         )
 
     def test_empty(self):
-        self.assertEqual(h._mcp_content_to_text({}), "(no content)")
+        self.assertEqual(h.mcp._mcp_content_to_text({}), "(no content)")
 
 
 class TestMcpConfig(Base):
@@ -4005,9 +4005,9 @@ class TestMcpConfig(Base):
         old = os.environ.get("HARNLESS_TEST_VAR")
         os.environ["HARNLESS_TEST_VAR"] = "secret"
         try:
-            self.assertEqual(h._expand_env("a${HARNLESS_TEST_VAR}b"), "asecretb")
-            self.assertEqual(h._expand_env("${MISSING_VAR_XYZ}"), "${MISSING_VAR_XYZ}")
-            self.assertEqual(h._expand_env(42), 42)
+            self.assertEqual(h.mcp._expand_env("a${HARNLESS_TEST_VAR}b"), "asecretb")
+            self.assertEqual(h.mcp._expand_env("${MISSING_VAR_XYZ}"), "${MISSING_VAR_XYZ}")
+            self.assertEqual(h.mcp._expand_env(42), 42)
         finally:
             if old is None:
                 os.environ.pop("HARNLESS_TEST_VAR", None)
@@ -4018,14 +4018,14 @@ class TestMcpConfig(Base):
         path = os.path.join(self.tmp, "cfg.json")
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"mcpServers": {"s": {"transport": "http", "url": "http://x"}}}, f)
-        self.assertEqual(h.load_mcp_config(path), {"s": {"transport": "http", "url": "http://x"}})
+        self.assertEqual(h.mcp.load_mcp_config(path), {"s": {"transport": "http", "url": "http://x"}})
 
     def test_load_bare(self):
         path = os.path.join(self.tmp, "cfg.json")
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"s": {"transport": "stdio", "command": "node", "args": ["a"]}}, f)
         self.assertEqual(
-            h.load_mcp_config(path),
+            h.mcp.load_mcp_config(path),
             {"s": {"transport": "stdio", "command": "node", "args": ["a"]}},
         )
 
@@ -4036,7 +4036,7 @@ class TestMcpConfig(Base):
             path = os.path.join(self.tmp, "cfg.json")
             with open(path, "w", encoding="utf-8") as f:
                 json.dump({"s": {"transport": "http", "url": "${HARNLESS_TEST_URL}/mcp"}}, f)
-            self.assertEqual(h.load_mcp_config(path), {"s": {"transport": "http", "url": "http://real/mcp"}})
+            self.assertEqual(h.mcp.load_mcp_config(path), {"s": {"transport": "http", "url": "http://real/mcp"}})
         finally:
             if old is None:
                 os.environ.pop("HARNLESS_TEST_URL", None)
@@ -4054,7 +4054,7 @@ class TestMcpConfig(Base):
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"mcpServers": {"a": {"transport": "http", "url": "http://a"}}}, f)
         servers = {}
-        h._load_mcp_config_into(servers, path)
+        h.mcp._load_mcp_config_into(servers, path)
         self.assertEqual(servers, {"a": {"transport": "http", "url": "http://a"}})
 
     def test_load_into_later_wins(self):
@@ -4064,7 +4064,7 @@ class TestMcpConfig(Base):
         servers = {"a": {"transport": "http", "url": "http://old"}}
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            h._load_mcp_config_into(servers, path)
+            h.mcp._load_mcp_config_into(servers, path)
         self.assertEqual(servers["a"]["url"], "http://a")
         self.assertIn("duplicate mcp server name 'a'", buf.getvalue())
 
@@ -4075,32 +4075,32 @@ class TestMcpConfig(Base):
         servers = {}
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            h._load_mcp_config_into(servers, path)
+            h.mcp._load_mcp_config_into(servers, path)
         self.assertEqual(servers, {})
         self.assertIn("failed to load mcp config", buf.getvalue())
 
     def test_parse_stdio(self):
-        name, cfg = h._parse_mcp_stdio("fs:npx -y server ./data")
+        name, cfg = h.mcp._parse_mcp_stdio("fs:npx -y server ./data")
         self.assertEqual(name, "fs")
         self.assertEqual(cfg, {"transport": "stdio", "command": "npx", "args": ["-y", "server", "./data"]})
 
     def test_parse_stdio_invalid(self):
-        with self.assertRaises(h.MCPError):
-            h._parse_mcp_stdio("no-colon-here")
+        with self.assertRaises(h.mcp.MCPError):
+            h.mcp._parse_mcp_stdio("no-colon-here")
 
     def test_parse_http(self):
-        name, cfg = h._parse_mcp_http("api=http://127.0.0.1:8000/mcp")
+        name, cfg = h.mcp._parse_mcp_http("api=http://127.0.0.1:8000/mcp")
         self.assertEqual(name, "api")
         self.assertEqual(cfg, {"transport": "http", "url": "http://127.0.0.1:8000/mcp"})
 
     def test_parse_http_invalid(self):
-        with self.assertRaises(h.MCPError):
-            h._parse_mcp_http("no-equals")
+        with self.assertRaises(h.mcp.MCPError):
+            h.mcp._parse_mcp_http("no-equals")
 
 
 class TestMcpRegister(Base):
     def _fake_client(self, name, tools):
-        c = h.MCPClient(name, {"transport": "stdio", "command": "x"})
+        c = h.mcp.MCPClient(name, {"transport": "stdio", "command": "x"})
         c.connect = lambda: {}
         c.list_tools = lambda: tools
         c.close = lambda: None
@@ -4122,19 +4122,37 @@ class TestMcpRegister(Base):
         )
         c3 = self._fake_client("c", [{"name": "dup", "description": "d", "inputSchema": {}}])
         self.addCleanup(self._reset)
-        h.register_mcp_tools([c1, c2, c3])
+        h.mcp.register_mcp_tools([c1, c2, c3], taken={"read_file"})
         names = [s["function"]["name"] for s in h.state.MCP_TOOLS]
-        # read_file collides with a built-in -> skipped; echo registered;
+        # read_file was marked taken by the caller -> skipped; echo registered;
         # dup from c2 registered, dup from c3 skipped (first server wins)
         self.assertEqual(names, ["echo", "dup"])
         self.assertIn("echo", h.state.MCP_DISPATCH)
         self.assertIs(h.state.MCP_DISPATCH["echo"][0], c2)
         self.assertEqual(c2.tool_names, ["echo", "dup"])
 
+    def test_the_caller_has_to_say_which_names_are_taken(self):
+        """The MCP module does not know the harness's built-in tools: it refuses a name
+        because the caller marked it taken. Nothing is taken when nobody says so."""
+        c = self._fake_client("a", [{"name": "read_file", "description": "d", "inputSchema": {}}])
+        self.addCleanup(self._reset)
+        h.mcp.register_mcp_tools([c])
+        self.assertEqual([s["function"]["name"] for s in h.state.MCP_TOOLS], ["read_file"])
+        h.mcp.register_mcp_tools([c], taken={"read_file"})
+        self.assertEqual(h.state.MCP_TOOLS, [])
+
+    def test_the_agent_layer_hands_its_own_names_down(self):
+        """_builtin_tool_names() is the other half of the seam: what startup passes as
+        `taken`, so a server cannot shadow a built-in tool."""
+        builtins = h._builtin_tool_names()
+        for name in ("read_file", "run_shell", "task"):
+            self.assertIn(name, builtins)
+        self.assertNotIn("not_a_tool", builtins)
+
     def test_spec_shape(self):
         c = self._fake_client("a", [{"name": "t", "description": "desc", "inputSchema": {"type": "object", "properties": {"x": {"type": "string"}}}}])
         self.addCleanup(self._reset)
-        h.register_mcp_tools([c])
+        h.mcp.register_mcp_tools([c])
         self.assertEqual(
             h.state.MCP_TOOLS[0],
             {
@@ -4164,8 +4182,8 @@ class TestMcpPending(Base):
     def test_register_mcp_client_connects(self):
         server, port, _ = _fake_mcp_server("pw")
         try:
-            c = h.MCPClient("s", {"transport": "http", "url": f"http://127.0.0.1:{port}/mcp"})
-            ok = h._register_mcp_client(c)
+            c = h.mcp.MCPClient("s", {"transport": "http", "url": f"http://127.0.0.1:{port}/mcp"})
+            ok = h.mcp._register_mcp_client(c)
             self.assertTrue(ok)
             self.assertEqual([s["function"]["name"] for s in h.state.MCP_TOOLS], ["pw"])
             self.assertIn("pw", h.state.MCP_DISPATCH)
@@ -4175,10 +4193,10 @@ class TestMcpPending(Base):
             server.server_close()
 
     def test_register_mcp_client_connect_fail(self):
-        c = h.MCPClient("s", {"transport": "http", "url": "http://127.0.0.1:1/mcp"})
+        c = h.mcp.MCPClient("s", {"transport": "http", "url": "http://127.0.0.1:1/mcp"})
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            ok = h._register_mcp_client(c)
+            ok = h.mcp._register_mcp_client(c)
         self.assertFalse(ok)
         self.assertEqual(h.state.MCP_TOOLS, [])
         self.assertEqual(h.state.MCP_CLIENTS, [c])
@@ -4187,7 +4205,7 @@ class TestMcpPending(Base):
         server, port, _ = _fake_mcp_server("pw")
         try:
             h.state.PENDING_MCP.append(("s", {"transport": "http", "url": f"http://127.0.0.1:{port}/mcp"}))
-            ok, msg = h._enable_pending_mcp("s")
+            ok, msg = h.mcp._enable_pending_mcp("s")
             self.assertTrue(ok)
             self.assertEqual(h.state.PENDING_MCP, [])
             self.assertEqual([s["function"]["name"] for s in h.state.MCP_TOOLS], ["pw"])
@@ -4196,7 +4214,7 @@ class TestMcpPending(Base):
             server.server_close()
 
     def test_enable_pending_mcp_unknown(self):
-        ok, msg = h._enable_pending_mcp("nope")
+        ok, msg = h.mcp._enable_pending_mcp("nope")
         self.assertFalse(ok)
         self.assertIn("not pending", msg)
 
@@ -4204,7 +4222,7 @@ class TestMcpPending(Base):
         h.state.PENDING_MCP.append(("s", {"transport": "http", "url": "http://127.0.0.1:1/mcp"}))
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            ok, msg = h._enable_pending_mcp("s")
+            ok, msg = h.mcp._enable_pending_mcp("s")
         self.assertFalse(ok)
         self.assertEqual(len(h.state.PENDING_MCP), 1)  # stays pending so the user can retry
 
@@ -4245,7 +4263,7 @@ class TestMcpStdioIntegration(Base):
 
     def test_connect_list_call(self):
         server = self._write_server()
-        client = h.MCPClient("fake", {"transport": "stdio", "command": sys.executable, "args": [server]})
+        client = h.mcp.MCPClient("fake", {"transport": "stdio", "command": sys.executable, "args": [server]})
         try:
             client.connect()
             tools = client.list_tools()
@@ -4257,12 +4275,12 @@ class TestMcpStdioIntegration(Base):
 
     def test_register_end_to_end(self):
         server = self._write_server()
-        client = h.MCPClient("fake", {"transport": "stdio", "command": sys.executable, "args": [server]})
+        client = h.mcp.MCPClient("fake", {"transport": "stdio", "command": sys.executable, "args": [server]})
         self.addCleanup(client.close)
         self.addCleanup(setattr, h.state, "MCP_TOOLS", [])
         self.addCleanup(setattr, h.state, "MCP_DISPATCH", {})
         self.addCleanup(setattr, h.state, "MCP_CLIENTS", [])
-        h.register_mcp_tools([client])
+        h.mcp.register_mcp_tools([client])
         names = [s["function"]["name"] for s in h.state.MCP_TOOLS]
         self.assertIn("echo", names)
         self.assertEqual(h.execute_tool("echo", '{"msg": "yo"}'), "echo: yo")
@@ -4298,14 +4316,14 @@ class TestMcpStdioShellShim(Base):
         with open(shim, "w") as f:
             f.write("@echo off\n")
         calls = self._capture_popen(
-            h.MCPClient("shim", {"transport": "stdio", "command": shim, "args": ["x"]})
+            h.mcp.MCPClient("shim", {"transport": "stdio", "command": shim, "args": ["x"]})
         )
         self.assertEqual(len(calls), 1)
         self.assertTrue(calls[0][1].get("shell"))
 
     def test_real_exe_no_shell(self):
         calls = self._capture_popen(
-            h.MCPClient("py", {"transport": "stdio", "command": sys.executable, "args": []})
+            h.mcp.MCPClient("py", {"transport": "stdio", "command": sys.executable, "args": []})
         )
         self.assertEqual(len(calls), 1)
         self.assertFalse(calls[0][1].get("shell"))
@@ -4388,7 +4406,7 @@ class TestMcpHttpIntegration(Base):
         t = threading.Thread(target=server.serve_forever, daemon=True)
         t.start()
         try:
-            client = h.MCPClient("http", {"transport": "http", "url": f"http://127.0.0.1:{port}/mcp"})
+            client = h.mcp.MCPClient("http", {"transport": "http", "url": f"http://127.0.0.1:{port}/mcp"})
             client.connect()
             tools = client.list_tools()
             self.assertEqual(tools[0]["name"], "add")
@@ -4585,11 +4603,11 @@ class TestToolsToggle(unittest.TestCase):
         h.state.MCP_TOOLS, h.state.MCP_DISPATCH, h.state.MCP_CLIENTS, h.state.PENDING_MCP = self._old_mcp
 
     def _register(self, server, tools):
-        c = h.MCPClient(server, {"transport": "stdio", "command": "x"})
+        c = h.mcp.MCPClient(server, {"transport": "stdio", "command": "x"})
         c.connect = lambda: {}
         c.list_tools = lambda: tools
         c.close = lambda: None
-        h.register_mcp_tools([c])
+        h.mcp.register_mcp_tools([c])
         return c
 
     def _mcp_tool(self, name, desc="d"):
@@ -4701,11 +4719,11 @@ class TestToolsMenu(unittest.TestCase):
         h.state.MCP_TOOLS, h.state.MCP_DISPATCH, h.state.MCP_CLIENTS, h.state.PENDING_MCP = self._old_mcp
 
     def _register(self, server, tools):
-        c = h.MCPClient(server, {"transport": "stdio", "command": "x"})
+        c = h.mcp.MCPClient(server, {"transport": "stdio", "command": "x"})
         c.connect = lambda: {}
         c.list_tools = lambda: tools
         c.close = lambda: None
-        h.register_mcp_tools([c])
+        h.mcp.register_mcp_tools([c])
         return c
 
     def _mcp_tool(self, name, desc="d"):
