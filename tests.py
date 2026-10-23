@@ -3671,22 +3671,31 @@ class TestCsiSequences(unittest.TestCase):
     @unittest.skipIf(os.name == "nt", "pty not available on Windows")
     def test_delete_key_via_pty(self):
         import pty
-        import tty
+        import threading
 
         master, slave = pty.openpty()  # type: ignore[reportAttributeAccessIssue]
-        # Raw mode before writing so the line discipline does not convert
-        # \r to \n (ICRNL) and hold back input (canonical mode).
-        tty.setraw(slave)  # type: ignore[reportAttributeAccessIssue]
         old = sys.stdin
         stdin_file = os.fdopen(slave, "r")
         try:
             sys.stdin = stdin_file
-            os.write(master, b"abc\x1b[3~\r")
             tokens = []
-            for tok in h._iter_keys_posix():
-                tokens.append(tok)
-                if tok == "enter":
-                    break
+
+            def consume():
+                for tok in h._iter_keys_posix():
+                    tokens.append(tok)
+                    if tok == "enter":
+                        break
+
+            # Feed the keys only after the generator has put the tty in raw
+            # mode (it does so when it starts reading). Keystrokes written
+            # before that tcsetattr arrive under the old canonical settings,
+            # and TCSAFLUSH discards them as stale input — delivered-
+            # vs-flushed, it made this test hang under full-suite load.
+            reader = threading.Thread(target=consume)
+            reader.start()
+            time.sleep(0.2)
+            os.write(master, b"abc\x1b[3~\r")
+            reader.join(timeout=10)
             self.assertEqual(
                 tokens,
                 [("char", "a"), ("char", "b"), ("char", "c"), "delete", "enter"],
@@ -3699,22 +3708,29 @@ class TestCsiSequences(unittest.TestCase):
     @unittest.skipIf(os.name == "nt", "pty not available on Windows")
     def test_ctrl_j_via_pty(self):
         import pty
-        import tty
+        import threading
 
         master, slave = pty.openpty()  # type: ignore[reportAttributeAccessIssue]
-        # Raw mode before writing so \n (Ctrl+J) and \r (Enter) pass through
-        # unconverted.
-        tty.setraw(slave)  # type: ignore[reportAttributeAccessIssue]
         old = sys.stdin
         stdin_file = os.fdopen(slave, "r")
         try:
             sys.stdin = stdin_file
-            os.write(master, b"a\nb\r")
             tokens = []
-            for tok in h._iter_keys_posix():
-                tokens.append(tok)
-                if tok == "enter":
-                    break
+
+            def consume():
+                for tok in h._iter_keys_posix():
+                    tokens.append(tok)
+                    if tok == "enter":
+                        break
+
+            # Keys arrive only after the generator is in raw mode, so \n
+            # (Ctrl+J) and \r (Enter) pass through unconverted and survive
+            # its tcsetattr (see test_delete_key_via_pty).
+            reader = threading.Thread(target=consume)
+            reader.start()
+            time.sleep(0.2)
+            os.write(master, b"a\nb\r")
+            reader.join(timeout=10)
             self.assertEqual(
                 tokens, [("char", "a"), "newline", ("char", "b"), "enter"]
             )
@@ -3726,27 +3742,158 @@ class TestCsiSequences(unittest.TestCase):
     @unittest.skipIf(os.name == "nt", "pty not available on Windows")
     def test_bare_esc_via_pty(self):
         import pty
-        import tty
+        import threading
 
         master, slave = pty.openpty()  # type: ignore[reportAttributeAccessIssue]
-        # Put the slave in raw mode before writing so the lone ESC byte is
-        # not held back by the canonical-mode line discipline.
-        tty.setraw(slave)  # type: ignore[reportAttributeAccessIssue]
         old = sys.stdin
         stdin_file = os.fdopen(slave, "r")
         try:
             sys.stdin = stdin_file
-            os.write(master, b"\x1b")
-            gen = h._iter_keys_posix()
             tokens = []
-            try:
-                for tok in gen:
-                    tokens.append(tok)
-                    if tok == "esc":
-                        break
-            finally:
-                gen.close()
+
+            def consume():
+                gen = h._iter_keys_posix()
+                try:
+                    for tok in gen:
+                        tokens.append(tok)
+                        if tok == "esc":
+                            break
+                finally:
+                    gen.close()
+
+            # The lone ESC reaches the generator after it is already in raw
+            # mode, so the canonical line discipline neither holds it back
+            # nor is its queue flushed away (see test_delete_key_via_pty).
+            reader = threading.Thread(target=consume)
+            reader.start()
+            time.sleep(0.2)
+            os.write(master, b"\x1b")
+            reader.join(timeout=10)
             self.assertEqual(tokens, ["esc"])
+        finally:
+            sys.stdin = old
+            stdin_file.close()
+            os.close(master)
+
+
+class TestRawInputMode(unittest.TestCase):
+    """_set_raw_input must raw the terminal for input without touching oflag.
+
+    stdin and stdout are the same terminal device, and tty.setraw zeroes the
+    output flags too: while it was in effect — which covers the whole streaming
+    turn, the interrupt watcher holding the terminal while the harness prints
+    reasoning, Markdown replies, and tool lines — every "\\n" the harness wrote
+    reached the terminal without the CR ONLCR would have added, shifting each
+    line by the column the previous one ended on (staircase output)."""
+
+    @staticmethod
+    def _read_all(fd, n):
+        """Read at most n bytes, giving up after a short wait (b"" when nothing
+        was sent — the no-echo check)."""
+        import select
+
+        data = b""
+        while len(data) < n:
+            ready, _, _ = select.select([fd], [], [], 2.0)
+            if not ready:
+                break
+            chunk = os.read(fd, n - len(data))
+            if not chunk:
+                break
+            data += chunk
+        return data
+
+    @unittest.skipIf(os.name == "nt", "pty not available on Windows")
+    def test_printed_newlines_keep_their_crs(self):
+        import pty
+        import termios
+
+        master, slave = pty.openpty()  # type: ignore[reportAttributeAccessIssue]
+        try:
+            h._set_raw_input(slave)
+            mode = termios.tcgetattr(slave)  # type: ignore[reportAttributeAccessIssue]
+            self.assertTrue(mode[1] & termios.OPOST, "OPOST must stay on")
+            self.assertTrue(mode[1] & termios.ONLCR, "ONLCR must stay on")
+            # The harness's side of the terminal: write output on the slave,
+            # see what the terminal would show on the master.
+            os.write(slave, b"a\nb\n")
+            self.assertEqual(self._read_all(master, 6), b"a\r\nb\r\n")
+        finally:
+            os.close(master)
+            os.close(slave)
+
+    @unittest.skipIf(os.name == "nt", "pty not available on Windows")
+    def test_tty_setraw_left_the_output_without_crs(self):
+        """The regression, pinned against tty.setraw itself: the same output
+        written under it arrives as bare LFs — the staircase bug."""
+        import pty
+        import tty
+
+        master, slave = pty.openpty()  # type: ignore[reportAttributeAccessIssue]
+        try:
+            tty.setraw(slave)  # type: ignore[reportAttributeAccessIssue]
+            os.write(slave, b"a\nb\n")
+            self.assertEqual(self._read_all(master, 6), b"a\nb\n")
+        finally:
+            os.close(master)
+            os.close(slave)
+
+    @unittest.skipIf(os.name == "nt", "pty not available on Windows")
+    def test_input_side_is_raw_as_before(self):
+        import pty
+        import termios
+
+        master, slave = pty.openpty()  # type: ignore[reportAttributeAccessIssue]
+        try:
+            h._set_raw_input(slave)
+            mode = termios.tcgetattr(slave)  # type: ignore[reportAttributeAccessIssue]
+            self.assertEqual(
+                mode[0] & (termios.ICRNL | termios.IXON | termios.ISTRIP), 0
+            )
+            self.assertEqual(
+                mode[3]
+                & (termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG
+                   | termios.IEXTEN),
+                0,
+            )
+            self.assertEqual(mode[6][termios.VMIN], 1)
+            self.assertEqual(mode[6][termios.VTIME], 0)
+            # Enter and Ctrl+C still reach the reader unconverted...
+            os.write(master, b"\r\x03")
+            self.assertEqual(self._read_all(slave, 2), b"\r\x03")
+            # ...and keystrokes are still not echoed back.
+            self.assertEqual(self._read_all(master, 2), b"")
+        finally:
+            os.close(master)
+            os.close(slave)
+
+    @unittest.skipIf(os.name == "nt", "pty not available on Windows")
+    def test_iter_keys_posix_reads_through_the_helper(self):
+        import pty
+        import threading
+
+        master, slave = pty.openpty()  # type: ignore[reportAttributeAccessIssue]
+        old = sys.stdin
+        stdin_file = os.fdopen(slave, "r")
+        try:
+            sys.stdin = stdin_file
+            tokens = []
+
+            def consume():
+                for tok in h._iter_keys_posix():
+                    tokens.append(tok)
+                    if tok == "enter":
+                        break
+
+            # _iter_keys_posix raws the terminal through _set_raw_input
+            # itself; the keys are fed after that is in place (see
+            # test_delete_key_via_pty for why).
+            reader = threading.Thread(target=consume)
+            reader.start()
+            time.sleep(0.2)
+            os.write(master, b"hi\r")
+            reader.join(timeout=10)
+            self.assertEqual(tokens, [("char", "h"), ("char", "i"), "enter"])
         finally:
             sys.stdin = old
             stdin_file.close()

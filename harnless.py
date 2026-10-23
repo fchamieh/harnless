@@ -22,7 +22,7 @@ import urllib.error
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-VERSION = "1.8.1"
+VERSION = "1.8.2"
 API_URL = "http://127.0.0.1:11434/v1/chat/completions"
 API_KEY = None
 MODEL = "local-model"
@@ -4562,11 +4562,41 @@ def _parse_csi_seq(read_char):
     }.get(params, "ignore")
 
 
+def _set_raw_input(fd):
+    """Put the terminal in raw mode for *input only*: tty.setraw's changes,
+    but with oflag left intact.
+
+    tty.setraw runs cfmakeraw, which zeroes the output flags as well, and
+    stdin and stdout are the same terminal device: while it is in effect, a
+    '\\n' written to stdout reaches the terminal without the CR that ONLCR
+    would have added, and every line printed after the first starts wherever
+    the previous one ended (staircase output). That window covers the whole
+    streaming turn — the interrupt watcher holds the terminal while the
+    harness prints reasoning, Markdown replies, and tool lines. Input-only raw
+    mode keeps the input side exactly as cfmakeraw sets it (ICRNL off: Enter
+    still arrives as '\\r'; ISIG off: Ctrl+C still arrives as '\\x03') while
+    OPOST/ONLCR go on translating newlines for stdout."""
+    import termios
+
+    mode = termios.tcgetattr(fd)  # type: ignore[reportAttributeAccessIssue]
+    # cfmakeraw's pass, index by index — except mode[1] (oflag), left intact:
+    # the terminal keeps turning "\n" into CR-NL on output, which is what
+    # every print in the harness relies on.
+    mode[0] &= ~(termios.IGNBRK | termios.BRKINT | termios.PARMRK | termios.ISTRIP
+                 | termios.INLCR | termios.IGNCR | termios.ICRNL | termios.IXON)
+    mode[2] &= ~(termios.CSIZE | termios.PARENB)
+    mode[2] |= termios.CS8
+    mode[3] &= ~(termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG
+                 | termios.IEXTEN)
+    mode[6][termios.VMIN] = 1
+    mode[6][termios.VTIME] = 0
+    termios.tcsetattr(fd, termios.TCSAFLUSH, mode)  # type: ignore[reportAttributeAccessIssue]
+
+
 def _iter_keys_posix():
-    """Yield key tokens from a POSIX terminal in raw mode via termios/tty."""
+    """Yield key tokens from a POSIX terminal in input-only raw mode."""
     import select
     import termios
-    import tty
 
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)  # type: ignore[reportAttributeAccessIssue]
@@ -4592,7 +4622,7 @@ def _iter_keys_posix():
         return (b + rest).decode("utf-8", errors="replace")
 
     try:
-        tty.setraw(fd)  # type: ignore[reportAttributeAccessIssue]
+        _set_raw_input(fd)
         while True:
             ch = read_char()
             if ch is None:
@@ -4639,7 +4669,6 @@ def _iter_keys_posix_poll(stop_event):
     can be stopped without a keypress."""
     import select
     import termios
-    import tty
 
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)  # type: ignore[reportAttributeAccessIssue]
@@ -4665,7 +4694,7 @@ def _iter_keys_posix_poll(stop_event):
         return (b + rest).decode("utf-8", errors="replace")
 
     try:
-        tty.setraw(fd)  # type: ignore[reportAttributeAccessIssue]
+        _set_raw_input(fd)
         while not stop_event.is_set():
             ready, _, _ = select.select([fd], [], [], 0.05)
             if not ready:
@@ -5042,8 +5071,10 @@ def _edit_line(prompt: str, keys) -> str:
         line = "".join(buf)
         width = terminal_width()
         prompt_w = display_width(_ANSI_RE.sub("", prompt))
-        # An explicit CR: in raw mode a bare LF only moves down, which would
-        # leave every row after a newline shifted right by the column it fell on.
+        # An explicit CR: the render must land rows correctly whatever the
+        # terminal's output translation is doing (input-only raw mode keeps
+        # ONLCR on, but the editor does not depend on it — an extra CR at
+        # column 0 is inert).
         text = line.replace("\n", "\r\n")
         out = ""
         if prev_rendered:
