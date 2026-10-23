@@ -20,6 +20,20 @@ from urllib.request import pathname2url
 import harnless as h
 
 
+def _holder(name: str):
+    """The module that actually owns a harnless name: harnless.py, or the core module
+    it moved into.
+
+    Saving and restoring attributes has to write to the owner. An attribute set on the
+    `harnless` facade shadows its name forwarding and leaves the real module holding one
+    test's value for every test that runs after it.
+    """
+    for mod in tuple(getattr(h, "_MODULES", ())) + (h,):
+        if name in vars(mod):
+            return mod
+    raise AttributeError(f"harnless has no attribute {name!r}")
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = "./_test_tmp"
@@ -90,7 +104,7 @@ class TestSymlinkedCwd(Base):
 
     def setUp(self):
         super().setUp()
-        self._old_cwd = h.CWD
+        self._old_cwd = h.state.CWD
         self.real = self.p("realdir")  # the link target, holding the files
         self.link = os.path.abspath(os.path.join(self.tmp, "linkdir"))
         os.makedirs(os.path.join(self.real, "src"), exist_ok=True)
@@ -100,10 +114,10 @@ class TestSymlinkedCwd(Base):
             f.write("AAA\n")
         if not _make_dir_link(self.real, self.link):
             self.skipTest("cannot create a directory symlink or junction")
-        h.CWD = self.link  # work through the link, as os.getcwd() would report it
+        h.state.CWD = self.link  # work through the link, as os.getcwd() would report it
 
     def tearDown(self):
-        h.CWD = self._old_cwd
+        h.state.CWD = self._old_cwd
         _remove_dir_link(self.link)
         super().tearDown()
 
@@ -149,19 +163,19 @@ class TestSymlinkedCwd(Base):
 
 class TestCwdPathHelpers(unittest.TestCase):
     def test_rel_to_cwd_uses_resolved_cwd(self):
-        real = os.path.realpath(h.CWD)
+        real = os.path.realpath(h.state.CWD)
         self.assertEqual(h._rel_to_cwd(os.path.join(real, "src", "main.py")), "src/main.py")
         self.assertEqual(h._rel_to_cwd(real), ".")
 
     def test_rel_to_cwd_outside_cwd(self):
-        outside = os.path.realpath(os.path.join(os.path.realpath(h.CWD), "..", "outside.txt"))
+        outside = os.path.realpath(os.path.join(os.path.realpath(h.state.CWD), "..", "outside.txt"))
         self.assertTrue(h._rel_to_cwd(outside).startswith(".."))
 
     def test_inside_cwd(self):
         roots = h._cwd_roots()
-        self.assertTrue(h._inside_cwd(os.path.realpath(h.CWD), roots))
-        self.assertTrue(h._inside_cwd(os.path.realpath(os.path.join(h.CWD, "a", "b.txt")), roots))
-        self.assertFalse(h._inside_cwd(os.path.realpath(os.path.join(h.CWD, "..", "evil.txt")), roots))
+        self.assertTrue(h._inside_cwd(os.path.realpath(h.state.CWD), roots))
+        self.assertTrue(h._inside_cwd(os.path.realpath(os.path.join(h.state.CWD, "a", "b.txt")), roots))
+        self.assertFalse(h._inside_cwd(os.path.realpath(os.path.join(h.state.CWD, "..", "evil.txt")), roots))
 
     def test_glob_to_regex_double_star_matches_root_files(self):
         regex = h._glob_to_regex("**/*.py")
@@ -238,12 +252,12 @@ class TestReadFile(Base):
     def test_read_max_chars_clamped_to_ceiling(self):
         self.w("big2.txt", "c" * 70_000 + "\n")
         out = self.r("big2.txt", max_chars=10_000_000)
-        self.assertIn(f"showing first {h.TOOL_RESULT_LIMIT};", out)
+        self.assertIn(f"showing first {h.config.TOOL_RESULT_LIMIT};", out)
 
     def test_read_max_chars_bogus_falls_back(self):
         self.w("mid2.txt", "d" * 60_000 + "\n")
         out = self.r("mid2.txt", max_chars="not-a-number")
-        self.assertIn(f"showing first {h.READ_FILE_LIMIT};", out)
+        self.assertIn(f"showing first {h.config.READ_FILE_LIMIT};", out)
 
     def test_read_no_trailing_newline(self):
         self.w("nt.txt", "a\nb")
@@ -462,13 +476,13 @@ class TestGrep(Base):
         self.w("st/min.txt", "AAA" + "z" * 1200)
         out = self.grep("AAA")
         self.assertIn("…[+803 chars on this line]", out)
-        self.assertLess(len(out), h.GREP_LINE_LIMIT + 100)
+        self.assertLess(len(out), h.config.GREP_LINE_LIMIT + 100)
 
     def test_output_char_budget(self):
         self.w("st/wide.txt", "\n".join("AAA" + "y" * 300 for _ in range(200)))
         out = self.grep("AAA")
-        self.assertIn(f"output capped at {h.GREP_TEXT_LIMIT} chars", out)
-        self.assertLess(len(out), h.GREP_TEXT_LIMIT + 200)
+        self.assertIn(f"output capped at {h.config.GREP_TEXT_LIMIT} chars", out)
+        self.assertLess(len(out), h.config.GREP_TEXT_LIMIT + 200)
 
     def test_path_is_file(self):
         self.w("st/g1.txt", "l1\nAAA mid\nl3\n")
@@ -1181,10 +1195,10 @@ class TestRunShell(Base):
         self.assertIn("half a build log", out)
 
     def test_timeout_argument_validation(self):
-        self.assertEqual(h._shell_timeout({}), (h.SHELL_TIMEOUT_DEFAULT, None))
+        self.assertEqual(h._shell_timeout({}), (h.config.SHELL_TIMEOUT_DEFAULT, None))
         self.assertEqual(h._shell_timeout({"timeout": 5}), (5, None))
         self.assertEqual(h._shell_timeout({"timeout": 2.7}), (2, None))
-        self.assertEqual(h._shell_timeout({"timeout": 10**6}), (h.SHELL_TIMEOUT_CEILING, None))
+        self.assertEqual(h._shell_timeout({"timeout": 10**6}), (h.config.SHELL_TIMEOUT_CEILING, None))
         self.assertEqual(h._shell_timeout({"timeout": 0})[1], "error: timeout must be >= 1")
         self.assertEqual(
             h._shell_timeout({"timeout": "abc"})[1], "error: timeout must be a number of seconds"
@@ -1208,12 +1222,12 @@ class TestRunShell(Base):
 class TestResolveShell(Base):
     def setUp(self):
         super().setUp()
-        self._saved_cache = dict(h._SHELL_CACHE)
-        h._SHELL_CACHE.clear()
+        self._saved_cache = dict(h.state._SHELL_CACHE)
+        h.state._SHELL_CACHE.clear()
 
     def tearDown(self):
-        h._SHELL_CACHE.clear()
-        h._SHELL_CACHE.update(self._saved_cache)
+        h.state._SHELL_CACHE.clear()
+        h.state._SHELL_CACHE.update(self._saved_cache)
         super().tearDown()
 
     @staticmethod
@@ -1424,31 +1438,31 @@ class TestOutputCaps(unittest.TestCase):
         self.assertEqual(h._clip_line("short", 100), "short")
 
     def test_execute_tool_backstop_caps_any_result(self):
-        h.DISPATCH["_huge"] = lambda args: "h" * (h.TOOL_RESULT_LIMIT + 5_000)
+        h.DISPATCH["_huge"] = lambda args: "h" * (h.config.TOOL_RESULT_LIMIT + 5_000)
         self.addCleanup(h.DISPATCH.pop, "_huge", None)
         out = h.execute_tool("_huge", "{}")
-        self.assertTrue(out.startswith("h" * h.TOOL_RESULT_LIMIT))
-        self.assertIn(f"showing first {h.TOOL_RESULT_LIMIT};", out)
+        self.assertTrue(out.startswith("h" * h.config.TOOL_RESULT_LIMIT))
+        self.assertIn(f"showing first {h.config.TOOL_RESULT_LIMIT};", out)
 
     def test_execute_tool_backstop_applies_to_mcp_path(self):
         class HugeClient:
             def call_tool(self, name, args):
-                return "m" * (h.TOOL_RESULT_LIMIT + 9_000)
+                return "m" * (h.config.TOOL_RESULT_LIMIT + 9_000)
 
-        h.MCP_DISPATCH["_huge_mcp"] = (HugeClient(), "huge")
-        self.addCleanup(h.MCP_DISPATCH.pop, "_huge_mcp", None)
+        h.state.MCP_DISPATCH["_huge_mcp"] = (HugeClient(), "huge")
+        self.addCleanup(h.state.MCP_DISPATCH.pop, "_huge_mcp", None)
         out = h.execute_tool("_huge_mcp", "{}")
-        self.assertTrue(out.startswith("m" * h.TOOL_RESULT_LIMIT))
+        self.assertTrue(out.startswith("m" * h.config.TOOL_RESULT_LIMIT))
         self.assertIn("[truncated:", out)
 
     def test_mcp_text_result_capped(self):
         out = h._mcp_content_to_text({"content": [{"type": "text", "text": "m" * 40_000}]})
-        self.assertTrue(out.startswith("m" * h.MCP_RESULT_LIMIT))
-        self.assertIn(f"showing first {h.MCP_RESULT_LIMIT};", out)
+        self.assertTrue(out.startswith("m" * h.config.MCP_RESULT_LIMIT))
+        self.assertIn(f"showing first {h.config.MCP_RESULT_LIMIT};", out)
 
     def test_mcp_structured_content_capped(self):
         out = h._mcp_content_to_text({"structuredContent": {"blob": "s" * 40_000}})
-        self.assertLess(len(out), h.MCP_RESULT_LIMIT + 200)
+        self.assertLess(len(out), h.config.MCP_RESULT_LIMIT + 200)
         self.assertIn("[truncated:", out)
 
     def test_limit_args_are_exposed_in_schemas(self):
@@ -1477,10 +1491,10 @@ class TestOutputCaps(unittest.TestCase):
     def test_cap_constants_are_ordered(self):
         # The backstop must sit above every per-tool cap, otherwise a tool that
         # already trimmed gets a second truncation note appended.
-        for cap in (h.READ_FILE_LIMIT, h.SHELL_OUTPUT_LIMIT, h.FETCH_TEXT_LIMIT,
-                    h.MCP_RESULT_LIMIT, h.SUBAGENT_SUMMARY_LIMIT):
-            self.assertLess(cap, h.TOOL_RESULT_LIMIT)
-        self.assertLess(h.GREP_TEXT_LIMIT, h.TOOL_RESULT_LIMIT)
+        for cap in (h.config.READ_FILE_LIMIT, h.config.SHELL_OUTPUT_LIMIT, h.config.FETCH_TEXT_LIMIT,
+                    h.config.MCP_RESULT_LIMIT, h.config.SUBAGENT_SUMMARY_LIMIT):
+            self.assertLess(cap, h.config.TOOL_RESULT_LIMIT)
+        self.assertLess(h.config.GREP_TEXT_LIMIT, h.config.TOOL_RESULT_LIMIT)
 
 
 class TestColorize(unittest.TestCase):
@@ -1493,7 +1507,7 @@ class TestColorize(unittest.TestCase):
     def test_enabled_wraps_ansi(self):
         h.set_color_enabled(True)
         self.addCleanup(h.set_color_enabled, True)
-        self.assertEqual(h.colorize("hello", "tool"), f"{h.ANSI['tool']}hello{h.ANSI['reset']}")
+        self.assertEqual(h.colorize("hello", "tool"), f"{h.config.ANSI['tool']}hello{h.config.ANSI['reset']}")
         self.assertEqual(h.colorize("hello"), "hello")
 
     def test_no_color_env_disables(self):
@@ -1510,21 +1524,21 @@ class TestColorize(unittest.TestCase):
 
 class TestIcon(unittest.TestCase):
     def test_emoji_default(self):
-        old = h.EMOJI_ENABLED
+        old = h.state.EMOJI_ENABLED
         h.set_emoji_enabled(True)
         self.addCleanup(h.set_emoji_enabled, old)
-        self.assertEqual(h.icon("thinking"), h.ICONS["thinking"])
-        self.assertEqual(h.icon("tool"), h.ICONS["tool"])
+        self.assertEqual(h.icon("thinking"), h.config.ICONS["thinking"])
+        self.assertEqual(h.icon("tool"), h.config.ICONS["tool"])
 
     def test_ascii_fallback(self):
-        old = h.EMOJI_ENABLED
+        old = h.state.EMOJI_ENABLED
         h.set_emoji_enabled(False)
         self.addCleanup(h.set_emoji_enabled, old)
-        self.assertEqual(h.icon("thinking"), h.ASCII_ICONS["thinking"])
-        self.assertEqual(h.icon("assistant"), h.ASCII_ICONS["assistant"])
+        self.assertEqual(h.icon("thinking"), h.config.ASCII_ICONS["thinking"])
+        self.assertEqual(h.icon("assistant"), h.config.ASCII_ICONS["assistant"])
 
     def test_unknown_key(self):
-        old = h.EMOJI_ENABLED
+        old = h.state.EMOJI_ENABLED
         h.set_emoji_enabled(True)
         self.addCleanup(h.set_emoji_enabled, old)
         self.assertEqual(h.icon("nope"), "")
@@ -1539,7 +1553,7 @@ class TestEmojiAutoDisable(unittest.TestCase):
         old = sys.stdout
         sys.stdout = self._FakeStdout(enc)
         self.addCleanup(setattr, sys, "stdout", old)
-        self.assertEqual(h._stdout_can_encode_emoji(), expected)
+        self.assertEqual(h.state._stdout_can_encode_emoji(), expected)
 
     def test_utf8_allows_emoji(self):
         self._check("utf-8", True)
@@ -1559,7 +1573,7 @@ class TestEmojiAutoDisable(unittest.TestCase):
 
 class TestMarkdownRenderer(unittest.TestCase):
     def _render(self, text, chunks=None, colors=True, indent=0):
-        old = h.COLORS_ENABLED
+        old = h.state.COLORS_ENABLED
         h.set_color_enabled(colors)
         self.addCleanup(h.set_color_enabled, old)
         out = io.StringIO()
@@ -1578,65 +1592,65 @@ class TestMarkdownRenderer(unittest.TestCase):
     def test_heading(self):
         out = self._render("# Title\n")
         self.assertNotIn("#", out)
-        self.assertIn(h.ANSI["heading"] + "Title" + h.ANSI["reset"], out)
+        self.assertIn(h.config.ANSI["heading"] + "Title" + h.config.ANSI["reset"], out)
 
     def test_bold(self):
         out = self._render("a **bold** b\n")
-        self.assertIn(h.ANSI["bold"] + "bold" + h.ANSI["reset"], out)
+        self.assertIn(h.config.ANSI["bold"] + "bold" + h.config.ANSI["reset"], out)
         self.assertNotIn("**", out)
 
     def test_italic(self):
         out = self._render("a *it* b\n")
-        self.assertIn(h.ANSI["italic"] + "it" + h.ANSI["reset"], out)
+        self.assertIn(h.config.ANSI["italic"] + "it" + h.config.ANSI["reset"], out)
 
     def test_inline_code(self):
         out = self._render("use `patch_file` now\n")
-        self.assertIn(h.ANSI["code"] + "patch_file" + h.ANSI["reset"], out)
+        self.assertIn(h.config.ANSI["code"] + "patch_file" + h.config.ANSI["reset"], out)
 
     def test_code_span_protects_markers(self):
         out = self._render("`**not bold**`\n")
-        self.assertNotIn(h.ANSI["bold"], out)
-        self.assertIn(h.ANSI["code"] + "**not bold**" + h.ANSI["reset"], out)
+        self.assertNotIn(h.config.ANSI["bold"], out)
+        self.assertIn(h.config.ANSI["code"] + "**not bold**" + h.config.ANSI["reset"], out)
 
     def test_code_block(self):
         out = self._render("```python\nx = 1\n```\n")
         self.assertIn("```python", out)
-        self.assertIn(h.ANSI["codeblock"] + "x = 1" + h.ANSI["reset"], out)
+        self.assertIn(h.config.ANSI["codeblock"] + "x = 1" + h.config.ANSI["reset"], out)
 
     def test_code_block_no_inline_styling(self):
         out = self._render("```\n**not bold**\n```\n")
-        self.assertNotIn(h.ANSI["bold"], out)
+        self.assertNotIn(h.config.ANSI["bold"], out)
 
     def test_unordered_list(self):
         out = self._render("- item\n")
-        self.assertIn(h.ANSI["bullet"] + "• " + h.ANSI["reset"], out)
+        self.assertIn(h.config.ANSI["bullet"] + "• " + h.config.ANSI["reset"], out)
         self.assertIn("item", out)
 
     def test_ordered_list(self):
         out = self._render("1. first\n")
-        self.assertIn(h.ANSI["bullet"] + "1. " + h.ANSI["reset"], out)
+        self.assertIn(h.config.ANSI["bullet"] + "1. " + h.config.ANSI["reset"], out)
 
     def test_blockquote(self):
         out = self._render("> quoted\n")
-        self.assertIn(h.ANSI["quote"], out)
+        self.assertIn(h.config.ANSI["quote"], out)
         self.assertIn("quoted", out)
 
     def test_horizontal_rule(self):
         out = self._render("---\n")
-        self.assertIn(h.ANSI["dim"], out)
+        self.assertIn(h.config.ANSI["dim"], out)
         self.assertNotIn("---", out)
 
     def test_link(self):
         out = self._render("see [docs](http://x.y) now\n")
-        self.assertIn(h.ANSI["underline"] + "docs" + h.ANSI["reset"], out)
-        self.assertIn(h.ANSI["dim"] + " (http://x.y)" + h.ANSI["reset"], out)
+        self.assertIn(h.config.ANSI["underline"] + "docs" + h.config.ANSI["reset"], out)
+        self.assertIn(h.config.ANSI["dim"] + " (http://x.y)" + h.config.ANSI["reset"], out)
 
     def test_link_destination_is_literal(self):
         url = "https://example.com/a*b*c?q=**x**&file=a_b"
         self.assertEqual(self._plain(f"[link]({url})"), f"link ({url})\n")
         out = self._render(f"[**bold** `code`]({url})")
-        self.assertIn(h.ANSI["bold"] + "bold", out)
-        self.assertIn(h.ANSI["code"] + "code", out)
+        self.assertIn(h.config.ANSI["bold"] + "bold", out)
+        self.assertIn(h.config.ANSI["code"] + "code", out)
         self.assertIn(url, out)
 
     def test_escaped_inline_markers(self):
@@ -1647,16 +1661,16 @@ class TestMarkdownRenderer(unittest.TestCase):
 
     def test_variable_length_code_span(self):
         out = self._render("`` `x` **literal** ``")
-        self.assertIn(h.ANSI["code"] + "`x` **literal**" + h.ANSI["reset"], out)
-        self.assertNotIn(h.ANSI["bold"], out)
+        self.assertIn(h.config.ANSI["code"] + "`x` **literal**" + h.config.ANSI["reset"], out)
+        self.assertNotIn(h.config.ANSI["bold"], out)
 
     def test_fence_length_type_and_closing_suffix(self):
         for opening, closing in (("````python", "````"), ("~~~~python", "~~~~~")):
             with self.subTest(opening=opening):
                 doc = opening + "\n```\n~~~\n````suffix\n**literal**\n" + closing + "\n**bold**\n"
                 out = self._render(doc)
-                self.assertIn(h.ANSI["codeblock"] + "**literal**", out)
-                self.assertIn(h.ANSI["bold"] + "bold", out)
+                self.assertIn(h.config.ANSI["codeblock"] + "**literal**", out)
+                self.assertIn(h.config.ANSI["bold"] + "bold", out)
                 self.assertEqual(self._render(doc, chunks=list(doc)), out)
 
     def test_code_fence_continuation_indent(self):
@@ -1671,7 +1685,7 @@ class TestMarkdownRenderer(unittest.TestCase):
 
     def test_table_followed_by_fence_with_pipe(self):
         out = self._render("| A |\n|---|\n```a|b\n**literal**\n```\n")
-        self.assertIn(h.ANSI["codeblock"] + "**literal**", out)
+        self.assertIn(h.config.ANSI["codeblock"] + "**literal**", out)
         self.assertIn("└", out)
 
     def test_combining_character_width(self):
@@ -1690,7 +1704,7 @@ class TestMarkdownRenderer(unittest.TestCase):
 
     def test_open_fence_at_eof(self):
         out = self._render("```python\ncode", chunks=["```python\ncode"])
-        self.assertIn(h.ANSI["codeblock"] + "code" + h.ANSI["reset"], out)
+        self.assertIn(h.config.ANSI["codeblock"] + "code" + h.config.ANSI["reset"], out)
 
     def test_continuation_indent(self):
         self.assertEqual(self._render("line one\nline two\n", indent=4), "line one\n    line two\n")
@@ -1698,7 +1712,7 @@ class TestMarkdownRenderer(unittest.TestCase):
     # ------------------------------------------------------------ tables
 
     def _plain(self, text, **kw):
-        return h._ANSI_RE.sub("", self._render(text, **kw))
+        return h.config._ANSI_RE.sub("", self._render(text, **kw))
 
     def test_table_basic(self):
         out = self._plain("| A | B |\n|---|---|\n| 1 | 2 |\n")
@@ -1734,8 +1748,8 @@ class TestMarkdownRenderer(unittest.TestCase):
 
     def test_table_inline_styling(self):
         out = self._render("| A |\n|---|\n| `code` **b** |\n")
-        self.assertIn(h.ANSI["code"] + "code" + h.ANSI["reset"], out)
-        self.assertIn(h.ANSI["bold"] + "b" + h.ANSI["reset"], out)
+        self.assertIn(h.config.ANSI["code"] + "code" + h.config.ANSI["reset"], out)
+        self.assertIn(h.config.ANSI["bold"] + "b" + h.config.ANSI["reset"], out)
         self.assertNotIn("**", out)
         self.assertNotIn("`", out)
 
@@ -1869,11 +1883,11 @@ class TestMarkdownRenderer(unittest.TestCase):
 class TestLoadAgentsMd(Base):
     def setUp(self):
         super().setUp()
-        self._old_cwd = h.CWD
-        setattr(h, "CWD", self.p(""))
+        self._old_cwd = h.state.CWD
+        setattr(h.state, "CWD", self.p(""))
 
     def tearDown(self):
-        setattr(h, "CWD", self._old_cwd)
+        setattr(h.state, "CWD", self._old_cwd)
         super().tearDown()
 
     def test_absent(self):
@@ -1904,7 +1918,7 @@ class TestLoadAgentsMd(Base):
 
 class TestDispatch(Base):
     def test_get_cwd(self):
-        self.assertEqual(h.execute_tool("get_cwd", "{}"), h.CWD)
+        self.assertEqual(h.execute_tool("get_cwd", "{}"), h.state.CWD)
 
     def test_invalid_json(self):
         self.assertEqual(h.execute_tool("read_file", "{bad"), "error: invalid JSON arguments: {bad")
@@ -1932,41 +1946,41 @@ class TestDispatch(Base):
 
 class TestSubagents(unittest.TestCase):
     def setUp(self):
-        self._old_depth = h._AGENT_DEPTH
-        self._old_max = h.MAX_SUBAGENT_DEPTH
-        self._old_indent = h.OUTPUT_INDENT
-        self._old_model = h.MODEL
-        self._old_temp = h.TEMPERATURE
-        self._old_usage = dict(h.USAGE_BY_CONV)
-        self._old_exit_notes = dict(h.EXIT_NOTE_BY_CONV)
-        self._old_next_conv = h._NEXT_CONV_ID
-        self._old_steps = h.SUBAGENT_STEP_LIMIT
+        self._old_depth = h.state._AGENT_DEPTH
+        self._old_max = h.state.MAX_SUBAGENT_DEPTH
+        self._old_indent = h.state.OUTPUT_INDENT
+        self._old_model = h.state.MODEL
+        self._old_temp = h.state.TEMPERATURE
+        self._old_usage = dict(h.state.USAGE_BY_CONV)
+        self._old_exit_notes = dict(h.state.EXIT_NOTE_BY_CONV)
+        self._old_next_conv = h.state._NEXT_CONV_ID
+        self._old_steps = h.state.SUBAGENT_STEP_LIMIT
         self._old_chat = h.chat
-        h._AGENT_DEPTH = 0
-        h.MAX_SUBAGENT_DEPTH = 3
-        h.OUTPUT_INDENT = ""
-        h.MODEL = "test-model"
-        h.TEMPERATURE = 0.2
-        h.SUBAGENT_STEP_LIMIT = 0  # guard off unless a test asks for it
-        h.USAGE_BY_CONV.clear()
-        h.EXIT_NOTE_BY_CONV.clear()
+        h.state._AGENT_DEPTH = 0
+        h.state.MAX_SUBAGENT_DEPTH = 3
+        h.state.OUTPUT_INDENT = ""
+        h.state.MODEL = "test-model"
+        h.state.TEMPERATURE = 0.2
+        h.state.SUBAGENT_STEP_LIMIT = 0  # guard off unless a test asks for it
+        h.state.USAGE_BY_CONV.clear()
+        h.state.EXIT_NOTE_BY_CONV.clear()
 
         def no_live_api(*args, **kwargs):
             raise AssertionError("tests must not reach a live LLM server")
 
         h.chat = no_live_api  # a non-streaming fallback would hit the real API
-        self.addCleanup(setattr, h, "_AGENT_DEPTH", self._old_depth)
-        self.addCleanup(setattr, h, "MAX_SUBAGENT_DEPTH", self._old_max)
-        self.addCleanup(setattr, h, "OUTPUT_INDENT", self._old_indent)
-        self.addCleanup(setattr, h, "MODEL", self._old_model)
-        self.addCleanup(setattr, h, "TEMPERATURE", self._old_temp)
-        self.addCleanup(setattr, h, "SUBAGENT_STEP_LIMIT", self._old_steps)
+        self.addCleanup(setattr, h.state, "_AGENT_DEPTH", self._old_depth)
+        self.addCleanup(setattr, h.state, "MAX_SUBAGENT_DEPTH", self._old_max)
+        self.addCleanup(setattr, h.state, "OUTPUT_INDENT", self._old_indent)
+        self.addCleanup(setattr, h.state, "MODEL", self._old_model)
+        self.addCleanup(setattr, h.state, "TEMPERATURE", self._old_temp)
+        self.addCleanup(setattr, h.state, "SUBAGENT_STEP_LIMIT", self._old_steps)
         self.addCleanup(setattr, h, "chat", self._old_chat)
-        self.addCleanup(h.USAGE_BY_CONV.clear)
-        self.addCleanup(h.USAGE_BY_CONV.update, self._old_usage)
-        self.addCleanup(h.EXIT_NOTE_BY_CONV.clear)
-        self.addCleanup(h.EXIT_NOTE_BY_CONV.update, self._old_exit_notes)
-        self.addCleanup(setattr, h, "_NEXT_CONV_ID", self._old_next_conv)
+        self.addCleanup(h.state.USAGE_BY_CONV.clear)
+        self.addCleanup(h.state.USAGE_BY_CONV.update, self._old_usage)
+        self.addCleanup(h.state.EXIT_NOTE_BY_CONV.clear)
+        self.addCleanup(h.state.EXIT_NOTE_BY_CONV.update, self._old_exit_notes)
+        self.addCleanup(setattr, h.state, "_NEXT_CONV_ID", self._old_next_conv)
 
     def _call(self, name, args, call_id=None):
         return {
@@ -1995,7 +2009,7 @@ class TestSubagents(unittest.TestCase):
         calls = []
 
         def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
-            depth = h._AGENT_DEPTH
+            depth = h.state._AGENT_DEPTH
             calls.append(depth)
             turn = seen.get(depth, 0)
             seen[depth] = turn + 1
@@ -2024,7 +2038,7 @@ class TestSubagents(unittest.TestCase):
         self.assertEqual(h.tool_task({}), "error: empty task")
 
     def test_task_depth_limit(self):
-        h._AGENT_DEPTH = h.MAX_SUBAGENT_DEPTH
+        h.state._AGENT_DEPTH = h.state.MAX_SUBAGENT_DEPTH
         out = h.tool_task({"task": "do something"})
         self.assertTrue(out.startswith("error: sub-agent depth limit reached"))
 
@@ -2037,9 +2051,9 @@ class TestSubagents(unittest.TestCase):
         h.run_agent = fake_run_agent
         self.addCleanup(setattr, h, "run_agent", old)
         out = h.tool_task({"task": "do X"})
-        self.assertTrue(out.startswith("exit code: 0\n" + "s" * h.SUBAGENT_SUMMARY_LIMIT))
+        self.assertTrue(out.startswith("exit code: 0\n" + "s" * h.config.SUBAGENT_SUMMARY_LIMIT))
         self.assertIn(
-            f"showing first {h.SUBAGENT_SUMMARY_LIMIT};",
+            f"showing first {h.config.SUBAGENT_SUMMARY_LIMIT};",
             out,
         )
 
@@ -2067,7 +2081,7 @@ class TestSubagents(unittest.TestCase):
         self.assertEqual(call["depth"], 1)
         self.assertEqual(call["messages"][1], {"role": "user", "content": "do X"})
         self.assertIn("sub-agent", call["messages"][0]["content"])
-        self.assertEqual(h.OUTPUT_INDENT, "")
+        self.assertEqual(h.state.OUTPUT_INDENT, "")
 
     def test_task_indent_restored_on_error(self):
         def boom(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None):
@@ -2078,7 +2092,7 @@ class TestSubagents(unittest.TestCase):
         self.addCleanup(setattr, h, "run_agent", old)
         with self.assertRaises(RuntimeError):
             h.tool_task({"task": "do X"})
-        self.assertEqual(h.OUTPUT_INDENT, "")
+        self.assertEqual(h.state.OUTPUT_INDENT, "")
 
     def test_task_no_final_content(self):
         """Nothing to hand back: the result says so. A bare "exit code: 2" read
@@ -2091,7 +2105,7 @@ class TestSubagents(unittest.TestCase):
         old = h.run_agent
         h.run_agent = fake_run_agent
         self.addCleanup(setattr, h, "run_agent", old)
-        self.assertEqual(h.tool_task({"task": "do X"}), f"exit code: 2\n{h.NO_SUMMARY_NOTE}")
+        self.assertEqual(h.tool_task({"task": "do X"}), f"exit code: 2\n{h.config.NO_SUMMARY_NOTE}")
 
     # --- the hand-off: what the parent actually receives as the summary ---
 
@@ -2115,7 +2129,7 @@ class TestSubagents(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             out = h.tool_task({"task": "map the codebase"})
         self.assertEqual(out, f"exit code: 0\n{summary}")
-        self.assertEqual(h.EXIT_NOTE_BY_CONV, {})  # popped, not left behind
+        self.assertEqual(h.state.EXIT_NOTE_BY_CONV, {})  # popped, not left behind
 
     def test_closing_summary_prefers_the_substantive_text(self):
         long = "\n".join(f"finding {i}: file.py:{i}" for i in range(30))
@@ -2143,7 +2157,7 @@ class TestSubagents(unittest.TestCase):
         }
         self.assertEqual(
             h._closing_summary([reasoning_only], ""),
-            h.SALVAGED_SUMMARY_NOTE + "\nanswer: main() at 4760",
+            h.config.SALVAGED_SUMMARY_NOTE + "\nanswer: main() at 4760",
         )
         leftover_narration = [
             {"role": "assistant", "content": "now let me check the tool registry"},
@@ -2151,7 +2165,7 @@ class TestSubagents(unittest.TestCase):
         ]
         self.assertEqual(
             h._closing_summary(leftover_narration, ""),
-            h.SALVAGED_SUMMARY_NOTE + "\nnow let me check the tool registry",
+            h.config.SALVAGED_SUMMARY_NOTE + "\nnow let me check the tool registry",
         )
         self.assertEqual(h._closing_summary([{"role": "assistant", "content": ""}], ""), "")
 
@@ -2169,11 +2183,11 @@ class TestSubagents(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             out = h.tool_task({"task": "map it"})
         self.assertIn("main() at 4760", out)
-        self.assertIn(h.SALVAGED_SUMMARY_NOTE, out)
-        self.assertNotIn(h.NO_SUMMARY_NOTE, out)
+        self.assertIn(h.config.SALVAGED_SUMMARY_NOTE, out)
+        self.assertNotIn(h.config.NO_SUMMARY_NOTE, out)
 
     def test_exit_notes_do_not_leak_between_nested_runs(self):
-        h.MAX_SUBAGENT_DEPTH = 3
+        h.state.MAX_SUBAGENT_DEPTH = 3
 
         def decide(messages, depth, turn):
             if depth == 1 and turn == 0:
@@ -2192,7 +2206,7 @@ class TestSubagents(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             out = h.tool_task({"task": "map it"})
         self.assertEqual(out, "exit code: 0\nouter hand-off")
-        self.assertEqual(h.EXIT_NOTE_BY_CONV, {})
+        self.assertEqual(h.state.EXIT_NOTE_BY_CONV, {})
 
     def test_exit_answers_every_call_in_its_batch(self):
         """`exit` aborts a tool batch: the calls behind it get answers too, so
@@ -2236,7 +2250,7 @@ class TestSubagents(unittest.TestCase):
         # The sub-agent's usage entry must not survive the run: its
         # messages list is freed, and a recycled address would resurrect
         # the stale entry in /status.
-        self.assertEqual(h.USAGE_BY_CONV, {})
+        self.assertEqual(h.state.USAGE_BY_CONV, {})
 
     def test_task_usage_cleaned_up_on_error(self):
         def boom(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None):
@@ -2248,13 +2262,13 @@ class TestSubagents(unittest.TestCase):
         self.addCleanup(setattr, h, "run_agent", old)
         with self.assertRaises(RuntimeError):
             h.tool_task({"task": "do X"})
-        self.assertEqual(h.USAGE_BY_CONV, {})
+        self.assertEqual(h.state.USAGE_BY_CONV, {})
 
     # --- depth accounting: _AGENT_DEPTH is scoped to each run_agent call ---
 
     def test_task_depth_limit_message_names_the_cap(self):
-        h.MAX_SUBAGENT_DEPTH = 2
-        h._AGENT_DEPTH = 2
+        h.state.MAX_SUBAGENT_DEPTH = 2
+        h.state._AGENT_DEPTH = 2
         out = h.tool_task({"task": "do something"})
         self.assertTrue(out.startswith("error: sub-agent depth limit reached"))
         self.assertIn("capped at 2 level", out)
@@ -2264,7 +2278,7 @@ class TestSubagents(unittest.TestCase):
         """Regression: run_agent used to leave _AGENT_DEPTH at the depth its
         sub-agents reached, so a later top-level task call in the same turn was
         refused with 'sub-agent depth limit reached' even at depth 0."""
-        h.MAX_SUBAGENT_DEPTH = 2
+        h.state.MAX_SUBAGENT_DEPTH = 2
 
         def decide(messages, depth, turn):
             if depth == 0:
@@ -2285,10 +2299,10 @@ class TestSubagents(unittest.TestCase):
         for result in results:
             self.assertTrue(result.startswith("exit code: 0\nsub summary at depth 1"), result)
         self.assertNotIn("depth limit", "".join(results))
-        self.assertEqual(h._AGENT_DEPTH, 0)
+        self.assertEqual(h.state._AGENT_DEPTH, 0)
 
     def test_run_agent_depth_seen_by_nested_runs_is_incremented(self):
-        h.MAX_SUBAGENT_DEPTH = 3
+        h.state.MAX_SUBAGENT_DEPTH = 3
         depths = []
 
         def decide(messages, depth, turn):
@@ -2303,13 +2317,13 @@ class TestSubagents(unittest.TestCase):
         # 0: the parent's first turn, 1: the sub-agent's, 0: the parent's turn
         # after the sub-agent returned — the parent is back at level 0.
         self.assertEqual(depths, [0, 1, 0])
-        self.assertEqual(h._AGENT_DEPTH, 0)
+        self.assertEqual(h.state._AGENT_DEPTH, 0)
 
     def test_run_agent_restores_depth_after_exit_tool(self):
         depths = []
 
         def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
-            depths.append(h._AGENT_DEPTH)
+            depths.append(h.state._AGENT_DEPTH)
             return (
                 {
                     "role": "assistant",
@@ -2326,7 +2340,7 @@ class TestSubagents(unittest.TestCase):
             code = h.run_agent([{"role": "user", "content": "go"}], "m", depth=2)
         self.assertEqual(code, 7)
         self.assertEqual(depths, [2])
-        self.assertEqual(h._AGENT_DEPTH, 0)
+        self.assertEqual(h.state._AGENT_DEPTH, 0)
 
     def test_run_agent_restores_depth_on_exception(self):
         def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
@@ -2338,10 +2352,10 @@ class TestSubagents(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             with contextlib.redirect_stdout(io.StringIO()):
                 h.run_agent([{"role": "user", "content": "go"}], "m", depth=1)
-        self.assertEqual(h._AGENT_DEPTH, 0)
+        self.assertEqual(h.state._AGENT_DEPTH, 0)
 
     def test_task_failure_does_not_corrupt_parent_depth(self):
-        h.MAX_SUBAGENT_DEPTH = 2
+        h.state.MAX_SUBAGENT_DEPTH = 2
 
         def decide(messages, depth, turn):
             if depth == 0:
@@ -2357,7 +2371,7 @@ class TestSubagents(unittest.TestCase):
         self.assertEqual(calls, [0, 1, 0])
         results = [m["content"] for m in messages if m["role"] == "tool"]
         self.assertEqual(results, ["error: RuntimeError: sub-agent exploded"])
-        self.assertEqual(h._AGENT_DEPTH, 0)
+        self.assertEqual(h.state._AGENT_DEPTH, 0)
 
     # --- a double ESC during a sub-agent stops the whole delegation chain ---
 
@@ -2375,11 +2389,11 @@ class TestSubagents(unittest.TestCase):
         with self.assertRaises(h.SubagentInterrupted) as cm:
             h.tool_task({"task": "do X"})
         content = cm.exception.message["content"]
-        self.assertIn(h.SUBAGENT_INTERRUPT_PREFIX, content)
+        self.assertIn(h.config.SUBAGENT_INTERRUPT_PREFIX, content)
         self.assertIn("half an answer", content)
-        self.assertEqual(h.OUTPUT_INDENT, "")
-        self.assertEqual(h._AGENT_DEPTH, 0)
-        self.assertEqual(h.USAGE_BY_CONV, {})
+        self.assertEqual(h.state.OUTPUT_INDENT, "")
+        self.assertEqual(h.state._AGENT_DEPTH, 0)
+        self.assertEqual(h.state.USAGE_BY_CONV, {})
 
     def test_execute_tool_does_not_swallow_subagent_interrupt(self):
         def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None):
@@ -2390,7 +2404,7 @@ class TestSubagents(unittest.TestCase):
             h.execute_tool("task", json.dumps({"task": "do X"}))
 
     def test_interrupt_stops_the_whole_turn(self):
-        h.MAX_SUBAGENT_DEPTH = 2
+        h.state.MAX_SUBAGENT_DEPTH = 2
 
         def decide(messages, depth, turn):
             if depth == 0:
@@ -2417,13 +2431,13 @@ class TestSubagents(unittest.TestCase):
         # Every tool call in the batch is answered: a server rejects an
         # assistant message whose tool_calls were left dangling.
         self.assertEqual(sorted(answered), ["call-task", "call-todo"])
-        self.assertIn(h.SUBAGENT_INTERRUPT_PREFIX, answered["call-task"])
+        self.assertIn(h.config.SUBAGENT_INTERRUPT_PREFIX, answered["call-task"])
         self.assertIn("half the work", answered["call-task"])
         self.assertEqual(answered["call-todo"], "interrupted by user")
-        self.assertEqual(h._AGENT_DEPTH, 0)
+        self.assertEqual(h.state._AGENT_DEPTH, 0)
 
     def test_interrupt_bubbles_through_nested_subagents(self):
-        h.MAX_SUBAGENT_DEPTH = 3
+        h.state.MAX_SUBAGENT_DEPTH = 3
 
         def decide(messages, depth, turn):
             if depth < 2:
@@ -2439,7 +2453,7 @@ class TestSubagents(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertIn("deepest partial work", results[0])
         # The note is carried up unchanged rather than wrapped once per level.
-        self.assertEqual(results[0].count(h.SUBAGENT_INTERRUPT_PREFIX), 1)
+        self.assertEqual(results[0].count(h.config.SUBAGENT_INTERRUPT_PREFIX), 1)
 
     def test_top_level_interrupt_still_returns_to_the_prompt(self):
         """The top-level agent is not a sub-agent: an interrupt there keeps the
@@ -2456,17 +2470,17 @@ class TestSubagents(unittest.TestCase):
             code = h.run_agent(messages, "m")
         self.assertEqual(code, 0)
         self.assertEqual(messages[-1], {"role": "assistant", "content": "partial answer"})
-        self.assertEqual(h._AGENT_DEPTH, 0)
+        self.assertEqual(h.state._AGENT_DEPTH, 0)
 
     # --- runaway guard: model turns allowed per sub-agent ---
 
     def test_subagent_step_limit_stops_a_runaway(self):
-        h.MAX_SUBAGENT_DEPTH = 2
-        h.SUBAGENT_STEP_LIMIT = 3
+        h.state.MAX_SUBAGENT_DEPTH = 2
+        h.state.SUBAGENT_STEP_LIMIT = 3
         depths = []
 
         def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
-            depths.append(h._AGENT_DEPTH)
+            depths.append(h.state._AGENT_DEPTH)
             return (self._tool_turn("todo", {"action": "list"}), True)
 
         old = h.stream_once
@@ -2476,20 +2490,20 @@ class TestSubagents(unittest.TestCase):
         with contextlib.redirect_stdout(buf):
             out = h.tool_task({"task": "never ends"})
         self.assertEqual(depths, [1, 1, 1, 1])  # SUBAGENT_STEP_LIMIT turns + the closing one
-        self.assertTrue(out.startswith(f"exit code: {h.SUBAGENT_STEP_LIMIT_CODE}"), out)
+        self.assertTrue(out.startswith(f"exit code: {h.config.SUBAGENT_STEP_LIMIT_CODE}"), out)
         self.assertIn("step limit", out)
         self.assertIn("3 model turns", out)
         self.assertIn("this summary may be incomplete", out)
-        self.assertIn(h.NO_SUMMARY_NOTE, out)  # never summarised, and it says so
+        self.assertIn(h.config.NO_SUMMARY_NOTE, out)  # never summarised, and it says so
         self.assertIn("sub-agent stopped", buf.getvalue())
-        self.assertEqual(h._AGENT_DEPTH, 0)
-        self.assertEqual(h.OUTPUT_INDENT, "")
+        self.assertEqual(h.state._AGENT_DEPTH, 0)
+        self.assertEqual(h.state.OUTPUT_INDENT, "")
 
     def test_step_limit_closing_turn_delivers_a_summary(self):
         """A capped run gets one turn devoted to the hand-off instead of stopping
         mid-tool-call, which used to return `exit code: 4` with no findings."""
-        h.MAX_SUBAGENT_DEPTH = 2
-        h.SUBAGENT_STEP_LIMIT = 2
+        h.state.MAX_SUBAGENT_DEPTH = 2
+        h.state.SUBAGENT_STEP_LIMIT = 2
 
         seen = {}  # the sub-agent builds its own messages list; capture it live
 
@@ -2503,14 +2517,14 @@ class TestSubagents(unittest.TestCase):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             out = h.tool_task({"task": "never ends"})
-        self.assertTrue(out.startswith(f"exit code: {h.SUBAGENT_STEP_LIMIT_CODE}"), out)
+        self.assertTrue(out.startswith(f"exit code: {h.config.SUBAGENT_STEP_LIMIT_CODE}"), out)
         self.assertIn("Partial findings: X at 1, Y at 2", out)
         self.assertIn("this summary may be incomplete", out)
-        self.assertNotIn(h.NO_SUMMARY_NOTE, out)
+        self.assertNotIn(h.config.NO_SUMMARY_NOTE, out)
         # the extra turn was asked for, not invented by the harness
         self.assertTrue(
             any(
-                m.get("role") == "user" and m.get("content") == h.STEP_LIMIT_CLOSE_PROMPT
+                m.get("role") == "user" and m.get("content") == h.config.STEP_LIMIT_CLOSE_PROMPT
                 for conv in seen.values()
                 for m in conv
             ),
@@ -2519,8 +2533,8 @@ class TestSubagents(unittest.TestCase):
         self.assertIn("one closing turn", buf.getvalue())
 
     def test_step_limit_zero_disables_the_guard(self):
-        h.MAX_SUBAGENT_DEPTH = 2
-        h.SUBAGENT_STEP_LIMIT = 0
+        h.state.MAX_SUBAGENT_DEPTH = 2
+        h.state.SUBAGENT_STEP_LIMIT = 0
         turns = []
 
         def decide(messages, depth, turn):
@@ -2536,7 +2550,7 @@ class TestSubagents(unittest.TestCase):
         self.assertEqual(len(turns), 5)
 
     def test_top_level_agent_is_not_step_capped(self):
-        h.SUBAGENT_STEP_LIMIT = 2
+        h.state.SUBAGENT_STEP_LIMIT = 2
         turns = []
 
         def decide(messages, depth, turn):
@@ -2554,16 +2568,16 @@ class TestSubagents(unittest.TestCase):
     def test_model_exit_code_is_not_mistaken_for_the_step_limit(self):
         def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None):
             messages.append({"role": "assistant", "content": "done"})
-            return h.SUBAGENT_STEP_LIMIT_CODE  # the sub-agent's own `exit` code collides
+            return h.config.SUBAGENT_STEP_LIMIT_CODE  # the sub-agent's own `exit` code collides
 
         self._fake_run_agent(fake_run_agent)
         out = h.tool_task({"task": "do X"})
-        self.assertEqual(out, f"exit code: {h.SUBAGENT_STEP_LIMIT_CODE}\ndone")
+        self.assertEqual(out, f"exit code: {h.config.SUBAGENT_STEP_LIMIT_CODE}\ndone")
         self.assertNotIn("step limit", out)
 
     def test_step_limit_signal_leaves_no_state_behind(self):
-        h.MAX_SUBAGENT_DEPTH = 2
-        h.SUBAGENT_STEP_LIMIT = 2
+        h.state.MAX_SUBAGENT_DEPTH = 2
+        h.state.SUBAGENT_STEP_LIMIT = 2
 
         def decide(messages, depth, turn):
             return (self._tool_turn("todo", {"action": "list"}), True)  # a sub-agent that never ends
@@ -2573,16 +2587,16 @@ class TestSubagents(unittest.TestCase):
             out = h.tool_task({"task": "never ends"})
         self.assertEqual(calls, [1, 1, 1])  # limit + the closing turn, then the guard fired
         self.assertIn("step limit", out)
-        self.assertEqual(h._AGENT_DEPTH, 0)
-        self.assertEqual(h.OUTPUT_INDENT, "")
-        self.assertEqual(h.USAGE_BY_CONV, {})
-        self.assertEqual(h.EXIT_NOTE_BY_CONV, {})
+        self.assertEqual(h.state._AGENT_DEPTH, 0)
+        self.assertEqual(h.state.OUTPUT_INDENT, "")
+        self.assertEqual(h.state.USAGE_BY_CONV, {})
+        self.assertEqual(h.state.EXIT_NOTE_BY_CONV, {})
 
     def test_clamp_int_bounds_cli_values(self):
-        self.assertEqual(h._clamp_int(2, 0, h.SUBAGENT_DEPTH_CEILING), 2)
-        self.assertEqual(h._clamp_int(-1, 0, h.SUBAGENT_DEPTH_CEILING), 0)
-        self.assertEqual(h._clamp_int(999, 0, h.SUBAGENT_DEPTH_CEILING), h.SUBAGENT_DEPTH_CEILING)
-        self.assertEqual(h._clamp_int(-5, 0, h.SUBAGENT_STEPS_CEILING), 0)
+        self.assertEqual(h._clamp_int(2, 0, h.config.SUBAGENT_DEPTH_CEILING), 2)
+        self.assertEqual(h._clamp_int(-1, 0, h.config.SUBAGENT_DEPTH_CEILING), 0)
+        self.assertEqual(h._clamp_int(999, 0, h.config.SUBAGENT_DEPTH_CEILING), h.config.SUBAGENT_DEPTH_CEILING)
+        self.assertEqual(h._clamp_int(-5, 0, h.config.SUBAGENT_STEPS_CEILING), 0)
 
     def test_run_agent_exit_returns_code(self):
         def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
@@ -2663,12 +2677,12 @@ class TestStatus(unittest.TestCase):
 
 class TestProbeContextWindow(unittest.TestCase):
     def setUp(self):
-        self.old_api_url = h.API_URL
-        self.old_model = h.MODEL
-        h.API_URL = "http://127.0.0.1:11434/v1/chat/completions"
-        h.MODEL = "local-model"
-        self.addCleanup(setattr, h, "API_URL", self.old_api_url)
-        self.addCleanup(setattr, h, "MODEL", self.old_model)
+        self.old_api_url = h.state.API_URL
+        self.old_model = h.state.MODEL
+        h.state.API_URL = "http://127.0.0.1:11434/v1/chat/completions"
+        h.state.MODEL = "local-model"
+        self.addCleanup(setattr, h.state, "API_URL", self.old_api_url)
+        self.addCleanup(setattr, h.state, "MODEL", self.old_model)
 
     def _fake_response(self, payload):
         return io.BytesIO(json.dumps(payload).encode("utf-8"))
@@ -2744,9 +2758,9 @@ class TestProbeContextWindow(unittest.TestCase):
             self.assertEqual(h.probe_context_window(), 0)
 
     def test_api_url_line(self):
-        old = h.API_URL
-        h.API_URL = "http://example.com/v1/chat/completions"
-        self.addCleanup(setattr, h, "API_URL", old)
+        old = h.state.API_URL
+        h.state.API_URL = "http://example.com/v1/chat/completions"
+        self.addCleanup(setattr, h.state, "API_URL", old)
         out = h.format_status([{"role": "system", "content": "x"}])
         self.assertIn("api url: http://example.com/v1/chat/completions", out)
 
@@ -2992,12 +3006,12 @@ class _MiniTerm:
 class TestLineEditor(Base):
     def setUp(self):
         super().setUp()
-        self._old_history = h.HISTORY
-        h.HISTORY = []
-        self.addCleanup(setattr, h, "HISTORY", self._old_history)
-        self._old_history_file = h.HISTORY_FILE
-        h.HISTORY_FILE = os.path.join(self.tmp, "history.txt")
-        self.addCleanup(setattr, h, "HISTORY_FILE", self._old_history_file)
+        self._old_history = h.state.HISTORY
+        h.state.HISTORY = []
+        self.addCleanup(setattr, h.state, "HISTORY", self._old_history)
+        self._old_history_file = h.state.HISTORY_FILE
+        h.state.HISTORY_FILE = os.path.join(self.tmp, "history.txt")
+        self.addCleanup(setattr, h.state, "HISTORY_FILE", self._old_history_file)
 
     def edit(self, keys):
         import io
@@ -3046,9 +3060,9 @@ class TestLineEditor(Base):
         buffer/pos pair is mirrored *here*, with the editing rules restated
         independently of the code under test, so a test can compare each render
         with the wrapped text that should have been painted."""
-        old_width, old_auto = h.terminal_width, h.AUTO_SEND
+        old_width, old_auto = h.terminal_width, h.state.AUTO_SEND
         h.terminal_width = lambda: width
-        h.AUTO_SEND = True
+        h.state.AUTO_SEND = True
         buf, pos = [], 0
 
         def apply(token):
@@ -3109,7 +3123,7 @@ class TestLineEditor(Base):
             with redirect_stdout(rec):
                 line = h._edit_line(prompt, feed())
         finally:
-            h.terminal_width, h.AUTO_SEND = old_width, old_auto
+            h.terminal_width, h.state.AUTO_SEND = old_width, old_auto
 
         committed = bool(keys) and keys[-1] in ("enter", "ctrl_enter", "ctrl_d")
         if committed:
@@ -3337,7 +3351,7 @@ class TestLineEditor(Base):
         self.assertEqual(self.edit(keys)[0], "c")
 
     def test_history_up_down(self):
-        h.HISTORY = ["first", "second"]
+        h.state.HISTORY = ["first", "second"]
         keys = ["up", "enter"]
         self.assertEqual(self.edit(keys)[0], "second")
         keys = ["up", "up", "enter"]
@@ -3350,14 +3364,14 @@ class TestLineEditor(Base):
         self.assertEqual(self.edit(keys)[0], "")
 
     def test_history_up_at_top_stays(self):
-        h.HISTORY = ["only"]
+        h.state.HISTORY = ["only"]
         self.assertEqual(self.edit(["up", "up", "enter"])[0], "only")
 
     def test_up_moves_caret_within_multiline_before_history(self):
         # A multi-line draft: up moves the caret up line-by-line (column
         # preserved) and does not touch the buffer until the caret reaches
         # the first line and up is pressed once more.
-        h.HISTORY = ["cmd1", "cmd2"]
+        h.state.HISTORY = ["cmd1", "cmd2"]
         keys = (
             [("char", "a"), "newline", ("char", "b"), "newline", ("char", "c")]
             + ["up", "up"]  # caret walks from line 3 to line 1 (column kept)
@@ -3378,7 +3392,7 @@ class TestLineEditor(Base):
     def test_up_from_first_line_recalls_history_down_restores_draft(self):
         # Up from the first line shows the previous command, but keeps the
         # draft: the first down returns to it, with the caret where it was.
-        h.HISTORY = ["cmd1", "cmd2"]
+        h.state.HISTORY = ["cmd1", "cmd2"]
         keys = (
             [("char", "a"), "newline", ("char", "b"), "newline", ("char", "c")]
             + ["up", "up"]  # caret to the first line (end of "a")
@@ -3391,7 +3405,7 @@ class TestLineEditor(Base):
     def test_down_restores_draft_after_browsing_further_up(self):
         # Browsing up through several entries, then a single down returns to
         # the saved draft (not to the entry just above it).
-        h.HISTORY = ["cmd1", "cmd2"]
+        h.state.HISTORY = ["cmd1", "cmd2"]
         keys = (
             [("char", "a"), "newline", ("char", "b")]
             + ["up"]  # caret to the first line (end of "a")
@@ -3404,7 +3418,7 @@ class TestLineEditor(Base):
     def test_editing_history_entry_discards_draft(self):
         # Editing the recalled entry discards the draft; down then walks
         # history forward as usual (clearing the line at the end).
-        h.HISTORY = ["cmd1", "cmd2"]
+        h.state.HISTORY = ["cmd1", "cmd2"]
         keys = (
             [("char", "a"), "newline", ("char", "b")]
             + ["up"]  # caret to the first line
@@ -3453,45 +3467,45 @@ class TestLineEditor(Base):
         h._history_add("a")
         h._history_add("a")
         h._history_add("b")
-        self.assertEqual(h.HISTORY, ["a", "b"])
+        self.assertEqual(h.state.HISTORY, ["a", "b"])
         h._history_add("")
         h._history_add("   ")
-        self.assertEqual(h.HISTORY, ["a", "b"])
-        old_max = h.HISTORY_MAX
-        h.HISTORY_MAX = 3
-        self.addCleanup(setattr, h, "HISTORY_MAX", old_max)
+        self.assertEqual(h.state.HISTORY, ["a", "b"])
+        old_max = h.state.HISTORY_MAX
+        h.state.HISTORY_MAX = 3
+        self.addCleanup(setattr, h.state, "HISTORY_MAX", old_max)
         for i in range(10):
             h._history_add(f"e{i}")
-        self.assertEqual(len(h.HISTORY), 3)
-        self.assertEqual(h.HISTORY, ["e7", "e8", "e9"])
+        self.assertEqual(len(h.state.HISTORY), 3)
+        self.assertEqual(h.state.HISTORY, ["e7", "e8", "e9"])
 
     def test_history_persisted_to_file(self):
         h._history_add("one")
         h._history_add("two")
-        with open(h.HISTORY_FILE, "r", encoding="utf-8") as f:
+        with open(h.state.HISTORY_FILE, "r", encoding="utf-8") as f:
             self.assertEqual(f.read(), "one\ntwo\n")
 
     def test_history_load_from_file(self):
-        with open(h.HISTORY_FILE, "w", encoding="utf-8") as f:
+        with open(h.state.HISTORY_FILE, "w", encoding="utf-8") as f:
             f.write("old1\nold2\n\n")
-        h.HISTORY = []
+        h.state.HISTORY = []
         h._history_load()
-        self.assertEqual(h.HISTORY, ["old1", "old2"])
+        self.assertEqual(h.state.HISTORY, ["old1", "old2"])
 
     def test_history_load_missing_file(self):
-        h.HISTORY = []
+        h.state.HISTORY = []
         h._history_load()
-        self.assertEqual(h.HISTORY, [])
+        self.assertEqual(h.state.HISTORY, [])
 
     def test_history_load_caps_at_max(self):
-        old_max = h.HISTORY_MAX
-        h.HISTORY_MAX = 2
-        self.addCleanup(setattr, h, "HISTORY_MAX", old_max)
-        with open(h.HISTORY_FILE, "w", encoding="utf-8") as f:
+        old_max = h.state.HISTORY_MAX
+        h.state.HISTORY_MAX = 2
+        self.addCleanup(setattr, h.state, "HISTORY_MAX", old_max)
+        with open(h.state.HISTORY_FILE, "w", encoding="utf-8") as f:
             f.write("a\nb\nc\n")
-        h.HISTORY = []
+        h.state.HISTORY = []
         h._history_load()
-        self.assertEqual(h.HISTORY, ["b", "c"])
+        self.assertEqual(h.state.HISTORY, ["b", "c"])
 
     def test_readline_prompt_falls_back_without_tty(self):
         import io
@@ -3536,12 +3550,12 @@ class TestLineEditor(Base):
 class TestAutoSend(Base):
     def setUp(self):
         super().setUp()
-        self._old_auto_send = h.AUTO_SEND
-        h.AUTO_SEND = True
-        self.addCleanup(setattr, h, "AUTO_SEND", self._old_auto_send)
-        self._old_history = h.HISTORY
-        h.HISTORY = []
-        self.addCleanup(setattr, h, "HISTORY", self._old_history)
+        self._old_auto_send = h.state.AUTO_SEND
+        h.state.AUTO_SEND = True
+        self.addCleanup(setattr, h.state, "AUTO_SEND", self._old_auto_send)
+        self._old_history = h.state.HISTORY
+        h.state.HISTORY = []
+        self.addCleanup(setattr, h.state, "HISTORY", self._old_history)
 
     def edit(self, keys):
         import io
@@ -3552,7 +3566,7 @@ class TestAutoSend(Base):
         return line, buf.getvalue()
 
     def test_default_is_on(self):
-        self.assertTrue(h.AUTO_SEND)
+        self.assertTrue(h.state.AUTO_SEND)
 
     def test_enter_submits_when_on(self):
         self.assertEqual(self.edit([("char", "a"), "enter"])[0], "a")
@@ -3561,39 +3575,39 @@ class TestAutoSend(Base):
         self.assertEqual(self.edit([("char", "a"), "ctrl_enter"])[0], "a")
 
     def test_enter_inserts_newline_when_off(self):
-        h.AUTO_SEND = False
+        h.state.AUTO_SEND = False
         line, _ = self.edit([("char", "a"), "enter", ("char", "b"), "ctrl_enter"])
         self.assertEqual(line, "a\nb")
 
     def test_ctrl_enter_submits_when_off(self):
-        h.AUTO_SEND = False
+        h.state.AUTO_SEND = False
         self.assertEqual(self.edit([("char", "a"), "ctrl_enter"])[0], "a")
 
     def test_ctrl_d_still_sends_when_off(self):
-        h.AUTO_SEND = False
+        h.state.AUTO_SEND = False
         self.assertEqual(self.edit([("char", "a"), "ctrl_d"])[0], "a")
 
     def test_newline_token_still_inserts_newline_when_off(self):
-        h.AUTO_SEND = False
+        h.state.AUTO_SEND = False
         line, _ = self.edit([("char", "a"), "newline", ("char", "b"), "ctrl_enter"])
         self.assertEqual(line, "a\nb")
 
     def test_set_auto_send_off(self):
         msg = h.set_auto_send("off")
-        self.assertFalse(h.AUTO_SEND)
+        self.assertFalse(h.state.AUTO_SEND)
         self.assertIn("auto-send off", msg)
 
     def test_set_auto_send_on(self):
-        h.AUTO_SEND = False
+        h.state.AUTO_SEND = False
         msg = h.set_auto_send("ON")
-        self.assertTrue(h.AUTO_SEND)
+        self.assertTrue(h.state.AUTO_SEND)
         self.assertIn("auto-send on", msg)
 
     def test_set_auto_send_no_arg_reports_state(self):
-        h.AUTO_SEND = False
+        h.state.AUTO_SEND = False
         self.assertEqual(h.set_auto_send(""), "auto-send: off")
         self.assertEqual(h.set_auto_send("   "), "auto-send: off")
-        h.AUTO_SEND = True
+        h.state.AUTO_SEND = True
         self.assertEqual(h.set_auto_send(""), "auto-send: on")
 
     def test_set_auto_send_bogus(self):
@@ -4027,7 +4041,7 @@ class TestMcpConfig(Base):
 
     def test_home_config_path(self):
         self.assertEqual(
-            h.MCP_HOME_CONFIG,
+            h.config.MCP_HOME_CONFIG,
             os.path.join(os.path.expanduser("~"), ".harnless", "mcp.json"),
         )
 
@@ -4089,9 +4103,9 @@ class TestMcpRegister(Base):
         return c
 
     def _reset(self):
-        h.MCP_TOOLS = []
-        h.MCP_DISPATCH = {}
-        h.MCP_CLIENTS = []
+        h.state.MCP_TOOLS = []
+        h.state.MCP_DISPATCH = {}
+        h.state.MCP_CLIENTS = []
 
     def test_registers_and_collides(self):
         c1 = self._fake_client("a", [{"name": "read_file", "description": "d", "inputSchema": {"type": "object"}}])
@@ -4105,12 +4119,12 @@ class TestMcpRegister(Base):
         c3 = self._fake_client("c", [{"name": "dup", "description": "d", "inputSchema": {}}])
         self.addCleanup(self._reset)
         h.register_mcp_tools([c1, c2, c3])
-        names = [s["function"]["name"] for s in h.MCP_TOOLS]
+        names = [s["function"]["name"] for s in h.state.MCP_TOOLS]
         # read_file collides with a built-in -> skipped; echo registered;
         # dup from c2 registered, dup from c3 skipped (first server wins)
         self.assertEqual(names, ["echo", "dup"])
-        self.assertIn("echo", h.MCP_DISPATCH)
-        self.assertIs(h.MCP_DISPATCH["echo"][0], c2)
+        self.assertIn("echo", h.state.MCP_DISPATCH)
+        self.assertIs(h.state.MCP_DISPATCH["echo"][0], c2)
         self.assertEqual(c2.tool_names, ["echo", "dup"])
 
     def test_spec_shape(self):
@@ -4118,7 +4132,7 @@ class TestMcpRegister(Base):
         self.addCleanup(self._reset)
         h.register_mcp_tools([c])
         self.assertEqual(
-            h.MCP_TOOLS[0],
+            h.state.MCP_TOOLS[0],
             {
                 "type": "function",
                 "function": {
@@ -4133,14 +4147,14 @@ class TestMcpRegister(Base):
 class TestMcpPending(Base):
     def setUp(self):
         super().setUp()
-        self._saved = (h.MCP_TOOLS, h.MCP_DISPATCH, h.MCP_CLIENTS, h.PENDING_MCP)
-        h.MCP_TOOLS = []
-        h.MCP_DISPATCH = {}
-        h.MCP_CLIENTS = []
-        h.PENDING_MCP = []
+        self._saved = (h.state.MCP_TOOLS, h.state.MCP_DISPATCH, h.state.MCP_CLIENTS, h.state.PENDING_MCP)
+        h.state.MCP_TOOLS = []
+        h.state.MCP_DISPATCH = {}
+        h.state.MCP_CLIENTS = []
+        h.state.PENDING_MCP = []
 
     def tearDown(self):
-        h.MCP_TOOLS, h.MCP_DISPATCH, h.MCP_CLIENTS, h.PENDING_MCP = self._saved
+        h.state.MCP_TOOLS, h.state.MCP_DISPATCH, h.state.MCP_CLIENTS, h.state.PENDING_MCP = self._saved
         super().tearDown()
 
     def test_register_mcp_client_connects(self):
@@ -4149,9 +4163,9 @@ class TestMcpPending(Base):
             c = h.MCPClient("s", {"transport": "http", "url": f"http://127.0.0.1:{port}/mcp"})
             ok = h._register_mcp_client(c)
             self.assertTrue(ok)
-            self.assertEqual([s["function"]["name"] for s in h.MCP_TOOLS], ["pw"])
-            self.assertIn("pw", h.MCP_DISPATCH)
-            self.assertEqual(h.MCP_CLIENTS, [c])
+            self.assertEqual([s["function"]["name"] for s in h.state.MCP_TOOLS], ["pw"])
+            self.assertIn("pw", h.state.MCP_DISPATCH)
+            self.assertEqual(h.state.MCP_CLIENTS, [c])
         finally:
             server.shutdown()
             server.server_close()
@@ -4162,17 +4176,17 @@ class TestMcpPending(Base):
         with contextlib.redirect_stdout(buf):
             ok = h._register_mcp_client(c)
         self.assertFalse(ok)
-        self.assertEqual(h.MCP_TOOLS, [])
-        self.assertEqual(h.MCP_CLIENTS, [c])
+        self.assertEqual(h.state.MCP_TOOLS, [])
+        self.assertEqual(h.state.MCP_CLIENTS, [c])
 
     def test_enable_pending_mcp(self):
         server, port, _ = _fake_mcp_server("pw")
         try:
-            h.PENDING_MCP.append(("s", {"transport": "http", "url": f"http://127.0.0.1:{port}/mcp"}))
+            h.state.PENDING_MCP.append(("s", {"transport": "http", "url": f"http://127.0.0.1:{port}/mcp"}))
             ok, msg = h._enable_pending_mcp("s")
             self.assertTrue(ok)
-            self.assertEqual(h.PENDING_MCP, [])
-            self.assertEqual([s["function"]["name"] for s in h.MCP_TOOLS], ["pw"])
+            self.assertEqual(h.state.PENDING_MCP, [])
+            self.assertEqual([s["function"]["name"] for s in h.state.MCP_TOOLS], ["pw"])
         finally:
             server.shutdown()
             server.server_close()
@@ -4183,33 +4197,33 @@ class TestMcpPending(Base):
         self.assertIn("not pending", msg)
 
     def test_enable_pending_mcp_stays_on_fail(self):
-        h.PENDING_MCP.append(("s", {"transport": "http", "url": "http://127.0.0.1:1/mcp"}))
+        h.state.PENDING_MCP.append(("s", {"transport": "http", "url": "http://127.0.0.1:1/mcp"}))
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             ok, msg = h._enable_pending_mcp("s")
         self.assertFalse(ok)
-        self.assertEqual(len(h.PENDING_MCP), 1)  # stays pending so the user can retry
+        self.assertEqual(len(h.state.PENDING_MCP), 1)  # stays pending so the user can retry
 
     def test_tools_menu_enables_pending(self):
         server, port, _ = _fake_mcp_server("pw")
         try:
-            h.PENDING_MCP.append(("pwserver", {"transport": "http", "url": f"http://127.0.0.1:{port}/mcp"}))
+            h.state.PENDING_MCP.append(("pwserver", {"transport": "http", "url": f"http://127.0.0.1:{port}/mcp"}))
             # rows = built-ins + one row per mcp server + one row per mcp tool + pending
-            n_servers = len({client.name for _, (client, _) in h.MCP_DISPATCH.items()})
-            n_rows = len(h.OPENAI_TOOLS_INTERACTIVE) + n_servers + len(h.MCP_TOOLS)
+            n_servers = len({client.name for _, (client, _) in h.state.MCP_DISPATCH.items()})
+            n_rows = len(h.OPENAI_TOOLS_INTERACTIVE) + n_servers + len(h.state.MCP_TOOLS)
             keys = ["down"] * n_rows + [("char", " "), "enter"]
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 applied = h.tools_menu(iter(keys))
             self.assertTrue(applied)
-            self.assertEqual(h.PENDING_MCP, [])
-            self.assertIn("pw", [s["function"]["name"] for s in h.MCP_TOOLS])
+            self.assertEqual(h.state.PENDING_MCP, [])
+            self.assertIn("pw", [s["function"]["name"] for s in h.state.MCP_TOOLS])
         finally:
             server.shutdown()
             server.server_close()
 
     def test_tools_menu_rendering_shows_pending(self):
-        h.PENDING_MCP.append(("pwserver", {"transport": "http", "url": "http://x/mcp"}))
+        h.state.PENDING_MCP.append(("pwserver", {"transport": "http", "url": "http://x/mcp"}))
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             h.tools_menu(iter(["enter"]))
@@ -4241,11 +4255,11 @@ class TestMcpStdioIntegration(Base):
         server = self._write_server()
         client = h.MCPClient("fake", {"transport": "stdio", "command": sys.executable, "args": [server]})
         self.addCleanup(client.close)
-        self.addCleanup(setattr, h, "MCP_TOOLS", [])
-        self.addCleanup(setattr, h, "MCP_DISPATCH", {})
-        self.addCleanup(setattr, h, "MCP_CLIENTS", [])
+        self.addCleanup(setattr, h.state, "MCP_TOOLS", [])
+        self.addCleanup(setattr, h.state, "MCP_DISPATCH", {})
+        self.addCleanup(setattr, h.state, "MCP_CLIENTS", [])
         h.register_mcp_tools([client])
-        names = [s["function"]["name"] for s in h.MCP_TOOLS]
+        names = [s["function"]["name"] for s in h.state.MCP_TOOLS]
         self.assertIn("echo", names)
         self.assertEqual(h.execute_tool("echo", '{"msg": "yo"}'), "echo: yo")
 
@@ -4553,18 +4567,18 @@ class TestMcpHttpIntegration(Base):
 
 class TestToolsToggle(unittest.TestCase):
     def setUp(self):
-        self._old_disabled = h.DISABLED_TOOLS
-        h.DISABLED_TOOLS = set()
-        self.addCleanup(setattr, h, "DISABLED_TOOLS", self._old_disabled)
-        self._old_mcp = (h.MCP_TOOLS, h.MCP_DISPATCH, h.MCP_CLIENTS, h.PENDING_MCP)
-        h.MCP_TOOLS = []
-        h.MCP_DISPATCH = {}
-        h.MCP_CLIENTS = []
-        h.PENDING_MCP = []
+        self._old_disabled = h.state.DISABLED_TOOLS
+        h.state.DISABLED_TOOLS = set()
+        self.addCleanup(setattr, h.state, "DISABLED_TOOLS", self._old_disabled)
+        self._old_mcp = (h.state.MCP_TOOLS, h.state.MCP_DISPATCH, h.state.MCP_CLIENTS, h.state.PENDING_MCP)
+        h.state.MCP_TOOLS = []
+        h.state.MCP_DISPATCH = {}
+        h.state.MCP_CLIENTS = []
+        h.state.PENDING_MCP = []
         self.addCleanup(self._restore_mcp)
 
     def _restore_mcp(self):
-        h.MCP_TOOLS, h.MCP_DISPATCH, h.MCP_CLIENTS, h.PENDING_MCP = self._old_mcp
+        h.state.MCP_TOOLS, h.state.MCP_DISPATCH, h.state.MCP_CLIENTS, h.state.PENDING_MCP = self._old_mcp
 
     def _register(self, server, tools):
         c = h.MCPClient(server, {"transport": "stdio", "command": "x"})
@@ -4587,39 +4601,39 @@ class TestToolsToggle(unittest.TestCase):
         self.assertIn("[X] read_file — ", out)
 
     def test_format_tools_reflects_disabled(self):
-        h.DISABLED_TOOLS.add("read_file")
+        h.state.DISABLED_TOOLS.add("read_file")
         out = h.format_tools()
         self.assertIn("[ ] read_file — ", out)
         self.assertIn("[X] grep — ", out)
 
     def test_toggle_off_and_on(self):
         self.assertEqual(h.toggle_tools(["read_file"]), [("read_file", "off")])
-        self.assertIn("read_file", h.DISABLED_TOOLS)
+        self.assertIn("read_file", h.state.DISABLED_TOOLS)
         self.assertEqual(h.toggle_tools(["read_file"]), [("read_file", "on")])
-        self.assertNotIn("read_file", h.DISABLED_TOOLS)
+        self.assertNotIn("read_file", h.state.DISABLED_TOOLS)
 
     def test_toggle_unknown(self):
         self.assertEqual(h.toggle_tools(["nope"]), [("nope", "unknown")])
-        self.assertEqual(h.DISABLED_TOOLS, set())
+        self.assertEqual(h.state.DISABLED_TOOLS, set())
 
     def test_toggle_multiple(self):
         res = h.toggle_tools(["read_file", "grep", "nope"])
         self.assertEqual(res, [("read_file", "off"), ("grep", "off"), ("nope", "unknown")])
-        self.assertEqual(h.DISABLED_TOOLS, {"read_file", "grep"})
+        self.assertEqual(h.state.DISABLED_TOOLS, {"read_file", "grep"})
 
     def test_active_tools_excludes_disabled(self):
-        h.DISABLED_TOOLS.add("read_file")
+        h.state.DISABLED_TOOLS.add("read_file")
         names = [s["function"]["name"] for s in h._active_tools(True)]
         self.assertNotIn("read_file", names)
         self.assertIn("grep", names)
 
     def test_execute_tool_rejects_disabled(self):
-        h.DISABLED_TOOLS.add("get_cwd")
+        h.state.DISABLED_TOOLS.add("get_cwd")
         out = h.execute_tool("get_cwd", "{}")
         self.assertTrue(out.startswith("error: tool 'get_cwd' is disabled"))
 
     def test_status_reflects_disabled(self):
-        h.DISABLED_TOOLS.add("read_file")
+        h.state.DISABLED_TOOLS.add("read_file")
         out = h.format_status([{"role": "system", "content": "x"}])
         tools_line = out.split("tools: ")[1].split("\n")[0]
         self.assertNotIn("read_file", tools_line)
@@ -4628,19 +4642,19 @@ class TestToolsToggle(unittest.TestCase):
     def test_toggle_mcp_server_prefix(self):
         self._register("srv", [self._mcp_tool("t1"), self._mcp_tool("t2")])
         self.assertEqual(h.toggle_tools(["mcp:srv"]), [("mcp:srv", "off")])
-        self.assertEqual(h.DISABLED_TOOLS, {"t1", "t2"})
+        self.assertEqual(h.state.DISABLED_TOOLS, {"t1", "t2"})
         self.assertEqual(h.toggle_tools(["mcp:srv"]), [("mcp:srv", "on")])
-        self.assertEqual(h.DISABLED_TOOLS, set())
+        self.assertEqual(h.state.DISABLED_TOOLS, set())
 
     def test_toggle_mcp_server_prefix_mixed(self):
         self._register("srv", [self._mcp_tool("t1"), self._mcp_tool("t2")])
-        h.DISABLED_TOOLS.add("t2")
+        h.state.DISABLED_TOOLS.add("t2")
         self.assertEqual(h.toggle_tools(["mcp:srv"]), [("mcp:srv", "on")])
-        self.assertEqual(h.DISABLED_TOOLS, set())
+        self.assertEqual(h.state.DISABLED_TOOLS, set())
 
     def test_toggle_mcp_server_prefix_unknown(self):
         self.assertEqual(h.toggle_tools(["mcp:nope"]), [("mcp:nope", "unknown")])
-        self.assertEqual(h.DISABLED_TOOLS, set())
+        self.assertEqual(h.state.DISABLED_TOOLS, set())
 
     def test_format_tools_groups_mcp(self):
         self._register("srv", [self._mcp_tool("t1", "d1"), self._mcp_tool("t2", "d2")])
@@ -4654,7 +4668,7 @@ class TestToolsToggle(unittest.TestCase):
 
     def test_format_tools_mcp_mixed_mark(self):
         self._register("srv", [self._mcp_tool("t1", "d1"), self._mcp_tool("t2", "d2")])
-        h.DISABLED_TOOLS.add("t2")
+        h.state.DISABLED_TOOLS.add("t2")
         out = h.format_tools()
         self.assertIn("[-] mcp: srv (2 tools)", out)
         self.assertIn("  [X] t1 — d1", out)
@@ -4662,25 +4676,25 @@ class TestToolsToggle(unittest.TestCase):
 
     def test_format_tools_mcp_all_off_mark(self):
         self._register("srv", [self._mcp_tool("t1"), self._mcp_tool("t2")])
-        h.DISABLED_TOOLS.update({"t1", "t2"})
+        h.state.DISABLED_TOOLS.update({"t1", "t2"})
         out = h.format_tools()
         self.assertIn("[ ] mcp: srv (2 tools)", out)
 
 
 class TestToolsMenu(unittest.TestCase):
     def setUp(self):
-        self._old_disabled = h.DISABLED_TOOLS
-        h.DISABLED_TOOLS = set()
-        self.addCleanup(setattr, h, "DISABLED_TOOLS", self._old_disabled)
-        self._old_mcp = (h.MCP_TOOLS, h.MCP_DISPATCH, h.MCP_CLIENTS, h.PENDING_MCP)
-        h.MCP_TOOLS = []
-        h.MCP_DISPATCH = {}
-        h.MCP_CLIENTS = []
-        h.PENDING_MCP = []
+        self._old_disabled = h.state.DISABLED_TOOLS
+        h.state.DISABLED_TOOLS = set()
+        self.addCleanup(setattr, h.state, "DISABLED_TOOLS", self._old_disabled)
+        self._old_mcp = (h.state.MCP_TOOLS, h.state.MCP_DISPATCH, h.state.MCP_CLIENTS, h.state.PENDING_MCP)
+        h.state.MCP_TOOLS = []
+        h.state.MCP_DISPATCH = {}
+        h.state.MCP_CLIENTS = []
+        h.state.PENDING_MCP = []
         self.addCleanup(self._restore_mcp)
 
     def _restore_mcp(self):
-        h.MCP_TOOLS, h.MCP_DISPATCH, h.MCP_CLIENTS, h.PENDING_MCP = self._old_mcp
+        h.state.MCP_TOOLS, h.state.MCP_DISPATCH, h.state.MCP_CLIENTS, h.state.PENDING_MCP = self._old_mcp
 
     def _register(self, server, tools):
         c = h.MCPClient(server, {"transport": "stdio", "command": "x"})
@@ -4703,7 +4717,7 @@ class TestToolsMenu(unittest.TestCase):
 
     def sorted_names(self):
         specs = sorted(
-            h.OPENAI_TOOLS_INTERACTIVE + h.MCP_TOOLS,
+            h.OPENAI_TOOLS_INTERACTIVE + h.state.MCP_TOOLS,
             key=lambda s: s["function"]["name"],
         )
         return [s["function"]["name"] for s in specs]
@@ -4711,25 +4725,25 @@ class TestToolsMenu(unittest.TestCase):
     def test_enter_applies_no_changes(self):
         applied, _ = self.menu(["enter"])
         self.assertTrue(applied)
-        self.assertEqual(h.DISABLED_TOOLS, set())
+        self.assertEqual(h.state.DISABLED_TOOLS, set())
 
     def test_space_toggles_and_enter_applies(self):
         first = self.sorted_names()[0]
         applied, _ = self.menu([("char", " "), "enter"])
         self.assertTrue(applied)
-        self.assertEqual(h.DISABLED_TOOLS, {first})
+        self.assertEqual(h.state.DISABLED_TOOLS, {first})
 
     def test_down_moves_cursor(self):
         second = self.sorted_names()[1]
         applied, _ = self.menu(["down", ("char", " "), "enter"])
         self.assertTrue(applied)
-        self.assertEqual(h.DISABLED_TOOLS, {second})
+        self.assertEqual(h.state.DISABLED_TOOLS, {second})
 
     def test_up_at_top_stays(self):
         first = self.sorted_names()[0]
         applied, _ = self.menu(["up", "up", ("char", " "), "enter"])
         self.assertTrue(applied)
-        self.assertEqual(h.DISABLED_TOOLS, {first})
+        self.assertEqual(h.state.DISABLED_TOOLS, {first})
 
     def test_down_clamps_at_end(self):
         names = self.sorted_names()
@@ -4737,40 +4751,40 @@ class TestToolsMenu(unittest.TestCase):
         last = names[-1]
         applied, _ = self.menu(["down"] * (n + 5) + [("char", " "), "enter"])
         self.assertTrue(applied)
-        self.assertEqual(h.DISABLED_TOOLS, {last})
+        self.assertEqual(h.state.DISABLED_TOOLS, {last})
 
     def test_toggle_twice_restores(self):
         first = self.sorted_names()[0]
         applied, _ = self.menu([("char", " "), ("char", " "), "enter"])
         self.assertTrue(applied)
-        self.assertEqual(h.DISABLED_TOOLS, set())
+        self.assertEqual(h.state.DISABLED_TOOLS, set())
 
     def test_esc_cancels_changes(self):
         applied, _ = self.menu([("char", " "), "esc"])
         self.assertFalse(applied)
-        self.assertEqual(h.DISABLED_TOOLS, set())
+        self.assertEqual(h.state.DISABLED_TOOLS, set())
 
     def test_ctrl_c_cancels_changes(self):
         applied, _ = self.menu([("char", " "), "ctrl_c"])
         self.assertFalse(applied)
-        self.assertEqual(h.DISABLED_TOOLS, set())
+        self.assertEqual(h.state.DISABLED_TOOLS, set())
 
     def test_ctrl_d_cancels_changes(self):
         applied, _ = self.menu([("char", " "), "ctrl_d"])
         self.assertFalse(applied)
-        self.assertEqual(h.DISABLED_TOOLS, set())
+        self.assertEqual(h.state.DISABLED_TOOLS, set())
 
     def test_eof_cancels(self):
         applied, _ = self.menu([("char", " ")])
         self.assertFalse(applied)
-        self.assertEqual(h.DISABLED_TOOLS, set())
+        self.assertEqual(h.state.DISABLED_TOOLS, set())
 
     def test_menu_preserves_preexisting_disabled(self):
-        h.DISABLED_TOOLS.add("read_file")
+        h.state.DISABLED_TOOLS.add("read_file")
         first = self.sorted_names()[0]
         applied, _ = self.menu([("char", " "), "enter"])
         self.assertTrue(applied)
-        self.assertEqual(h.DISABLED_TOOLS, {"read_file", first})
+        self.assertEqual(h.state.DISABLED_TOOLS, {"read_file", first})
 
     def test_rendering(self):
         applied, out = self.menu(["enter"])
@@ -4782,7 +4796,7 @@ class TestToolsMenu(unittest.TestCase):
         self.assertIn("space: toggle", out)
 
     def test_rendering_shows_disabled_mark(self):
-        h.DISABLED_TOOLS.add("read_file")
+        h.state.DISABLED_TOOLS.add("read_file")
         applied, out = self.menu(["enter"])
         self.assertTrue(applied)
         self.assertIn("[ ] read_file", out)
@@ -4833,7 +4847,7 @@ class TestToolsMenu(unittest.TestCase):
 
     def test_navigation_skips_collapsed_rows(self):
         self._register("srv", [self._mcp_tool("t1", "d1"), self._mcp_tool("t2", "d2")])
-        h.PENDING_MCP.append(("pend", {"transport": "http", "url": "http://x/mcp"}))
+        h.state.PENDING_MCP.append(("pend", {"transport": "http", "url": "http://x/mcp"}))
         n_builtin = len(h.OPENAI_TOOLS_INTERACTIVE)
         # visible rows: built-ins, 'srv' (collapsed), 'pend' — so n_builtin+1
         # downs lands on the pending row, not on the hidden t1
@@ -4846,20 +4860,20 @@ class TestToolsMenu(unittest.TestCase):
         n_builtin = len(h.OPENAI_TOOLS_INTERACTIVE)
         applied, _ = self.menu(["down"] * n_builtin + [("char", " "), "enter"])
         self.assertTrue(applied)
-        self.assertEqual(h.DISABLED_TOOLS, {"t1", "t2"})
+        self.assertEqual(h.state.DISABLED_TOOLS, {"t1", "t2"})
 
     def test_server_row_mixed_toggles_all_on(self):
         self._register("srv", [self._mcp_tool("t1"), self._mcp_tool("t2")])
-        h.DISABLED_TOOLS.add("t2")
+        h.state.DISABLED_TOOLS.add("t2")
         n_builtin = len(h.OPENAI_TOOLS_INTERACTIVE)
         applied, out = self.menu(["down"] * n_builtin + [("char", " "), "enter"])
         self.assertTrue(applied)
-        self.assertEqual(h.DISABLED_TOOLS, set())
+        self.assertEqual(h.state.DISABLED_TOOLS, set())
         self.assertIn("[x] srv", out)
 
     def test_server_row_mixed_mark(self):
         self._register("srv", [self._mcp_tool("t1"), self._mcp_tool("t2")])
-        h.DISABLED_TOOLS.add("t2")
+        h.state.DISABLED_TOOLS.add("t2")
         applied, out = self.menu(["enter"])
         self.assertTrue(applied)
         self.assertIn("[-] srv", out)
@@ -4872,7 +4886,7 @@ class TestToolsMenu(unittest.TestCase):
             ["down"] * n_builtin + [("char", "+"), "down", ("char", " "), "enter"]
         )
         self.assertTrue(applied)
-        self.assertEqual(h.DISABLED_TOOLS, {"t1"})
+        self.assertEqual(h.state.DISABLED_TOOLS, {"t1"})
 
 
 class TestCommandsMenu(unittest.TestCase):
@@ -4941,18 +4955,18 @@ class TestCommandsMenu(unittest.TestCase):
 class TestTodo(Base):
     def setUp(self):
         super().setUp()
-        self._old_items = h.TODO_ITEMS
-        self._old_next = h.TODO_NEXT_ID
-        self._old_injected = h.TODO_LAST_INJECTED
-        self._old_file = h.TODO_FILE
-        h.TODO_ITEMS = []
-        h.TODO_NEXT_ID = 1
-        h.TODO_LAST_INJECTED = None
-        h.TODO_FILE = os.path.join(self.tmp, ".harnless", "todo.md")
-        self.addCleanup(setattr, h, "TODO_ITEMS", self._old_items)
-        self.addCleanup(setattr, h, "TODO_NEXT_ID", self._old_next)
-        self.addCleanup(setattr, h, "TODO_LAST_INJECTED", self._old_injected)
-        self.addCleanup(setattr, h, "TODO_FILE", self._old_file)
+        self._old_items = h.state.TODO_ITEMS
+        self._old_next = h.state.TODO_NEXT_ID
+        self._old_injected = h.state.TODO_LAST_INJECTED
+        self._old_file = h.state.TODO_FILE
+        h.state.TODO_ITEMS = []
+        h.state.TODO_NEXT_ID = 1
+        h.state.TODO_LAST_INJECTED = None
+        h.state.TODO_FILE = os.path.join(self.tmp, ".harnless", "todo.md")
+        self.addCleanup(setattr, h.state, "TODO_ITEMS", self._old_items)
+        self.addCleanup(setattr, h.state, "TODO_NEXT_ID", self._old_next)
+        self.addCleanup(setattr, h.state, "TODO_LAST_INJECTED", self._old_injected)
+        self.addCleanup(setattr, h.state, "TODO_FILE", self._old_file)
 
     def todo(self, **kw):
         return h.tool_todo(kw)
@@ -4968,7 +4982,7 @@ class TestTodo(Base):
         self.assertEqual(
             self.todo(action="add", items=["a", "b", "c"]),
             "todo list:\n- [ ] 1. a\n- [ ] 2. b\n- [ ] 3. c")
-        self.assertEqual(h.TODO_NEXT_ID, 4)
+        self.assertEqual(h.state.TODO_NEXT_ID, 4)
 
     def test_add_items_skips_blank(self):
         self.assertEqual(
@@ -5032,7 +5046,7 @@ class TestTodo(Base):
     def test_clear(self):
         self.todo(action="add", text="a")
         self.assertEqual(self.todo(action="clear"), "todo list:\n(empty)")
-        self.assertEqual(h.TODO_ITEMS, [])
+        self.assertEqual(h.state.TODO_ITEMS, [])
 
     def test_unknown_action(self):
         self.assertEqual(self.todo(action="fly"), "error: unknown action 'fly' (use add, update, list, or clear)")
@@ -5044,24 +5058,24 @@ class TestTodo(Base):
     def test_persisted_to_file(self):
         self.todo(action="add", text="a")
         self.todo(action="update", id=1, status="done")
-        with open(h.TODO_FILE, "r", encoding="utf-8") as f:
+        with open(h.state.TODO_FILE, "r", encoding="utf-8") as f:
             self.assertEqual(f.read(), "- [x] 1. a\n")
 
     def test_load_from_file(self):
-        os.makedirs(os.path.dirname(h.TODO_FILE), exist_ok=True)
-        with open(h.TODO_FILE, "w", encoding="utf-8") as f:
+        os.makedirs(os.path.dirname(h.state.TODO_FILE), exist_ok=True)
+        with open(h.state.TODO_FILE, "w", encoding="utf-8") as f:
             f.write("- [ ] 1. a\n- [~] 2. b\n- [x] 3. c\n")
         h._todo_load()
-        self.assertEqual(h.TODO_ITEMS, [
+        self.assertEqual(h.state.TODO_ITEMS, [
             {"id": 1, "text": "a", "status": "pending"},
             {"id": 2, "text": "b", "status": "in_progress"},
             {"id": 3, "text": "c", "status": "done"},
         ])
-        self.assertEqual(h.TODO_NEXT_ID, 4)
+        self.assertEqual(h.state.TODO_NEXT_ID, 4)
 
     def test_load_missing_file(self):
         h._todo_load()
-        self.assertEqual(h.TODO_ITEMS, [])
+        self.assertEqual(h.state.TODO_ITEMS, [])
 
     def test_reminder_injected_on_change(self):
         messages = []
@@ -5114,9 +5128,9 @@ class TestTodo(Base):
         for i in range(300):
             h.tool_todo({"action": "add", "text": ("item %d " % i) * 40})
         out = h.tool_todo({"action": "list"})
-        self.assertIn(f"showing first {h.TODO_BLOCK_LIMIT};", out)
+        self.assertIn(f"showing first {h.config.TODO_BLOCK_LIMIT};", out)
         # the file on disk keeps the full list; only what enters the chat is trimmed
-        with open(h.TODO_FILE, "r", encoding="utf-8") as f:
+        with open(h.state.TODO_FILE, "r", encoding="utf-8") as f:
             self.assertEqual(len(f.read().splitlines()), 300)
 
     def test_reminder_capped(self):
@@ -5126,18 +5140,18 @@ class TestTodo(Base):
         h._todo_reminder(messages)
         reminders = [m for m in messages if m.get("role") == "user"]
         self.assertEqual(len(reminders), 1)
-        self.assertLess(len(reminders[0]["content"]), h.TODO_BLOCK_LIMIT + 200)
+        self.assertLess(len(reminders[0]["content"]), h.config.TODO_BLOCK_LIMIT + 200)
 
 
 class TestMemory(Base):
     def setUp(self):
         super().setUp()
-        self._old_proj = h.MEMORY_PROJECT_FILE
-        self._old_glob = h.MEMORY_GLOBAL_FILE
-        h.MEMORY_PROJECT_FILE = os.path.join(self.tmp, ".harnless", "memory.md")
-        h.MEMORY_GLOBAL_FILE = os.path.join(self.tmp, "global_memory.md")
-        self.addCleanup(setattr, h, "MEMORY_PROJECT_FILE", self._old_proj)
-        self.addCleanup(setattr, h, "MEMORY_GLOBAL_FILE", self._old_glob)
+        self._old_proj = h.state.MEMORY_PROJECT_FILE
+        self._old_glob = h.state.MEMORY_GLOBAL_FILE
+        h.state.MEMORY_PROJECT_FILE = os.path.join(self.tmp, ".harnless", "memory.md")
+        h.state.MEMORY_GLOBAL_FILE = os.path.join(self.tmp, "global_memory.md")
+        self.addCleanup(setattr, h.state, "MEMORY_PROJECT_FILE", self._old_proj)
+        self.addCleanup(setattr, h.state, "MEMORY_GLOBAL_FILE", self._old_glob)
 
     def mem(self, **kw):
         return h.tool_memory(kw)
@@ -5159,8 +5173,8 @@ class TestMemory(Base):
 
     def test_add_global_scope(self):
         self.mem(action="add", text="global note", scope="global")
-        self.assertTrue(os.path.exists(h.MEMORY_GLOBAL_FILE))
-        self.assertFalse(os.path.exists(h.MEMORY_PROJECT_FILE))
+        self.assertTrue(os.path.exists(h.state.MEMORY_GLOBAL_FILE))
+        self.assertFalse(os.path.exists(h.state.MEMORY_PROJECT_FILE))
 
     def test_bad_scope(self):
         self.assertEqual(self.mem(action="add", text="x", scope="nope"),
@@ -5200,7 +5214,7 @@ class TestMemory(Base):
         for i in range(200):
             self.mem(action="add", text=("note %d " % i) * 30)
         out = self.mem(action="list", scope="project")
-        self.assertIn(f"showing first {h.MEMORY_BLOCK_LIMIT};", out)
+        self.assertIn(f"showing first {h.config.MEMORY_BLOCK_LIMIT};", out)
 
     def test_load_memory_capped(self):
         # load_memory feeds every system prompt, so an unbounded notes file
@@ -5208,7 +5222,7 @@ class TestMemory(Base):
         for i in range(200):
             self.mem(action="add", text=("long note %d " % i) * 30)
         block = h.load_memory()
-        self.assertLess(len(block), h.MEMORY_BLOCK_LIMIT + 200)
+        self.assertLess(len(block), h.config.MEMORY_BLOCK_LIMIT + 200)
         self.assertIn("[truncated:", block)
 
 
@@ -5244,11 +5258,11 @@ class TestStateToolsRegistered(unittest.TestCase):
         self.assertIn("gotcha:", schema["description"])
 
     def test_context_additions(self):
-        old_proj, old_glob = h.MEMORY_PROJECT_FILE, h.MEMORY_GLOBAL_FILE
-        h.MEMORY_PROJECT_FILE = "/nonexistent/proj.md"
-        h.MEMORY_GLOBAL_FILE = "/nonexistent/glob.md"
-        self.addCleanup(setattr, h, "MEMORY_PROJECT_FILE", old_proj)
-        self.addCleanup(setattr, h, "MEMORY_GLOBAL_FILE", old_glob)
+        old_proj, old_glob = h.state.MEMORY_PROJECT_FILE, h.state.MEMORY_GLOBAL_FILE
+        h.state.MEMORY_PROJECT_FILE = "/nonexistent/proj.md"
+        h.state.MEMORY_GLOBAL_FILE = "/nonexistent/glob.md"
+        self.addCleanup(setattr, h.state, "MEMORY_PROJECT_FILE", old_proj)
+        self.addCleanup(setattr, h.state, "MEMORY_GLOBAL_FILE", old_glob)
         self.assertEqual(h._context_additions(), "")
 
 
@@ -5339,14 +5353,14 @@ class TestFileRefs(Base):
 
     def setUp(self):
         super().setUp()
-        self._old_vision = h.VISION_ENABLED
-        self._old_cwd = h.CWD
-        h.VISION_ENABLED = True
-        h.CWD = self.p("")
+        self._old_vision = h.state.VISION_ENABLED
+        self._old_cwd = h.state.CWD
+        h.state.VISION_ENABLED = True
+        h.state.CWD = self.p("")
 
     def tearDown(self):
-        h.VISION_ENABLED = self._old_vision
-        h.CWD = self._old_cwd
+        h.state.VISION_ENABLED = self._old_vision
+        h.state.CWD = self._old_cwd
         super().tearDown()
 
     def _write(self, rel, content):
@@ -5415,7 +5429,7 @@ class TestFileRefs(Base):
         )
 
     def test_no_vision_image_becomes_note(self):
-        h.VISION_ENABLED = False
+        h.state.VISION_ENABLED = False
         with open(os.path.join(self.tmp, "dot.png"), "wb") as f:
             f.write(self.PNG)
         out = h.expand_file_refs("@[cwd://dot.png]")
@@ -5494,30 +5508,30 @@ class TestContentChars(unittest.TestCase):
 
 class TestUsageTracking(unittest.TestCase):
     def setUp(self):
-        self.saved = dict(h.USAGE_BY_CONV)
-        h.USAGE_BY_CONV.clear()
+        self.saved = dict(h.state.USAGE_BY_CONV)
+        h.state.USAGE_BY_CONV.clear()
 
     def tearDown(self):
-        h.USAGE_BY_CONV.clear()
-        h.USAGE_BY_CONV.update(self.saved)
+        h.state.USAGE_BY_CONV.clear()
+        h.state.USAGE_BY_CONV.update(self.saved)
 
     def test_record_usage_stores_by_messages_id(self):
         msgs = [{"role": "user", "content": "hi"}]
         h._record_usage(msgs, {"prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105})
-        self.assertEqual(h.USAGE_BY_CONV[id(msgs)]["prompt_tokens"], 100)
+        self.assertEqual(h.state.USAGE_BY_CONV[id(msgs)]["prompt_tokens"], 100)
 
     def test_record_usage_ignores_bad(self):
         msgs = [{"role": "user", "content": "hi"}]
         h._record_usage(msgs, None)
         h._record_usage(msgs, {})
         h._record_usage(msgs, {"prompt_tokens": 0})
-        self.assertNotIn(id(msgs), h.USAGE_BY_CONV)
+        self.assertNotIn(id(msgs), h.state.USAGE_BY_CONV)
 
     def test_record_usage_stores_by_conv_id(self):
         msgs = [{"role": "user", "content": "hi"}]
         h._record_usage(msgs, {"prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105}, conv_id=7)
-        self.assertEqual(h.USAGE_BY_CONV[7]["prompt_tokens"], 100)
-        self.assertNotIn(id(msgs), h.USAGE_BY_CONV)
+        self.assertEqual(h.state.USAGE_BY_CONV[7]["prompt_tokens"], 100)
+        self.assertNotIn(id(msgs), h.state.USAGE_BY_CONV)
 
     def test_format_status_by_conv_id(self):
         msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]
@@ -5547,8 +5561,8 @@ class TestUsageTracking(unittest.TestCase):
         with mock.patch.object(h.urllib.request, "urlopen", return_value=FakeResp()):
             msgs = [{"role": "user", "content": "hi"}]
             h.chat(msgs, "m", conv_id=3)
-        self.assertEqual(h.USAGE_BY_CONV[3]["prompt_tokens"], 55)
-        self.assertNotIn(id(msgs), h.USAGE_BY_CONV)
+        self.assertEqual(h.state.USAGE_BY_CONV[3]["prompt_tokens"], 55)
+        self.assertNotIn(id(msgs), h.state.USAGE_BY_CONV)
 
     def test_stream_chat_records_usage_by_conv_id(self):
         lines = [
@@ -5567,8 +5581,8 @@ class TestUsageTracking(unittest.TestCase):
         with mock.patch.object(h.urllib.request, "urlopen", return_value=FakeResp()):
             msgs = [{"role": "user", "content": "hi"}]
             list(h.stream_chat(msgs, "m", conv_id=4))
-        self.assertEqual(h.USAGE_BY_CONV[4]["prompt_tokens"], 170000)
-        self.assertNotIn(id(msgs), h.USAGE_BY_CONV)
+        self.assertEqual(h.state.USAGE_BY_CONV[4]["prompt_tokens"], 170000)
+        self.assertNotIn(id(msgs), h.state.USAGE_BY_CONV)
 
     def test_parse_sse_line_usage_chunk_empty_choices(self):
         line = 'data: {"id":"x","choices":[],"usage":{"prompt_tokens":170000,"completion_tokens":10,"total_tokens":170010}}'
@@ -5616,7 +5630,7 @@ class TestUsageTracking(unittest.TestCase):
             msgs = [{"role": "user", "content": "hi"}]
             out = h.chat(msgs, "m")
         self.assertEqual(out["choices"][0]["message"]["content"], "ok")
-        self.assertEqual(h.USAGE_BY_CONV[id(msgs)]["prompt_tokens"], 55)
+        self.assertEqual(h.state.USAGE_BY_CONV[id(msgs)]["prompt_tokens"], 55)
 
     def test_stream_chat_records_usage(self):
         lines = [
@@ -5636,7 +5650,7 @@ class TestUsageTracking(unittest.TestCase):
             msgs = [{"role": "user", "content": "hi"}]
             deltas = list(h.stream_chat(msgs, "m"))
         self.assertEqual(deltas, [{"content": "hi"}])
-        self.assertEqual(h.USAGE_BY_CONV[id(msgs)]["prompt_tokens"], 170000)
+        self.assertEqual(h.state.USAGE_BY_CONV[id(msgs)]["prompt_tokens"], 170000)
 
     def test_format_status_server_reported(self):
         msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]
@@ -5840,13 +5854,13 @@ class TestInterrupt(Base):
         def fake_stream_chat(messages, model, interactive=False, temperature=0.2, watcher=None, progress=None, conv_id=None):
             yield {"content": "partial"}
 
-        old_enabled = h.INTERRUPT_ENABLED
+        old_enabled = h.state.INTERRUPT_ENABLED
         old_watcher = h.InterruptWatcher
         old_chat = h.stream_chat
-        h.INTERRUPT_ENABLED = True
+        h.state.INTERRUPT_ENABLED = True
         h.InterruptWatcher = FakeWatcher
         h.stream_chat = fake_stream_chat
-        self.addCleanup(setattr, h, "INTERRUPT_ENABLED", old_enabled)
+        self.addCleanup(setattr, h.state, "INTERRUPT_ENABLED", old_enabled)
         self.addCleanup(setattr, h, "InterruptWatcher", old_watcher)
         self.addCleanup(setattr, h, "stream_chat", old_chat)
         buf = io.StringIO()
@@ -5876,13 +5890,13 @@ class TestInterrupt(Base):
         def fake_stream_chat(messages, model, interactive=False, temperature=0.2, watcher=None, progress=None, conv_id=None):
             yield from ()
 
-        old_enabled = h.INTERRUPT_ENABLED
+        old_enabled = h.state.INTERRUPT_ENABLED
         old_watcher = h.InterruptWatcher
         old_chat = h.stream_chat
-        h.INTERRUPT_ENABLED = True
+        h.state.INTERRUPT_ENABLED = True
         h.InterruptWatcher = FakeWatcher
         h.stream_chat = fake_stream_chat
-        self.addCleanup(setattr, h, "INTERRUPT_ENABLED", old_enabled)
+        self.addCleanup(setattr, h.state, "INTERRUPT_ENABLED", old_enabled)
         self.addCleanup(setattr, h, "InterruptWatcher", old_watcher)
         self.addCleanup(setattr, h, "stream_chat", old_chat)
         buf = io.StringIO()
@@ -6017,7 +6031,7 @@ class TestInterrupt(Base):
 class TestContextProgress(unittest.TestCase):
     def _big_messages(self):
         # Well over CONTEXT_PROGRESS_THRESHOLD tokens (chars/4).
-        return [{"role": "user", "content": "x" * (h.CONTEXT_PROGRESS_THRESHOLD * 4 + 1000)}]
+        return [{"role": "user", "content": "x" * (h.config.CONTEXT_PROGRESS_THRESHOLD * 4 + 1000)}]
 
     def test_estimate_context_tokens_counts_content_and_tools(self):
         messages = [
@@ -6086,9 +6100,9 @@ class TestContextProgress(unittest.TestCase):
         self.assertIn("32.0k tokens", line)
 
     def test_draws_line_and_clears(self):
-        old_delay = h.CONTEXT_PROGRESS_DELAY
-        h.CONTEXT_PROGRESS_DELAY = 0.05
-        self.addCleanup(setattr, h, "CONTEXT_PROGRESS_DELAY", old_delay)
+        old_delay = h.state.CONTEXT_PROGRESS_DELAY
+        h.state.CONTEXT_PROGRESS_DELAY = 0.05
+        self.addCleanup(setattr, h.state, "CONTEXT_PROGRESS_DELAY", old_delay)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf), mock.patch.object(buf, "isatty", return_value=True):
             spinner = h.ContextProgress(self._big_messages(), interactive=True)
@@ -6104,9 +6118,9 @@ class TestContextProgress(unittest.TestCase):
         self.assertIn("\x1b[2K", out)  # the line was cleared
 
     def test_stop_clears_above_hint_lines(self):
-        old_delay = h.CONTEXT_PROGRESS_DELAY
-        h.CONTEXT_PROGRESS_DELAY = 0.05
-        self.addCleanup(setattr, h, "CONTEXT_PROGRESS_DELAY", old_delay)
+        old_delay = h.state.CONTEXT_PROGRESS_DELAY
+        h.state.CONTEXT_PROGRESS_DELAY = 0.05
+        self.addCleanup(setattr, h.state, "CONTEXT_PROGRESS_DELAY", old_delay)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf), mock.patch.object(buf, "isatty", return_value=True):
             spinner = h.ContextProgress(self._big_messages(), interactive=True)
@@ -6149,7 +6163,7 @@ class TestContextProgress(unittest.TestCase):
         t = threading.Thread(target=server.serve_forever, daemon=True)
         t.start()
         try:
-            body = b"x" * (3 * h.PROGRESS_CHUNK + 123)
+            body = b"x" * (3 * h.config.PROGRESS_CHUNK + 123)
             req = urllib.request.Request(
                 f"http://127.0.0.1:{port}/v1/chat/completions",
                 data=body,
@@ -6189,7 +6203,7 @@ class TestContextProgress(unittest.TestCase):
         try:
             req = urllib.request.Request(
                 f"http://127.0.0.1:{port}/x",
-                data=b"x" * (2 * h.PROGRESS_CHUNK + 1),
+                data=b"x" * (2 * h.config.PROGRESS_CHUNK + 1),
                 headers={"Content-Type": "application/json"},
             )
             seen = []
@@ -6253,23 +6267,23 @@ class TestSessionLog(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
         os.makedirs(self.tmp, exist_ok=True)
         self.sessions = os.path.join(self.tmp, "sessions")
-        self._saved = {name: getattr(h, name) for name in self.ATTRS}
+        self._saved = {name: getattr(_holder(name), name) for name in self.ATTRS}
         self._saved_state = (
-            dict(h.SESSION_FILES), dict(h.SESSION_SEQ), dict(h.SUBAGENT_CHILDREN),
+            dict(h.state.SESSION_FILES), dict(h.state.SESSION_SEQ), dict(h.state.SUBAGENT_CHILDREN),
         )
-        h.SESSION_DIR = self.sessions
-        h.SESSION_LOG = True
-        h.SESSION_WARNED = False
-        h.SESSION_ID = ""
+        h.state.SESSION_DIR = self.sessions
+        h.state.SESSION_LOG = True
+        h.state.SESSION_WARNED = False
+        h.state.SESSION_ID = ""
         h._session_new_id = lambda: "test-session"  # predictable file names
-        h.AGENT_LOG_ID = ""
-        h.OUTPUT_INDENT = ""
-        h.MODEL = "test-model"
-        h.TEMPERATURE = 0.2
-        h._AGENT_DEPTH = 0
-        h.MAX_SUBAGENT_DEPTH = 3
-        h.SUBAGENT_STEP_LIMIT = 0
-        h.TODO_FILE = os.path.join(self.tmp, ".harnless", "todo.md")
+        h.state.AGENT_LOG_ID = ""
+        h.state.OUTPUT_INDENT = ""
+        h.state.MODEL = "test-model"
+        h.state.TEMPERATURE = 0.2
+        h.state._AGENT_DEPTH = 0
+        h.state.MAX_SUBAGENT_DEPTH = 3
+        h.state.SUBAGENT_STEP_LIMIT = 0
+        h.state.TODO_FILE = os.path.join(self.tmp, ".harnless", "todo.md")
 
         def no_live_api(*args, **kwargs):
             raise AssertionError("tests must not reach a live LLM server")
@@ -6278,14 +6292,14 @@ class TestSessionLog(unittest.TestCase):
 
     def tearDown(self):
         for name, value in self._saved.items():
-            setattr(h, name, value)
+            setattr(_holder(name), name, value)
         files, seq, children = self._saved_state
-        h.SESSION_FILES.clear()
-        h.SESSION_FILES.update(files)
-        h.SESSION_SEQ.clear()
-        h.SESSION_SEQ.update(seq)
-        h.SUBAGENT_CHILDREN.clear()
-        h.SUBAGENT_CHILDREN.update(children)
+        h.state.SESSION_FILES.clear()
+        h.state.SESSION_FILES.update(files)
+        h.state.SESSION_SEQ.clear()
+        h.state.SESSION_SEQ.update(seq)
+        h.state.SUBAGENT_CHILDREN.clear()
+        h.state.SUBAGENT_CHILDREN.update(children)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     # ---- helpers
@@ -6305,7 +6319,7 @@ class TestSessionLog(unittest.TestCase):
         seen = {}
 
         def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
-            depth = h._AGENT_DEPTH
+            depth = h.state._AGENT_DEPTH
             turn = seen.get(depth, 0)
             seen[depth] = turn + 1
             return decide(messages, depth, turn)
@@ -6316,9 +6330,9 @@ class TestSessionLog(unittest.TestCase):
         """An interactive top-level run against the conversation journal."""
         h.start_session(kw.pop("mode", "interactive"))
         messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "go"}]
-        h._session_messages(messages, h.MAIN_CONV_ID)
+        h._session_messages(messages, h.state.MAIN_CONV_ID)
         code = h.run_agent(
-            messages, "test-model", interactive=True, temperature=0.2, conv_id=h.MAIN_CONV_ID
+            messages, "test-model", interactive=True, temperature=0.2, conv_id=h.state.MAIN_CONV_ID
         )
         return code, messages
 
@@ -6364,20 +6378,20 @@ class TestSessionLog(unittest.TestCase):
                          ["system", "user", "assistant", "tool", "assistant"])
         self.assertEqual([r["seq"] for r in records], list(range(len(records))))
         self.assertTrue(all(r.get("ts") for r in records))
-        self.assertEqual(records[4]["content"], h.CWD)  # the get_cwd result
+        self.assertEqual(records[4]["content"], h.state.CWD)  # the get_cwd result
         self.assertEqual(records[3]["tool_calls"][0]["function"]["arguments"], "{}")
-        self.assertEqual(records[4]["chars"], len(h.CWD))
+        self.assertEqual(records[4]["chars"], len(h.state.CWD))
 
     def test_journal_is_untouched_when_no_session_was_opened(self):
         self._scripted(lambda m, d, t: ({"role": "assistant", "content": "done"}, True))
         messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "go"}]
         self.assertEqual(h.run_agent(
-            messages, "test-model", interactive=True, temperature=0.2, conv_id=h.MAIN_CONV_ID
+            messages, "test-model", interactive=True, temperature=0.2, conv_id=h.state.MAIN_CONV_ID
         ), 0)
         self.assertFalse(os.path.isdir(self.sessions))
 
     def test_logging_off_writes_nothing(self):
-        h.SESSION_LOG = False
+        h.state.SESSION_LOG = False
         self._scripted(lambda m, d, t: ({"role": "assistant", "content": "done"}, True))
         self.assertEqual(self._run()[0], 0)
         self.assertFalse(os.path.isdir(self.sessions))
@@ -6387,9 +6401,9 @@ class TestSessionLog(unittest.TestCase):
         h._record_usage(
             [{"role": "user", "content": "hi"}],
             {"prompt_tokens": 1200, "completion_tokens": 3, "total_tokens": 1203},
-            conv_id=h.MAIN_CONV_ID,
+            conv_id=h.state.MAIN_CONV_ID,
         )
-        h._record_usage([{"role": "user", "content": "hi"}], None, conv_id=h.MAIN_CONV_ID)
+        h._record_usage([{"role": "user", "content": "hi"}], None, conv_id=h.state.MAIN_CONV_ID)
         records = self._log()
         self.assertEqual([r.get("type") for r in records], ["session", "usage"])
         self.assertEqual(records[1]["usage"]["prompt_tokens"], 1200)
@@ -6399,7 +6413,7 @@ class TestSessionLog(unittest.TestCase):
         h.start_session()
         h.tool_todo({"action": "add", "text": "write the log"})
         messages = [{"role": "system", "content": "s"}]
-        h._todo_reminder(messages, h.MAIN_CONV_ID)
+        h._todo_reminder(messages, h.state.MAIN_CONV_ID)
         self.assertEqual(self._jmessages()[-1]["role"], "user")
         self.assertIn("write the log", self._jmessages()[-1]["content"])
 
@@ -6411,7 +6425,7 @@ class TestSessionLog(unittest.TestCase):
                 {"type": "text", "text": "see"},
                 {"type": "image_url", "image_url": {"url": big}},
             ]},
-            h.MAIN_CONV_ID,
+            h.state.MAIN_CONV_ID,
         )
         record = self._jmessages()[0]
         dumped = json.dumps(record)
@@ -6429,9 +6443,9 @@ class TestSessionLog(unittest.TestCase):
         h.stream_once = interrupted
         h.start_session()
         messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "go"}]
-        h._session_messages(messages, h.MAIN_CONV_ID)
+        h._session_messages(messages, h.state.MAIN_CONV_ID)
         self.assertEqual(h.run_agent(
-            messages, "test-model", interactive=True, temperature=0.2, conv_id=h.MAIN_CONV_ID
+            messages, "test-model", interactive=True, temperature=0.2, conv_id=h.state.MAIN_CONV_ID
         ), 0)
         last = self._jmessages()[-1]
         self.assertEqual(last["role"], "assistant")
@@ -6442,19 +6456,19 @@ class TestSessionLog(unittest.TestCase):
         blocker = os.path.join(self.tmp, "not-a-directory")
         with open(blocker, "w", encoding="utf-8") as f:
             f.write("SESSION_DIR points at this file")
-        h.SESSION_DIR = blocker
+        h.state.SESSION_DIR = blocker
         self._scripted(lambda m, d, t: ({"role": "assistant", "content": "done"}, True))
         with contextlib.redirect_stdout(io.StringIO()) as out:
             # Already the header is where it fails: nothing can be created inside
             # a file. The session must carry on regardless.
             h.start_session()
             messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "go"}]
-            h._session_messages(messages, h.MAIN_CONV_ID)
+            h._session_messages(messages, h.state.MAIN_CONV_ID)
             code = h.run_agent(
-                messages, "test-model", interactive=True, temperature=0.2, conv_id=h.MAIN_CONV_ID
+                messages, "test-model", interactive=True, temperature=0.2, conv_id=h.state.MAIN_CONV_ID
             )
         self.assertEqual(code, 0)  # the agent carries on with no journal at all
-        self.assertFalse(h.SESSION_LOG)
+        self.assertFalse(h.state.SESSION_LOG)
         self.assertIn("session log disabled", out.getvalue())
         self.assertEqual(out.getvalue().count("session log disabled"), 1)  # reported once
 
@@ -6530,7 +6544,7 @@ class TestSessionLog(unittest.TestCase):
         self.assertEqual(self._log("test-session.2.jsonl")[0]["task"], "job 1")
 
     def test_a_refused_delegation_logs_nothing(self):
-        h.MAX_SUBAGENT_DEPTH = 0
+        h.state.MAX_SUBAGENT_DEPTH = 0
         out = h.tool_task({"task": "no nesting allowed"})
         self.assertTrue(out.startswith("error: sub-agent depth limit reached"))
         self.assertFalse(os.path.isdir(self.sessions))  # a refused call opens no log
@@ -6551,7 +6565,7 @@ class TestSessionLog(unittest.TestCase):
         self.assertEqual([m["role"] for m in messages], ["user", "assistant", "tool", "assistant"])
         self.assertEqual(set(messages[0]), {"role", "content"})
         self.assertEqual(messages[-1]["content"], "done")
-        self.assertEqual(h.SESSION_ID, "test-session")
+        self.assertEqual(h.state.SESSION_ID, "test-session")
         self.assertEqual(h._session_path(), os.path.join(self.sessions, "test-session.jsonl"))
 
     def test_resume_latest_picks_the_newest_top_level_log(self):
@@ -6574,7 +6588,7 @@ class TestSessionLog(unittest.TestCase):
             os.utime(os.path.join(self.sessions, name), (future, future))
         messages, note = h.resume_session("latest")
         self.assertEqual(messages[0]["content"], "new run")
-        self.assertEqual(h.SESSION_ID, "newer")
+        self.assertEqual(h.state.SESSION_ID, "newer")
 
     def test_resume_continues_the_same_log_without_recording_it_twice(self):
         self._scripted(
@@ -6587,8 +6601,8 @@ class TestSessionLog(unittest.TestCase):
         messages, _ = h.resume_session("test-session")
         # A resumed run appends a `resume` marker, then only what it adds itself:
         # re-recording the restored messages would double the log at every resume.
-        h._session_messages([{"role": "system", "content": "new system"}], h.MAIN_CONV_ID)
-        h._session_messages([{"role": "user", "content": "carry on"}], h.MAIN_CONV_ID)
+        h._session_messages([{"role": "system", "content": "new system"}], h.state.MAIN_CONV_ID)
+        h._session_messages([{"role": "user", "content": "carry on"}], h.state.MAIN_CONV_ID)
         records = self._log()
         self.assertEqual(len([r for r in records if r.get("type") == "message"]), before + 2)
         self.assertEqual(records[before + 1]["type"], "resume")
@@ -6609,7 +6623,7 @@ class TestSessionLog(unittest.TestCase):
         self.assertEqual([m["role"] for m in messages], ["user", "assistant", "tool"])
         answer = messages[-1]
         self.assertEqual(answer["tool_call_id"], "a1")
-        self.assertIn(h.SESSION_UNANSWERED_NOTE, answer["content"])
+        self.assertIn(h.config.SESSION_UNANSWERED_NOTE, answer["content"])
 
     def test_resume_drops_orphans_and_contentless_partials(self):
         self._write_log("dirty.jsonl", [
@@ -6675,7 +6689,7 @@ class TestSessionLog(unittest.TestCase):
 
     def _echo(self, *args, **kwargs):
         """resume_session(...) with colour off, returning (messages, note, what it printed)."""
-        saved = h.COLORS_ENABLED
+        saved = h.state.COLORS_ENABLED
         h.set_color_enabled(False)
         buf = io.StringIO()
         try:
@@ -6727,21 +6741,21 @@ class TestSessionLog(unittest.TestCase):
             f"{h.icon('tool')} run_shell({json.dumps({'command': 'echo hi'})})", out
         )
         # the same TOOL_RESULT_ECHO preview the agent loop printed while it ran
-        self.assertIn(f"{h.icon('result')} " + "y" * h.TOOL_RESULT_ECHO + "...", out)
-        self.assertNotIn("y" * (h.TOOL_RESULT_ECHO + 1), out)
+        self.assertIn(f"{h.icon('result')} " + "y" * h.config.TOOL_RESULT_ECHO + "...", out)
+        self.assertNotIn("y" * (h.config.TOOL_RESULT_ECHO + 1), out)
         # call, then its answer — the order they happened in, not calls then answers
         self.assertLess(out.index("run_shell("), out.index(h.icon("result")))
 
     def test_resume_echo_caps_replayed_thinking_but_not_the_replies(self):
         self._write_chat()
         _, _, out = self._echo("echo", echo=4)
-        kept = h.RESUME_TAIL_CHARS - len("thinking hard ")
+        kept = h.config.RESUME_TAIL_CHARS - len("thinking hard ")
         self.assertIn(
             f"{h.icon('thinking')} thinking: thinking hard " + "x" * kept
-            + f"... [+{1314 - h.RESUME_TAIL_CHARS} chars in the session log]",
+            + f"... [+{1314 - h.config.RESUME_TAIL_CHARS} chars in the session log]",
             out,
         )
-        self.assertNotIn("x" * h.RESUME_TAIL_CHARS, out)
+        self.assertNotIn("x" * h.config.RESUME_TAIL_CHARS, out)
         self.assertIn("first answer", out)  # a reply is what they came back for: uncapped
 
     def test_resume_echo_bounds_the_window_to_recent_records(self):
@@ -6768,7 +6782,7 @@ class TestSessionLog(unittest.TestCase):
         self.assertNotIn("the oldest ask", out)
         self.assertNotIn("cwd output 0", out)
         self.assertNotIn("cwd output 4", out)  # the window cuts mid-batch, not mid-turn
-        pairs = max(1, (h.RESUME_TAIL_RECORDS - 2) // 2)  # the calls that made the cut
+        pairs = max(1, (h.config.RESUME_TAIL_RECORDS - 2) // 2)  # the calls that made the cut
         self.assertEqual(out.count(f"{h.icon('tool')} get_cwd("), pairs)
         self.assertEqual(out.count(f"{h.icon('result')} cwd output "), pairs)
         # a tool-call turn is not a reply: nothing claims an answer it never gave
@@ -6780,9 +6794,9 @@ class TestSessionLog(unittest.TestCase):
             {"type": "message", "seq": 1, "ts": "t", "role": "user", "content": "ask"},
             {"type": "message", "seq": 2, "ts": "t", "role": "assistant", "content": "answer"},
             {"type": "message", "seq": 3, "ts": "t", "role": "user",
-             "content": h.TODO_REMINDER_HEADER + "\n- [x] a todo item"},
+             "content": h.config.TODO_REMINDER_HEADER + "\n- [x] a todo item"},
             {"type": "message", "seq": 4, "ts": "t", "role": "user",
-             "content": h.COMPACT_SUMMARY_HEADER + "\n\nthe handoff note"},
+             "content": h.config.COMPACT_SUMMARY_HEADER + "\n\nthe handoff note"},
             {"type": "message", "seq": 5, "ts": "t", "role": "user", "content": "next ask"},
             {"type": "message", "seq": 6, "ts": "t", "role": "assistant", "content": "later answer"},
         ])
@@ -6835,12 +6849,12 @@ class TestSessionLog(unittest.TestCase):
         messages, _, out = self._echo("half", echo=2)
         # rebuilt: the dangling call gets the placeholder answer a server insists on
         self.assertEqual([m.get("content") for m in messages if m["role"] == "tool"],
-                         ["the cwd", h.SESSION_UNANSWERED_NOTE])
+                         ["the cwd", h.config.SESSION_UNANSWERED_NOTE])
         # replayed: both calls, the one recorded answer, and no placeholder
         self.assertIn("you> keep going", out)
         self.assertEqual(out.count(f"{h.icon('tool')} get_cwd("), 2)
         self.assertEqual(out.count(f"{h.icon('result')} "), 1)
-        self.assertNotIn(h.SESSION_UNANSWERED_NOTE, out)
+        self.assertNotIn(h.config.SESSION_UNANSWERED_NOTE, out)
 
     def test_resume_target_reads_both_resume_flags(self):
         # --resume names the session; --resume-last only trims it.
@@ -6855,8 +6869,8 @@ class TestSessionLog(unittest.TestCase):
         # The keep limit is clamped like every other CLI knob.
         self.assertEqual(h._resume_target(None, -4), ("latest", 0, True))
         self.assertEqual(
-            h._resume_target(None, h.SESSION_KEEP_CEILING + 99),
-            ("latest", h.SESSION_KEEP_CEILING, True),
+            h._resume_target(None, h.config.SESSION_KEEP_CEILING + 99),
+            ("latest", h.config.SESSION_KEEP_CEILING, True),
         )
         self.assertEqual(h._resume_target("abc", -4), ("abc", 0, False))
 
@@ -6866,9 +6880,9 @@ class TestSessionLog(unittest.TestCase):
             {"type": "message", "seq": 1, "ts": "t", "role": "user", "content": "nested task"},
         ])
         messages, _ = h.resume_session("chain.1.2")
-        self.assertEqual(h.SESSION_ID, "chain.1.2")
+        self.assertEqual(h.state.SESSION_ID, "chain.1.2")
         # The chain keeps its place: a sub-agent of the resumed run nests under it.
-        self.assertEqual(h._session_path(h.SESSION_ID, "1"),
+        self.assertEqual(h._session_path(h.state.SESSION_ID, "1"),
                          os.path.join(self.sessions, "chain.1.2.1.jsonl"))
         self.assertEqual(messages[0]["content"], "nested task")
 
@@ -6885,8 +6899,8 @@ class TestSessionLog(unittest.TestCase):
         self.assertIn("1 sub-agent logs", out)
         self.assertIn("5 messages", out)  # system, user, the task call, its result, the reply
         self.assertIn("/resume <session-id>", out)
-        h.SESSION_FILES.pop(h.MAIN_CONV_ID, None)
-        h.SESSION_ID = ""
+        h.state.SESSION_FILES.pop(h.state.MAIN_CONV_ID, None)
+        h.state.SESSION_ID = ""
         for name in os.listdir(self.sessions):
             os.remove(os.path.join(self.sessions, name))
         self.assertEqual(h.format_sessions(), f"no session logs in {self.sessions}")
@@ -6897,7 +6911,7 @@ class TestSessionLog(unittest.TestCase):
         self.assertIn("session: test-session", out)
         self.assertIn("test-session.jsonl", out)
         self.assertIn("sub-agents:", out)
-        h.SESSION_LOG = False
+        h.state.SESSION_LOG = False
         self.assertIn("session log: off", h.format_status([{"role": "user", "content": "hi"}]))
 
     # ---- CLI plumbing
@@ -7074,31 +7088,31 @@ class TestCompaction(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
         os.makedirs(self.tmp, exist_ok=True)
         self.sessions = os.path.join(self.tmp, "sessions")
-        self._saved = {name: getattr(h, name) for name in self.ATTRS}
+        self._saved = {name: getattr(_holder(name), name) for name in self.ATTRS}
         self._saved_state = (
-            dict(h.SESSION_FILES), dict(h.SESSION_SEQ), dict(h.SESSION_MSG_SEQ),
-            dict(h.SUBAGENT_CHILDREN), dict(h.USAGE_BY_CONV), dict(h.COMPACT_STATS),
+            dict(h.state.SESSION_FILES), dict(h.state.SESSION_SEQ), dict(h.state.SESSION_MSG_SEQ),
+            dict(h.state.SUBAGENT_CHILDREN), dict(h.state.USAGE_BY_CONV), dict(h.state.COMPACT_STATS),
         )
-        h.SESSION_DIR = self.sessions
-        h.SESSION_LOG = True
-        h.SESSION_WARNED = False
-        h.SESSION_ID = ""
+        h.state.SESSION_DIR = self.sessions
+        h.state.SESSION_LOG = True
+        h.state.SESSION_WARNED = False
+        h.state.SESSION_ID = ""
         h._session_new_id = lambda: "test-session"
-        h.AGENT_LOG_ID = ""
-        h.OUTPUT_INDENT = ""
-        h.MODEL = "test-model"
-        h.TEMPERATURE = 0.2
-        h._AGENT_DEPTH = 0
-        h.MAX_SUBAGENT_DEPTH = 3
-        h.SUBAGENT_STEP_LIMIT = 0
-        h.TODO_FILE = os.path.join(self.tmp, ".harnless", "todo.md")
+        h.state.AGENT_LOG_ID = ""
+        h.state.OUTPUT_INDENT = ""
+        h.state.MODEL = "test-model"
+        h.state.TEMPERATURE = 0.2
+        h.state._AGENT_DEPTH = 0
+        h.state.MAX_SUBAGENT_DEPTH = 3
+        h.state.SUBAGENT_STEP_LIMIT = 0
+        h.state.TODO_FILE = os.path.join(self.tmp, ".harnless", "todo.md")
         # Small numbers on purpose: a handful of fat messages is enough to cross them,
         # and the shapes of the result stay readable in a failure message.
-        h.CONTEXT_WINDOW = 4000
-        h.AUTO_COMPACT = True
-        h.COMPACT_THRESHOLD_PCT = 85
-        h.COMPACT_MAX_ATTEMPTS = 1
-        h.COMPACT_SUMMARY_TRIMS = 3
+        h.state.CONTEXT_WINDOW = 4000
+        h.state.AUTO_COMPACT = True
+        h.state.COMPACT_THRESHOLD_PCT = 85
+        h.state.COMPACT_MAX_ATTEMPTS = 1
+        h.state.COMPACT_SUMMARY_TRIMS = 3
         h._open_request = self._saved["_open_request"]
         self.notes = []  # every request the summariser was asked to write
         self.turns = []  # what each model turn was actually shown
@@ -7117,12 +7131,12 @@ class TestCompaction(unittest.TestCase):
 
     def tearDown(self):
         for name, value in self._saved.items():
-            setattr(h, name, value)
+            setattr(_holder(name), name, value)
         files, seq, msg_seq, children, usage, stats = self._saved_state
         for target, saved in (
-            (h.SESSION_FILES, files), (h.SESSION_SEQ, seq), (h.SESSION_MSG_SEQ, msg_seq),
-            (h.SUBAGENT_CHILDREN, children), (h.USAGE_BY_CONV, usage),
-            (h.COMPACT_STATS, stats),
+            (h.state.SESSION_FILES, files), (h.state.SESSION_SEQ, seq), (h.state.SESSION_MSG_SEQ, msg_seq),
+            (h.state.SUBAGENT_CHILDREN, children), (h.state.USAGE_BY_CONV, usage),
+            (h.state.COMPACT_STATS, stats),
         ):
             target.clear()
             target.update(saved)
@@ -7148,7 +7162,7 @@ class TestCompaction(unittest.TestCase):
         seen = {}
 
         def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
-            depth = h._AGENT_DEPTH
+            depth = h.state._AGENT_DEPTH
             turn = seen.get(depth, 0)
             seen[depth] = turn + 1
             self.turns.append(list(messages))
@@ -7173,24 +7187,24 @@ class TestCompaction(unittest.TestCase):
                     "tool_call_id": f"c{i}",
                     "content": "z" * (tool_size if tool_size is not None else 20_000),
                 })
-        h._session_messages(messages, h.MAIN_CONV_ID)
+        h._session_messages(messages, h.state.MAIN_CONV_ID)
         return messages
 
     def _compact(self, messages, reason="manual"):
         return h.compact_messages(
-            messages, h.MAIN_CONV_ID, model="test-model", reason=reason, interactive=True
+            messages, h.state.MAIN_CONV_ID, model="test-model", reason=reason, interactive=True
         )
 
     def _run(self, **kw):
         """A real top-level run against a seeded conversation (stream_once scripted)."""
         h.start_session(kw.pop("mode", "interactive"))
         messages = [{"role": "system", "content": "sys"}] + list(kw.pop("seed", []))
-        h._session_messages(messages, h.MAIN_CONV_ID)
+        h._session_messages(messages, h.state.MAIN_CONV_ID)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             code = h.run_agent(
                 messages, "test-model", interactive=True, temperature=0.2,
-                conv_id=h.MAIN_CONV_ID,
+                conv_id=h.state.MAIN_CONV_ID,
             )
         return code, messages, buf.getvalue()
 
@@ -7241,29 +7255,29 @@ class TestCompaction(unittest.TestCase):
         summary = messages[1]
         self.assertEqual(summary["role"], "user")  # a user message: chat templates
         # reject a system message anywhere but the first (the todo reminder's trick)
-        self.assertTrue(summary["content"].startswith(h.COMPACT_SUMMARY_HEADER))
+        self.assertTrue(summary["content"].startswith(h.config.COMPACT_SUMMARY_HEADER))
         self.assertIn("HANDOFF NOTE", summary["content"])
         tail = messages[2:]
-        self.assertEqual(len(tail), h.COMPACT_KEEP_MIN_MESSAGES)
-        for kept, original in zip(tail, untouched[-h.COMPACT_KEEP_MIN_MESSAGES:]):
+        self.assertEqual(len(tail), h.config.COMPACT_KEEP_MIN_MESSAGES)
+        for kept, original in zip(tail, untouched[-h.config.COMPACT_KEEP_MIN_MESSAGES:]):
             self.assertIs(kept, original)  # verbatim: the same objects, untouched
 
     def test_tail_floor_keeps_real_turns_whatever_the_budget_says(self):
-        h.CONTEXT_WINDOW = 100  # a 25-token tail budget: the token rule wants no tail
+        h.state.CONTEXT_WINDOW = 100  # a 25-token tail budget: the token rule wants no tail
         messages = self._seed(8)
         self.assertTrue(self._compact(messages)[0])
-        self.assertGreaterEqual(len(messages) - 2, h.COMPACT_KEEP_MIN_MESSAGES)
+        self.assertGreaterEqual(len(messages) - 2, h.config.COMPACT_KEEP_MIN_MESSAGES)
 
     def test_refuses_below_the_minimum(self):
         messages = self._seed(2)  # 5 messages
         ok, note = self._compact(messages)
         self.assertFalse(ok)
-        self.assertIn(str(h.COMPACT_MIN_MESSAGES), note)
+        self.assertIn(str(h.state.COMPACT_MIN_MESSAGES), note)
         self.assertEqual(len(messages), 5)
         self.assertEqual(self._compacts(), [])  # nothing done, nothing recorded
 
     def test_refuses_when_nothing_is_older_than_the_tail(self):
-        h.CONTEXT_WINDOW = 10_000_000  # the tail budget covers the whole conversation
+        h.state.CONTEXT_WINDOW = 10_000_000  # the tail budget covers the whole conversation
         messages = self._seed(8)
         before = list(messages)
         ok, note = self._compact(messages)
@@ -7305,10 +7319,10 @@ class TestCompaction(unittest.TestCase):
         self.assertEqual(h._compact_cut(messages, 405), 17)  # nudged past both answers
 
     def test_a_tool_answer_never_outlives_its_call(self):
-        h.CONTEXT_WINDOW = 1620  # a 405-token tail budget: the cut lands mid-batch
+        h.state.CONTEXT_WINDOW = 1620  # a 405-token tail budget: the cut lands mid-batch
         messages = self._straddling()
         h.start_session("interactive")
-        h._session_messages(messages, h.MAIN_CONV_ID)
+        h._session_messages(messages, h.state.MAIN_CONV_ID)
         self.assertTrue(self._batches_intact(messages))
         self.assertTrue(self._compact(messages)[0])
         self.assertTrue(self._batches_intact(messages))
@@ -7322,7 +7336,7 @@ class TestCompaction(unittest.TestCase):
         request = self._summary_request()
         self.assertFalse(self.notes[0]["send_tools"])
         self.assertEqual(request[0]["role"], "system")
-        self.assertEqual(request[0]["content"], h.COMPACT_SUMMARY_PROMPT)
+        self.assertEqual(request[0]["content"], h.config.COMPACT_SUMMARY_PROMPT)
         body = h._request_body(request, "test-model", send_tools=False)
         self.assertNotIn("tools", body)
         self.assertNotIn("tool_choice", body)  # no tool_choice without tools to choose
@@ -7339,7 +7353,7 @@ class TestCompaction(unittest.TestCase):
         content = messages[1]["content"]
         self.assertIn("[truncated:", content)
         self.assertLess(
-            len(content), h.COMPACT_SUMMARY_LIMIT + len(h.COMPACT_SUMMARY_HEADER) + 600
+            len(content), h.config.COMPACT_SUMMARY_LIMIT + len(h.config.COMPACT_SUMMARY_HEADER) + 600
         )
 
     def test_the_note_says_where_the_replaced_turns_are(self):
@@ -7371,13 +7385,13 @@ class TestCompaction(unittest.TestCase):
         # The summary takes the seq the record promised: the record's own + 1.
         self.assertEqual(record["summary_seq"], record["seq"] + 1)
         self.assertEqual(
-            recorded[record["summary_seq"]]["content"][: len(h.COMPACT_SUMMARY_HEADER)],
-            h.COMPACT_SUMMARY_HEADER,
+            recorded[record["summary_seq"]]["content"][: len(h.config.COMPACT_SUMMARY_HEADER)],
+            h.config.COMPACT_SUMMARY_HEADER,
         )
         self.assertEqual(record["summary"], "model")
         self.assertIsNone(record["summary_error"])
         # The seq list keeps describing the conversation it is paired with.
-        entries = h.SESSION_MSG_SEQ[h.MAIN_CONV_ID]
+        entries = h.state.SESSION_MSG_SEQ[h.state.MAIN_CONV_ID]
         self.assertEqual(len(entries), len(messages))
         self.assertEqual(entries[1], record["summary_seq"])
 
@@ -7385,10 +7399,10 @@ class TestCompaction(unittest.TestCase):
         messages = self._seed(8)
         self._compact(messages)
         messages.append({"role": "user", "content": "next " + "x" * 2000})
-        h._session_message(messages[-1], h.MAIN_CONV_ID)
+        h._session_message(messages[-1], h.state.MAIN_CONV_ID)
         seqs = [r["seq"] for r in self._log()]
         self.assertEqual(seqs, list(range(len(seqs))))  # gapless, no seq reused
-        self.assertEqual(max(seqs), h.SESSION_SEQ[h.MAIN_CONV_ID] - 1)
+        self.assertEqual(max(seqs), h.state.SESSION_SEQ[h.state.MAIN_CONV_ID] - 1)
 
     def test_starting_a_session_starts_a_fresh_log(self):
         self._seed(8)
@@ -7406,8 +7420,8 @@ class TestCompaction(unittest.TestCase):
         # The way main() puts a fresh system prompt in front of restored turns — with
         # _session_prepend, so the seq list stays aligned with the conversation.
         resumed.insert(0, {"role": "system", "content": "sys again"})
-        h._session_prepend(resumed[0], h.MAIN_CONV_ID)
-        entries = h.SESSION_MSG_SEQ[h.MAIN_CONV_ID]
+        h._session_prepend(resumed[0], h.state.MAIN_CONV_ID)
+        entries = h.state.SESSION_MSG_SEQ[h.state.MAIN_CONV_ID]
         self.assertEqual(len(entries), len(resumed))
         self.assertEqual(entries[0], last_seq + 2)  # resume marker, then the new prompt
         self.assertEqual(entries[1], 2)  # the first restored turn keeps its own seq
@@ -7419,7 +7433,7 @@ class TestCompaction(unittest.TestCase):
         self._compact(messages)
         extra = [{"role": "user", "content": f"more{i} " + "x" * 2000} for i in range(8)]
         messages.extend(extra)
-        h._session_messages(extra, h.MAIN_CONV_ID)
+        h._session_messages(extra, h.state.MAIN_CONV_ID)
         self.notes.clear()
         self.assertTrue(self._compact(messages)[0])
         self.assertEqual(len(self._compacts()), 2)
@@ -7495,7 +7509,7 @@ class TestCompaction(unittest.TestCase):
                 {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 5000}},
                 {"type": "image_url", "image_url": {"url": "http://x/y.png"}},
             ],
-        }, h.MAIN_CONV_ID)
+        }, h.state.MAIN_CONV_ID)
         out = h.tool_sessions({"action": "read"})
         self.assertIn("what is in this screenshot?", out)
         self.assertIn("[image elided in the session log", out)  # the pixels stay out of the transcript
@@ -7505,7 +7519,7 @@ class TestCompaction(unittest.TestCase):
     def test_a_long_turn_is_clipped_and_says_where_the_rest_is(self):
         h.start_session("interactive")
         h._session_message(
-            {"role": "assistant", "content": "b" * (h.SESSION_RECORD_CHARS + 400)}, h.MAIN_CONV_ID
+            {"role": "assistant", "content": "b" * (h.config.SESSION_RECORD_CHARS + 400)}, h.state.MAIN_CONV_ID
         )
         out = h.tool_sessions({"action": "read"})
         self.assertIn("[truncated:", out)
@@ -7547,7 +7561,7 @@ class TestCompaction(unittest.TestCase):
         before = len(messages)
         ok, report = self._compact(messages)
         self.assertTrue(ok)  # dropping the head is what made the room: that still happens
-        self.assertIn(h.COMPACT_FALLBACK_NOTE, messages[1]["content"])
+        self.assertIn(h.config.COMPACT_FALLBACK_NOTE, messages[1]["content"])
         self.assertLess(len(messages), before)
         record = self._compacts()[0]
         self.assertEqual(record["summary"], "fallback")
@@ -7578,13 +7592,13 @@ class TestCompaction(unittest.TestCase):
         bodies = [m.get("content") or "" for m in self._summary_request() if m.get("role") == "tool"]
         self.assertTrue(bodies)
         self.assertTrue(any("harnless elided" in b for b in bodies))
-        self.assertLess(max(len(b) for b in bodies), h.COMPACT_TOOL_RESULT_KEEP + 400)
+        self.assertLess(max(len(b) for b in bodies), h.config.COMPACT_TOOL_RESULT_KEEP + 400)
         pruned_size = len(json.dumps(self._summary_request()))
         pruned_saving = self._compacts()[0]["pruned_chars"]
-        self.assertGreaterEqual(pruned_saving, 30_000 - h.COMPACT_TOOL_RESULT_KEEP)
+        self.assertGreaterEqual(pruned_saving, 30_000 - h.config.COMPACT_TOOL_RESULT_KEEP)
 
         self.notes.clear()
-        h.COMPACT_PRUNE_TOOL_RESULTS = False
+        h.state.COMPACT_PRUNE_TOOL_RESULTS = False
         messages = self._seed(8, tool_at=2, tool_size=30_000)
         self.assertTrue(self._compact(messages)[0])
         whole_bodies = [m.get("content") or "" for m in self._summary_request() if m.get("role") == "tool"]
@@ -7595,8 +7609,8 @@ class TestCompaction(unittest.TestCase):
         # it never fits, and the note gets written without ever seeing it.
         self.assertTrue(bodies)  # pruned: the turn was there
         self.assertEqual(whole_bodies, [])  # unpruned: the same turn did not fit at all
-        self.assertGreater(pruned_saving, h.COMPACT_TOOL_RESULT_KEEP)
-        self.assertLess(pruned_size + pruned_saving, h.TOOL_RESULT_LIMIT)
+        self.assertGreater(pruned_saving, h.config.COMPACT_TOOL_RESULT_KEEP)
+        self.assertLess(pruned_size + pruned_saving, h.config.TOOL_RESULT_LIMIT)
 
     def test_a_small_tool_result_is_not_pruned_at_all(self):
         messages = self._seed(8, tool_at=2, tool_size=600)  # under the keep size
@@ -7625,7 +7639,7 @@ class TestCompaction(unittest.TestCase):
                 "content": f"a{i}",
                 "reasoning_content": "r" * 4000,
             })
-        h._session_messages(messages, h.MAIN_CONV_ID)
+        h._session_messages(messages, h.state.MAIN_CONV_ID)
         current = messages[-1]  # the thinking that produced the turn in progress
         self.assertTrue(self._compact(messages)[0])
         assistants = [m for m in messages[2:] if m.get("role") == "assistant"]
@@ -7640,10 +7654,10 @@ class TestCompaction(unittest.TestCase):
         self.assertEqual(self._compacts()[0]["pruned_chars"], 7 * 4000)
 
     def test_the_reasoning_switch_off_leaves_it_in_place(self):
-        h.COMPACT_DROP_REASONING = False
+        h.state.COMPACT_DROP_REASONING = False
         messages = self._seed(8)
         messages.append({"role": "assistant", "content": "late", "reasoning_content": "r" * 4000})
-        h._session_message(messages[-1], h.MAIN_CONV_ID)
+        h._session_message(messages[-1], h.state.MAIN_CONV_ID)
         self.assertTrue(self._compact(messages)[0])
         self.assertEqual(messages[-1].get("reasoning_content"), "r" * 4000)
         self.assertEqual(self._compacts()[0]["pruned_chars"], 0)
@@ -7660,7 +7674,7 @@ class TestCompaction(unittest.TestCase):
         return self._run(seed=seed)
 
     def test_usage_over_the_threshold_compacts_before_the_next_request(self):
-        h.USAGE_BY_CONV[h.MAIN_CONV_ID] = {"prompt_tokens": 3_900, "completion_tokens": 10}
+        h.state.USAGE_BY_CONV[h.state.MAIN_CONV_ID] = {"prompt_tokens": 3_900, "completion_tokens": 10}
         self._scripted(
             lambda m, d, t: (self._tool_turn("get_cwd", {}, "c1"), True)
             if t == 0 else ({"role": "assistant", "content": "done"}, True)
@@ -7670,22 +7684,22 @@ class TestCompaction(unittest.TestCase):
         code, messages, out = self._run(seed=seed)
         self.assertEqual(code, 0)
         self.assertEqual([r["reason"] for r in self._compacts()], ["proactive"])
-        self.assertEqual(messages[1]["content"][: len(h.COMPACT_SUMMARY_HEADER)],
-                         h.COMPACT_SUMMARY_HEADER)
+        self.assertEqual(messages[1]["content"][: len(h.config.COMPACT_SUMMARY_HEADER)],
+                         h.config.COMPACT_SUMMARY_HEADER)
         # What the model was shown was the compacted conversation, not the one that
         # would not have fit: 8 seed turns + system became the tail plus the note.
         self.assertLess(len(self.turns[0]), len(seed) + 1)
         self.assertIn("compacted", out)
-        self.assertEqual(h.COMPACT_STATS[h.MAIN_CONV_ID]["rounds"], 1)
+        self.assertEqual(h.state.COMPACT_STATS[h.state.MAIN_CONV_ID]["rounds"], 1)
 
     def test_the_trigger_measures_what_the_server_reported_when_it_can(self):
-        h.CONTEXT_WINDOW = 20_000  # threshold 17,000 tokens
+        h.state.CONTEXT_WINDOW = 20_000  # threshold 17,000 tokens
         seed = [{"role": "user", "content": f"u{i} " + "x" * 2000} for i in range(8)]
         seed += [{"role": "assistant", "content": f"a{i}"} for i in range(8)]
         self.assertLess(
-            h.estimate_context_tokens(seed, True), 20_000 * h.COMPACT_THRESHOLD_PCT // 100
+            h.estimate_context_tokens(seed, True), 20_000 * h.state.COMPACT_THRESHOLD_PCT // 100
         )  # the estimate alone would not have triggered it
-        h.USAGE_BY_CONV[h.MAIN_CONV_ID] = {"prompt_tokens": 18_000}
+        h.state.USAGE_BY_CONV[h.state.MAIN_CONV_ID] = {"prompt_tokens": 18_000}
         code, _, _ = self._seeded_run(decide=lambda m, d, t: (
             (self._tool_turn("get_cwd", {}, "c1"), True) if t == 0
             else ({"role": "assistant", "content": "done"}, True)
@@ -7694,11 +7708,11 @@ class TestCompaction(unittest.TestCase):
         self.assertEqual([r["reason"] for r in self._compacts()], ["proactive"])
 
     def test_the_proactive_trigger_ignores_what_compaction_cannot_shrink(self):
-        h.CONTEXT_WINDOW = 3000  # threshold 2550 tokens
+        h.state.CONTEXT_WINDOW = 3000  # threshold 2550 tokens
         seed = [{"role": "user", "content": f"u{i}"} for i in range(6)]
         seed += [{"role": "assistant", "content": f"a{i}"} for i in range(6)]
         request = [{"role": "system", "content": "sys"}] + seed
-        threshold = h.CONTEXT_WINDOW * h.COMPACT_THRESHOLD_PCT // 100
+        threshold = h.state.CONTEXT_WINDOW * h.state.COMPACT_THRESHOLD_PCT // 100
         # The tool schemas ride along with every request, and here they alone are over
         # the threshold while the conversation is nowhere near it. Compacting would cut
         # turns that were never what filled the context — that overflow is the reactive
@@ -7717,15 +7731,15 @@ class TestCompaction(unittest.TestCase):
         messages = [{"role": "system", "content": "sys"}]
         messages += [{"role": "user", "content": f"u{i} " + "x" * 2000} for i in range(8)]
         messages += [{"role": "assistant", "content": f"a{i}"} for i in range(8)]
-        h._session_messages(messages, h.MAIN_CONV_ID)
+        h._session_messages(messages, h.state.MAIN_CONV_ID)
         return messages
 
     def test_a_reported_usage_is_what_the_tail_budget_is_counted_against(self):
-        h.CONTEXT_WINDOW = 20_000  # a 5000-token tail budget
+        h.state.CONTEXT_WINDOW = 20_000  # a 5000-token tail budget
         ours = self._spread_seed()
         self.assertFalse(self._compact(ours)[0])  # our estimate fits the tail: nothing to drop
         reported = self._spread_seed()
-        h.USAGE_BY_CONV[h.MAIN_CONV_ID] = {"prompt_tokens": 18_000}
+        h.state.USAGE_BY_CONV[h.state.MAIN_CONV_ID] = {"prompt_tokens": 18_000}
         self.assertTrue(self._compact(reported)[0])  # the server's number says otherwise
         record = self._compacts()[0]
         self.assertEqual(record["used_tokens"], 18_000)
@@ -7733,8 +7747,8 @@ class TestCompaction(unittest.TestCase):
         self.assertGreater(record["token_scale"], 1.0)  # so the cut is made in its units
 
     def test_auto_compact_off_leaves_the_context_as_it_is(self):
-        h.AUTO_COMPACT = False
-        h.USAGE_BY_CONV[h.MAIN_CONV_ID] = {"prompt_tokens": 3_900}
+        h.state.AUTO_COMPACT = False
+        h.state.USAGE_BY_CONV[h.state.MAIN_CONV_ID] = {"prompt_tokens": 3_900}
         code, messages, _ = self._seeded_run(count=10, size=2000)
         self.assertEqual(code, 0)
         self.assertEqual(self._compacts(), [])
@@ -7742,16 +7756,16 @@ class TestCompaction(unittest.TestCase):
         self.assertEqual(len(messages), 22)  # system + 20 seeded turns + the reply
 
     def test_no_known_window_means_no_proactive_compaction(self):
-        h.CONTEXT_WINDOW = 0
+        h.state.CONTEXT_WINDOW = 0
         code, _, _ = self._seeded_run(count=10, size=2000)
         self.assertEqual(code, 0)
         self.assertEqual(self._compacts(), [])
         self.assertEqual(self.notes, [])
 
     def test_a_context_that_cannot_be_compacted_says_so_once(self):
-        h.COMPACT_MIN_MESSAGES = 2  # long enough to try, but:
-        h.COMPACT_KEEP_TOKENS_PCT = 100  # the tail budget is the whole window
-        h.USAGE_BY_CONV[h.MAIN_CONV_ID] = {"prompt_tokens": 3_900}
+        h.state.COMPACT_MIN_MESSAGES = 2  # long enough to try, but:
+        h.state.COMPACT_KEEP_TOKENS_PCT = 100  # the tail budget is the whole window
+        h.state.USAGE_BY_CONV[h.state.MAIN_CONV_ID] = {"prompt_tokens": 3_900}
         self._scripted(
             lambda m, d, t: (self._tool_turn("get_cwd", {}, f"c{t}"), True)
             if t < 2 else ({"role": "assistant", "content": "done"}, True)
@@ -7785,10 +7799,10 @@ class TestCompaction(unittest.TestCase):
         self.assertEqual([r["reason"] for r in self._compacts()], ["overflow"])
         self.assertIn("n_ctx", out)  # what the server actually said, passed along
         self.assertIn("retrying", out)
-        self.assertIn(h.COMPACT_SUMMARY_HEADER, messages[1]["content"])
+        self.assertIn(h.config.COMPACT_SUMMARY_HEADER, messages[1]["content"])
 
     def test_prompt_that_is_still_too_big_ends_the_run_with_the_overflow_code(self):
-        h.COMPACT_KEEP_TOKENS_PCT = 100  # nothing can be dropped: the tail is everything
+        h.state.COMPACT_KEEP_TOKENS_PCT = 100  # nothing can be dropped: the tail is everything
         seed = [{"role": "user", "content": f"u{i} " + "x" * 1200} for i in range(8)]
         self._scripted(
             lambda m, d, t: (_ for _ in ()).throw(
@@ -7796,7 +7810,7 @@ class TestCompaction(unittest.TestCase):
             )
         )
         code, _, out = self._run(seed=seed)
-        self.assertEqual(code, h.CONTEXT_OVERFLOW_CODE)
+        self.assertEqual(code, h.config.CONTEXT_OVERFLOW_CODE)
         self.assertEqual(self._compacts(), [])
         self.assertIn("compaction cannot help", out)
 
@@ -7809,19 +7823,19 @@ class TestCompaction(unittest.TestCase):
             )
         )
         code, _, out = self._run(seed=seed)
-        self.assertEqual(code, h.CONTEXT_OVERFLOW_CODE)  # not 1, not 0: its own code
-        self.assertNotEqual(code, h.SUBAGENT_STEP_LIMIT_CODE)
+        self.assertEqual(code, h.config.CONTEXT_OVERFLOW_CODE)  # not 1, not 0: its own code
+        self.assertNotEqual(code, h.config.SUBAGENT_STEP_LIMIT_CODE)
         self.assertEqual(len(self._compacts()), 1)  # COMPACT_MAX_ATTEMPTS, not more
         self.assertIn("out of context", out)
         self.assertIn("test-session", out)  # names the transcript that still has it
         self.assertIn("sessions", out)
 
     def test_overflow_when_auto_compaction_is_off_says_so(self):
-        h.AUTO_COMPACT = False
+        h.state.AUTO_COMPACT = False
         seed = [{"role": "user", "content": f"u{i} " + "x" * 1200} for i in range(8)]
         self._overflow_once()
         code, _, out = self._run(seed=seed)
-        self.assertEqual(code, h.CONTEXT_OVERFLOW_CODE)
+        self.assertEqual(code, h.config.CONTEXT_OVERFLOW_CODE)
         self.assertEqual(self._compacts(), [])
         self.assertIn("auto-compaction is off", out)
 
@@ -7845,7 +7859,7 @@ class TestCompaction(unittest.TestCase):
         code, _, out = self._run(seed=seed)
         # The fallback is a request too: whichever path the server refused, a prompt
         # still too big after the one compaction ends the run the same way.
-        self.assertEqual(code, h.CONTEXT_OVERFLOW_CODE)
+        self.assertEqual(code, h.config.CONTEXT_OVERFLOW_CODE)
         self.assertEqual([r["reason"] for r in self._compacts()], ["overflow"])
         self.assertEqual(len(self.notes), 1)  # one note, one retry — not a loop
         self.assertIn("out of context", out)
@@ -7907,7 +7921,7 @@ class TestCompaction(unittest.TestCase):
         conv_id = 7
         h.start_session("interactive")  # the parent's log exists, and stays untouched
         h._session_open(
-            conv_id, h._session_path(h.SESSION_ID, "1"),
+            conv_id, h._session_path(h.state.SESSION_ID, "1"),
             {"depth": 1, "mode": "sub-agent", "subagent_id": "1"},
         )
         sub = [{"role": "system", "content": "sub sys"}, {"role": "user", "content": "the task"}]
@@ -7915,7 +7929,7 @@ class TestCompaction(unittest.TestCase):
             sub.append({"role": "assistant", "content": f"a{i} " + "y" * 1600})
             sub.append({"role": "user", "content": f"u{i} " + "x" * 1600})
         h._session_messages(sub, conv_id)
-        h.USAGE_BY_CONV[conv_id] = {"prompt_tokens": 9_000}  # over 85% of the window
+        h.state.USAGE_BY_CONV[conv_id] = {"prompt_tokens": 9_000}  # over 85% of the window
         self._scripted(lambda m, d, t: ({"role": "assistant", "content": "sub done"}, True))
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -7925,6 +7939,6 @@ class TestCompaction(unittest.TestCase):
         self.assertEqual([r["reason"] for r in self._compacts("test-session.1.jsonl")],
                          ["proactive"])
         self.assertEqual(self._compacts(), [])  # a sub-agent's room is its own business
-        self.assertIn(h.COMPACT_SUMMARY_HEADER, sub[1]["content"])
+        self.assertIn(h.config.COMPACT_SUMMARY_HEADER, sub[1]["content"])
 if __name__ == "__main__":
     unittest.main(verbosity=2)

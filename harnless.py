@@ -22,315 +22,20 @@ import urllib.error
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-VERSION = "1.8.2"
-API_URL = "http://127.0.0.1:11434/v1/chat/completions"
-API_KEY = None
-MODEL = "local-model"
-TEMPERATURE = 1.0
-MAX_SUBAGENT_DEPTH = 2
-SUBAGENT_DEPTH_CEILING = 10  # sanity clamp for --max-subagents
-# Runaway guard: how many model turns (API calls) a single sub-agent may take
-# before its run is stopped; 0 disables the guard. Only sub-agents are capped —
-# a top-level agent is steered by the user, who can always double-ESC it.
-SUBAGENT_STEP_LIMIT = 500
-SUBAGENT_STEPS_CEILING = 10_000  # sanity clamp for --max-subagent-steps
-SUBAGENT_STEP_LIMIT_CODE = 4  # exit code reported to the parent when the guard fires
-# A capped sub-agent gets one closing turn instead of stopping cold: a run that
-# ends on a tool-call turn leaves tool_task with no text to hand the parent.
-STEP_LIMIT_CLOSE_PROMPT = (
-    "You have reached the harness step limit for this sub-agent. Do not call any "
-    "more tools. Reply now with only the final summary the parent will receive: "
-    "self-contained findings with file paths and line numbers, decisions, and "
-    "caveats."
-)
-# Shown to the delegating agent when a sub-agent produced no hand-off text at
-# all. The sub-agent's printed output never enters the parent's context, so an
-# empty result has to say so — otherwise "nothing found" and "summary lost"
-# look identical and the parent redoes the work.
-NO_SUMMARY_NOTE = (
-    "(sub-agent returned no final summary — the output it printed is not part of "
-    "your context, so this task is still undone: delegate a narrower task or do it yourself)"
-)
-# Prefix on a hand-off recovered from less explicit places (a reasoning-only
-# turn, or narration from before the final turn) so the parent knows the text
-# was salvaged, not written as a summary.
-SALVAGED_SUMMARY_NOTE = "(no closing summary from the sub-agent; its last output follows)"
-# Current sub-agent nesting level: depth 0 = top-level agent. Scoped to each
-# run_agent call (set on entry, restored on exit — see run_agent).
-_AGENT_DEPTH = 0
-OUTPUT_INDENT = ""
-CWD = os.getcwd()
-VISION_ENABLED = True
-# Double-ESC streaming interrupt: enabled for interactive REPL sessions
-# (set in main()); two ESC presses within this window cancel the stream.
-INTERRUPT_ENABLED = False
-DOUBLE_ESC_WINDOW = 2.0
-# Auto-send mode (REPL only): True (default) — Enter submits the line;
-# False — Enter inserts a newline and Ctrl+Enter submits (Ctrl+D also
-# submits a non-empty line, which is the reliable send key on POSIX where
-# Ctrl+Enter is not distinguishable from Enter). Toggled with /auto-send.
-AUTO_SEND = True
-# Show a "sending context" progress line while waiting for the LLM's first
-# token, for large requests only (estimated token count, chars/4, including
-# the tool schemas). The line appears CONTEXT_PROGRESS_DELAY seconds in,
-# reports request-body upload progress (percent + tokens sent so far) while
-# the payload is being sent, then the elapsed wait. Active only on a TTY.
-CONTEXT_PROGRESS_THRESHOLD = 30_000
-CONTEXT_PROGRESS_DELAY = 1.0
-# Chunk size the counting opener writes the request body in, so upload
-# progress is observable (http.client would otherwise sendall() it at once).
-PROGRESS_CHUNK = 64 * 1024
-MAX_IMAGE_BYTES = 20 * 1024 * 1024
-MAX_REMOTE_BYTES = 10 * 1024 * 1024
-# Output caps. Two layers: a tool's `limit`-style argument is model-facing (the
-# agent can ask for less), the constants below are the harness-side ceiling it
-# cannot exceed. TOOL_RESULT_LIMIT is the final backstop in execute_tool, kept
-# above every per-tool cap so a tool that already trimmed is never trimmed twice.
-TOOL_RESULT_LIMIT = 60_000  # any single tool result (chars)
-READ_FILE_LIMIT = 50_000  # read_file and @[cwd://] refs (chars)
-SHELL_OUTPUT_LIMIT = 20_000  # run_shell stdout+stderr (chars)
-FETCH_TEXT_LIMIT = 50_000  # fetch_url body text (chars)
-GREP_MATCH_LIMIT = 200  # grep matching lines (count)
-GREP_LINE_LIMIT = 400  # grep: chars kept per matched line
-GREP_TEXT_LIMIT = 30_000  # grep: whole result (chars)
-LIST_LIMIT = 500  # glob / list_dir entries (count)
-MAX_COUNT_LIMIT = 5_000  # ceiling on a model-supplied count-based limit
-MCP_RESULT_LIMIT = 30_000  # MCP tools/call result (chars)
-SUBAGENT_SUMMARY_LIMIT = 20_000  # task: sub-agent final summary (chars)
-TODO_BLOCK_LIMIT = 8_000  # todo render + reminder injection (chars)
-MEMORY_BLOCK_LIMIT = 12_000  # memory notes injected into the system prompt (chars)
-AGENTS_MD_LIMIT = 20_000  # AGENTS.md appended to the system prompt (chars)
-SESSION_READ_LIMIT = 30_000  # sessions: transcript text returned from the log (chars)
-SESSION_RECORD_CHARS = 2_000  # sessions: chars kept of one recorded message
-# Search filtering: grep/glob skip what git would not have shown in the same
-# directory. GITIGNORE_ANCESTOR_SCAN bounds how far up from the searched
-# directory those files are looked for (it stops earlier at the .git directory).
-GITIGNORE_NAME = ".gitignore"
-GITIGNORE_SKIP_NAMES = (".git", "node_modules", "__pycache__")  # always skipped
-GITIGNORE_ANCESTOR_SCAN = 16
-# Context compaction: the answer to "the context is full". Older turns are
-# replaced by one model-written handoff note and the recent turns stay verbatim.
-# Two triggers: proactive (usage crosses COMPACT_THRESHOLD_PCT of CONTEXT_WINDOW)
-# and reactive (the server rejects the prompt as too long). Nothing is lost for
-# good — every message is journaled to the session log (see below).
-CONTEXT_WINDOW = 0  # window in tokens (probed or --context-window); 0 = unknown
-AUTO_COMPACT = True  # compact automatically; --no-auto-compact / /auto-compact off
-COMPACT_THRESHOLD_PCT = 85  # auto-compact once usage reaches this % of the window
-COMPACT_THRESHOLD_CEILING = 99  # sanity clamp for --compact-threshold
-COMPACT_KEEP_TOKENS_PCT = 25  # verbatim tail budget, as a % of the window
-COMPACT_KEEP_MIN_MESSAGES = 6  # floor on the verbatim tail (message count)
-COMPACT_MIN_MESSAGES = 8  # below this many messages, refuse to compact
-COMPACT_PRUNE_TOOL_RESULTS = True  # elide tool results that fall out of the tail
-COMPACT_TOOL_RESULT_KEEP = 1_500  # chars kept of an elided tool result (head+tail)
-COMPACT_DROP_REASONING = True  # stop replaying reasoning_content of old turns
-COMPACT_SUMMARY_LIMIT = 4_000  # chars kept from the generated handoff note
-COMPACT_MAX_ATTEMPTS = 1  # compact-and-retry budget after a reactive overflow
-COMPACT_SUMMARY_TRIMS = 3  # tries at the summarising request, each with a smaller head
-# Said out loud when the summarizing request itself failed: the turns were still
-# dropped (that is what made room), so the session must know the note is missing.
-COMPACT_FALLBACK_NOTE = (
-    "(no model summary: the summarizing request failed, so the earlier turns "
-    "were dropped without being rewritten — the full transcript is in the "
-    "session log)"
-)
-CONTEXT_OVERFLOW_CODE = 3  # exit code: context full, and compaction could not help
-# Given to the model to write the note that replaces the turns about to go. The
-# todo list and memory notes are re-injected by the harness anyway, so the note
-# must not spend its budget restating them.
-COMPACT_SUMMARY_PROMPT = (
-    "You are compacting an agent session that ran out of context. The "
-    "conversation below is about to be replaced by the note you write; the last "
-    "few turns will be kept as-is. Write the handoff note the agent continues "
-    "from. Cover, in dense bullets under 400 words: the goal; decisions taken "
-    "and why; files touched (exact paths, with line numbers where it matters); "
-    "facts and results worth keeping; the current state; open problems and the "
-    "next step. Do not call tools. Do not restate the todo list or the memory "
-    "notes — the harness supplies those separately. Reply with the note only."
-)
-# Marks the summary as harness-generated inside the conversation, so the model
-# never mistakes it for something the user said.
-COMPACT_SUMMARY_HEADER = (
-    "[harnless compacted this session: the earlier turns above were replaced by "
-    "the note below]"
-)
-# Session log: every conversation is journaled as it happens — the exact message
-# objects the harness replays to the API, one JSON object per line, plus a header
-# record per log and a usage record per LLM call. <id>.jsonl holds the top-level
-# conversation; each sub-agent run gets its own file named after where it sits in
-# the delegation chain (<id>.1.jsonl, <id>.1.2.jsonl). Nothing a session says is
-# ever lost, which is what compaction can lean on — and what --resume / /resume
-# rebuilds a conversation from. Enabled by main(); tests keep it off unless they
-# point SESSION_DIR at a temp dir and turn it on.
-SESSION_DIR = os.environ.get("HARNLESS_SESSIONS_DIR") or os.path.join(
-    CWD, ".harnless", "sessions"
-)
-SESSION_LOG = False  # journal messages as they enter the conversation (main() enables)
-SESSION_ID = ""  # <YYYYmmdd-HHMMSS>-<rand>, one per session (set in main())
-SESSION_MODE = "interactive"  # recorded in each log's header ("interactive" / "one-shot")
-SESSION_WARNED = False  # a journaling failure is reported once, not per record
-SESSION_URL_KEEP = 300  # chars of a content part's URL kept (base64 image data is elided)
-SESSION_LIST_LIMIT = 30  # sessions listed by /resume / /sessions (count)
-SESSION_RECORD_LIMIT = 50_000  # records read from one journal file (sanity ceiling)
-SESSION_KEEP_CEILING = 10_000  # sanity clamp for --resume-last
-# When the REPL resumes a session it echoes back the last stretch of the transcript
-# it restored, printed exactly the way the original session printed it (see
-# replay_session_tail): the `you>` line, the thinking line, the assistant reply
-# through the same Markdown renderer, the tool-call and tool-result lines with the
-# same caps. RESUME_TAIL_ITEMS is how many *speaking turns* (user / assistant) the
-# echo reaches back over, RESUME_TAIL_RECORDS is the hard bound on records replayed
-# (so a tool-heavy final turn cannot flood the screen), and RESUME_TAIL_CHARS caps a
-# replayed thinking block (a reply is shown whole — it is what the user came back for).
-# Items = 0 turns off the echo; only the interactive mode asks for it.
-RESUME_TAIL_ITEMS = 4  # speaking turns a resumed run echoes back
-RESUME_TAIL_RECORDS = 12  # journal records replayed at most
-RESUME_TAIL_CHARS = 1_200  # chars of a replayed thinking block
-# User messages the harness injects for the model and never prints as the user's own:
-# the todo reminder, and the handoff note a compacted head is replaced by.
-TODO_REMINDER_HEADER = "Current todo list:"
-# Said instead of a result for a tool call the log recorded but never answered
-# (the session ended while it was running): a server rejects a dangling call.
-SESSION_UNANSWERED_NOTE = (
-    "[harnless: this tool call was still running when the session ended, so the "
-    "session log has no result for it]"
-)
-_SESSION_META_KEYS = ("type", "seq", "ts", "chars")  # journal envelope, not message keys
-# Journal state, keyed like _record_usage keys a conversation: MAIN_CONV_ID for
-# the top-level conversation, a per-run conv id for a sub-agent, else id(messages).
-SESSION_FILES: dict = {}  # conversation key -> the .jsonl it is appending to
-SESSION_SEQ: dict = {}  # conversation key -> next record seq (a stable message id:
-# compaction can later name the turns it replaced by their seq, and a resumed run
-# picks up where the log left off)
-SESSION_MSG_SEQ: dict = {}  # conversation key -> journal seq of each message *in the
-# conversation*, in order (None for a message a rebuild invented, which has no record
-# of its own). It is what lets a compact record name the seqs it replaced.
-COMPACT_STATS: dict = {}  # conversation key -> rounds / turns replaced (/status)
-AGENT_LOG_ID = ""  # delegation chain id of the agent currently running ("" = top level)
-SUBAGENT_CHILDREN: dict = {}  # parent chain id -> how many sub-agent runs it started
-# Server-reported token usage per conversation, keyed by conversation id
-# (MAIN_CONV_ID for the top-level conversation, unique counters for
-# sub-agents — see _record_usage).
-USAGE_BY_CONV: dict[int, dict] = {}
-# The `message` argument of an agent's `exit` call, per conversation id: the
-# text a sub-agent meant as its closing statement, recorded by _agent_loop's
-# exit handler and harvested by tool_task as that sub-agent's summary. Dropped
-# when the sub-agent finishes.
-EXIT_NOTE_BY_CONV: dict[int, str] = {}
-MAIN_CONV_ID = 0
-_NEXT_CONV_ID = 1  # monotonically increasing usage keys for sub-agent runs
-IMAGE_MIME = {
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".gif": "image/gif",
-    ".webp": "image/webp",
-    ".bmp": "image/bmp",
-}
-_REF_RE = re.compile(r"@\[((?:cwd|file|https?)://[^\]]+)\]")
-# Preferred shell for run_shell on Windows: "auto" (pwsh → powershell → cmd),
-# or force "pwsh" / "powershell" / "cmd". Set from --shell in main().
-SHELL_PREFERRED = "auto"
-# run_shell timeouts. The direct child is only the shell *wrapper*: the real
-# work (a test runner, a compiler, a dev server) runs as its grandchild and
-# inherits the output pipes. Killing the wrapper alone leaves that orphan
-# holding the pipes open, so the harness's output drain waits for it instead of
-# returning — a "timed out after 120s" that never came back, and a runaway the
-# user had to kill by hand. Hence: kill the whole tree, then drain with a
-# deadline of its own.
-SHELL_TIMEOUT_DEFAULT = 120  # seconds a command may run before it is killed
-SHELL_TIMEOUT_MIN = 1
-SHELL_TIMEOUT_CEILING = 3_600  # a tool call that never returns stalls the turn
-KILL_DRAIN_TIMEOUT = 5  # seconds spent collecting output after the kill
-TASKKILL_TIMEOUT = 15  # seconds to let taskkill itself tear the tree down
-SHELL_NOTE = (
-    " Commands run in PowerShell (pwsh, falling back to powershell.exe); use PowerShell syntax "
-    "(e.g. Get-ChildItem, Select-String, Get-Content, Copy-Item) — bash/cmd syntax will not work."
-    if os.name == "nt"
-    else " Commands run in bash."
-) + (
-    " The call waits for everything still holding the output pipes, so do not leave "
-    "background processes running: at the timeout the command and its whole process tree are killed."
-)
-
-# What the terminal shows of a tool call about to run and of the answer it returned.
-# The agent loop prints these and a resumed session replays them with the very same
-# caps (see _print_tool_call / _print_tool_result / replay_session_tail), so the
-# replay cannot drift from what the original session showed.
-TOOL_ARG_ECHO = 200  # chars of a tool call's arguments
-TOOL_RESULT_ECHO = 500  # chars of a tool result
-ANSI = {
-    "user": "\033[1;36m",
-    "assistant": "\033[1;32m",
-    "thinking": "\033[1;35m",
-    "tool": "\033[1;33m",
-    "result": "\033[2m",
-    "error": "\033[1;31m",
-    "dim": "\033[2m",
-    "reset": "\033[0m",
-    # markdown
-    "heading": "\033[1;36m",
-    "code": "\033[35m",
-    "codeblock": "\033[48;5;236m",
-    "bullet": "\033[1;32m",
-    "quote": "\033[2m",
-    "bold": "\033[1m",
-    "italic": "\033[3m",
-    "underline": "\033[4m",
-}
-
-COLORS_ENABLED = True
-
-ICONS = {
-    "user": "🧑",
-    "assistant": "🤖",
-    "thinking": "🤔",
-    "tool": "🔧",
-    "result": "↳",
-    "exit": "🏁",
-    "error": "⚠️",
-    "wait": "⏳",
-    "ok": "✅",
-}
-ASCII_ICONS = {
-    "user": "you",
-    "assistant": "bot",
-    "thinking": "think",
-    "tool": "tool",
-    "result": "out",
-    "exit": "exit",
-    "error": "err",
-    "wait": "wait",
-    "ok": "ok",
-}
-
-
-def _stdout_can_encode_emoji() -> bool:
-    """True if sys.stdout's encoding can encode every emoji icon."""
-    enc = getattr(sys.stdout, "encoding", None)
-    if not enc:
-        return False
-    try:
-        for ch in ICONS.values():
-            ch.encode(enc)
-    except (LookupError, UnicodeEncodeError):
-        return False
-    return True
-
-
-EMOJI_ENABLED = _stdout_can_encode_emoji()
+from harnless_core import caps, config, errors, paths, state
+_MODULES = (caps, config, errors, paths, state)  # facade: moved modules
 
 
 def set_color_enabled(enabled: bool):
-    global COLORS_ENABLED
-    COLORS_ENABLED = enabled
+    state.COLORS_ENABLED = enabled
 
 
 def set_emoji_enabled(enabled: bool):
-    global EMOJI_ENABLED
-    EMOJI_ENABLED = enabled
+    state.EMOJI_ENABLED = enabled
 
 
 def icon(key: str) -> str:
-    table = ICONS if EMOJI_ENABLED else ASCII_ICONS
+    table = config.ICONS if state.EMOJI_ENABLED else config.ASCII_ICONS
     return table.get(key, "")
 
 
@@ -356,179 +61,12 @@ def color_enabled() -> bool:
 
 
 def colorize(text: str, key=None) -> str:
-    if not COLORS_ENABLED or key is None:
+    if not state.COLORS_ENABLED or key is None:
         return text
-    return f"{ANSI[key]}{text}{ANSI['reset']}"
-
-
-class ExitSignal(Exception):
-    def __init__(self, code: int, message: str = ""):
-        super().__init__(message)
-        self.code = code
-        self.message = message
-
-
-def _cwd_roots() -> list:
-    """Absolute forms of CWD: as given, plus fully resolved when CWD is a link.
-
-    CWD itself may be a symlink/junction (e.g. X:\\links\\proj -> X:\\real\\proj),
-    while paths are resolved with realpath(), so both forms are needed to keep the
-    containment check and the paths shown to the model consistent.
-    """
-    roots = [CWD]
-    real = os.path.realpath(CWD)
-    if os.path.normcase(real) != os.path.normcase(CWD):
-        roots.append(real)
-    return roots
-
-
-def _inside_cwd(full: str, roots: list = None) -> bool:
-    """True if an already realpath-resolved absolute path stays inside CWD.
-
-    Case-insensitive on Windows (normcase); comparing against the resolved CWD is
-    what makes a symlinked working directory work, while a link *inside* CWD that
-    points outside is still rejected because `full` has already been resolved.
-    """
-    p = os.path.normcase(full)
-    for root in (roots or _cwd_roots()):
-        r = os.path.normcase(root).rstrip("\\/")
-        if p == r or p.startswith(r + os.sep):
-            return True
-    return False
-
-
-def _rel_to_cwd(full: str, roots: list = None) -> str:
-    """Express an absolute path relative to CWD, using forward slashes.
-
-    Picks whichever CWD form (the link or its target) actually contains the path,
-    so a symlinked CWD yields `src/main.py` instead of `../../../real/src/main.py`.
-    """
-    fallback = None
-    for root in (roots or _cwd_roots()):
-        try:
-            rel = os.path.relpath(full, root).replace("\\", "/")
-        except ValueError:  # e.g. path on a different drive (Windows)
-            continue
-        if not rel.startswith(".."):
-            return rel
-        if fallback is None or len(rel) < len(fallback):
-            fallback = rel
-    return fallback if fallback is not None else full
-
-
-def safe_resolve(rel_path: str) -> str:
-    """Resolve a relative path and ensure it stays inside CWD. Returns absolute path."""
-    rel_path = rel_path.replace("\\", "/")
-    if rel_path.startswith("./"):
-        rel_path = rel_path[2:]
-    if os.path.isabs(rel_path):
-        raise ValueError(f"Absolute paths are not allowed: {rel_path}")
-    roots = _cwd_roots()
-    full = os.path.realpath(os.path.join(CWD, rel_path))
-    if not _inside_cwd(full, roots):
-        raise ValueError(f"Path escapes working directory: {rel_path}")
-    return full
-
-
-def _bool_arg(args: dict, key: str, default: bool) -> bool:
-    """Read a boolean-style tool argument, tolerating what models often send.
-
-    A model frequently sends "true"/"yes"/"1" instead of a JSON true, so those
-    strings are accepted; a missing or unrecognisable value falls back to
-    `default`.
-    """
-    raw = args.get(key)
-    if raw is None:
-        return default
-    if isinstance(raw, str):
-        text = raw.strip().lower()
-        if text in ("true", "t", "yes", "y", "on", "1"):
-            return True
-        if text in ("false", "f", "no", "n", "off", "0", ""):
-            return False
-        return default
-    return bool(raw)
-
-
-def _case_flags(case_sensitive: bool) -> int:
-    """re flags for a search knob: exact case by default, IGNORECASE when opted out."""
-    return 0 if case_sensitive else re.IGNORECASE
-
-
-def _glob_to_regex(pattern: str, case_sensitive: bool = True):
-    """Compile a glob pattern (or a raw regex) for matching CWD-relative paths.
-
-    `**/` matches zero or more directories, so `**/*.py` also matches files sitting
-    directly in the searched directory; plain `*`/`?` match across path separators
-    because patterns are matched against the whole relative path. A pattern
-    containing regex metacharacters is used as a regex. Matching is case-sensitive
-    unless `case_sensitive` is False.
-    """
-    flags = _case_flags(case_sensitive)
-    if any(c in pattern for c in "[](){}|\\^$"):
-        return re.compile(pattern, flags)
-    translated = pattern.replace("**/", "\x00")  # placeholder, so it isn't re-translated
-    translated = translated.replace("?", ".").replace("*", ".*")
-    return re.compile("^" + translated.replace("\x00", "(?:.*/)?") + "$", flags)
+    return f"{config.ANSI[key]}{text}{config.ANSI['reset']}"
 
 
 # ---------------------------------------------------------------- output caps
-
-
-def _limit_arg(args: dict, key: str, default: int, ceiling: int) -> int:
-    """Read an integer limit-style argument, clamped to [1, ceiling].
-
-    Model-facing: the agent can ask for a smaller (or bigger) result, but
-    never past the harness-side ceiling. A missing or bogus value falls back
-    to the default.
-    """
-    raw = args.get(key)
-    if raw is None:
-        return default
-    try:
-        value = int(raw)
-    except (TypeError, ValueError):
-        return default
-    return max(1, min(value, ceiling))
-
-
-def _clamp_int(value: int, low: int, high: int) -> int:
-    """Clamp a CLI-supplied integer into [low, high].
-
-    Guards the harness-side knobs (`--max-subagents`, `--max-subagent-steps`)
-    so a nonsensical value can't produce a negative limit or an unbounded loop.
-    """
-    return max(low, min(value, high))
-
-
-def _cap_note(stat: str, hint: str) -> str:
-    """The marker appended to a capped result: how much was dropped + how to recover."""
-    return f"\n... [truncated: {stat}{'; ' + hint if hint else ''}]"
-
-
-def _truncate(text: str, limit: int, *, unit: str = "chars", hint: str = "") -> str:
-    """Cap `text` at `limit` characters, appending what was dropped and a recovery hint."""
-    if len(text) <= limit:
-        return text
-    return text[:limit] + _cap_note(
-        f"{len(text)} {unit} total, showing first {limit}", hint
-    )
-
-
-def _cap_count(items: list, limit: int, *, unit: str, hint: str = "") -> str:
-    """Join at most `limit` items, appending how many exist and a recovery hint."""
-    if len(items) <= limit:
-        return "\n".join(str(i) for i in items)
-    return "\n".join(str(i) for i in items[:limit]) + _cap_note(
-        f"{len(items)} {unit}, showing first {limit}", hint
-    )
-
-
-def _clip_line(line: str, limit: int) -> str:
-    """Clip one over-long line (e.g. minified JS) so a single hit can't dump megabytes."""
-    if len(line) <= limit:
-        return line
-    return line[:limit] + f" …[+{len(line) - limit} chars on this line]"
 
 
 # ------------------------------------------------------------ session journal
@@ -551,18 +89,17 @@ def _session_path(session_id: str = "", subagent_id: str = "") -> str:
     """Journal file for a conversation: <session-id>.jsonl for the top-level
     conversation, <session-id>.<chain>.jsonl for a sub-agent run ('1', '1.2', …
     — the name shows how the run was delegated)."""
-    sid = session_id or SESSION_ID
+    sid = session_id or state.SESSION_ID
     name = f"{sid}.{subagent_id}" if subagent_id else sid
-    return os.path.join(SESSION_DIR, name + ".jsonl")
+    return os.path.join(state.SESSION_DIR, name + ".jsonl")
 
 
 def _session_disable(error) -> None:
     """Journaling is best effort: a log that cannot be written is dropped (said
     out loud once) and the session carries on without it."""
-    global SESSION_LOG, SESSION_WARNED
-    SESSION_LOG = False
-    if not SESSION_WARNED:
-        SESSION_WARNED = True
+    state.SESSION_LOG = False
+    if not state.SESSION_WARNED:
+        state.SESSION_WARNED = True
         print(colorize(f"{icon('error')} session log disabled: {error}", "error"))
 
 
@@ -573,22 +110,22 @@ def _session_append(key, record: dict) -> int:
     A conversation that was never opened — a test driving run_agent directly, a
     --no-session-log run — is silently skipped, which is how the journal stays off
     by default."""
-    if not SESSION_LOG:
+    if not state.SESSION_LOG:
         return -1
-    path = SESSION_FILES.get(key)
+    path = state.SESSION_FILES.get(key)
     if not path:
         return -1
-    seq = SESSION_SEQ.get(key, 0)
+    seq = state.SESSION_SEQ.get(key, 0)
     record = {**record, "seq": seq, "ts": _session_stamp()}  # envelope last: a
     # journal field can never be shadowed by a key the server put in the message
     try:
-        os.makedirs(SESSION_DIR, exist_ok=True)
+        os.makedirs(state.SESSION_DIR, exist_ok=True)
         with open(path, "a", encoding="utf-8", newline="\n") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except (OSError, TypeError, ValueError) as e:
         _session_disable(e)
         return -1
-    SESSION_SEQ[key] = seq + 1
+    state.SESSION_SEQ[key] = seq + 1
     return seq
 
 
@@ -602,7 +139,7 @@ def _session_elide(content):
     for part in content:
         if isinstance(part, dict) and part.get("type") == "image_url":
             url = ((part.get("image_url") or {}).get("url") or "")
-            if len(url) > SESSION_URL_KEEP:
+            if len(url) > config.SESSION_URL_KEEP:
                 kept.append({
                     "type": "text",
                     "text": f"[image elided in the session log: {url.split(',', 1)[0]}, {len(url)} chars]",
@@ -622,13 +159,13 @@ def _session_message(msg: dict, key) -> int:
     record = dict(msg)
     if "content" in record:
         record["content"] = _session_elide(record.get("content"))
-    record["chars"] = _content_chars(msg.get("content"))
+    record["chars"] = caps._content_chars(msg.get("content"))
     record["type"] = "message"
     seq = _session_append(key, record)
     if seq >= 0:
         # Positional: this list stays aligned with the conversation itself, so a
         # compact record can name the exact seqs of the turns it drops.
-        SESSION_MSG_SEQ.setdefault(key, []).append(seq)
+        state.SESSION_MSG_SEQ.setdefault(key, []).append(seq)
     return seq
 
 
@@ -640,13 +177,13 @@ def _session_messages(messages: list, key) -> None:
 
 def _session_open(key, path: str, header: dict) -> None:
     """Start conversation `key`'s journal at `path`, headed by what the run was."""
-    if not SESSION_LOG:
+    if not state.SESSION_LOG:
         return
-    SESSION_FILES[key] = path
-    SESSION_SEQ[key] = 0
-    SESSION_MSG_SEQ[key] = []
+    state.SESSION_FILES[key] = path
+    state.SESSION_SEQ[key] = 0
+    state.SESSION_MSG_SEQ[key] = []
     try:
-        os.makedirs(SESSION_DIR, exist_ok=True)
+        os.makedirs(state.SESSION_DIR, exist_ok=True)
         # A new session owns its file: opening a journal starts it, it does not
         # continue one that happens to be there (two runs in one file would mix
         # their records under restarting seqs). Continuations use _session_continue.
@@ -656,12 +193,12 @@ def _session_open(key, path: str, header: dict) -> None:
         _session_disable(e)
         return
     _session_append(key, {
-        "harnless": VERSION,
-        "session_id": SESSION_ID,
-        "mode": SESSION_MODE,
-        "cwd": CWD,
-        "api_url": API_URL,
-        "model": MODEL,
+        "harnless": config.VERSION,
+        "session_id": state.SESSION_ID,
+        "mode": state.SESSION_MODE,
+        "cwd": state.CWD,
+        "api_url": state.API_URL,
+        "model": state.MODEL,
         **header,
         "type": "session",
     })
@@ -670,32 +207,31 @@ def _session_open(key, path: str, header: dict) -> None:
 def _session_continue(key, path: str, start_seq: int, record: dict, seqs: list = None) -> None:
     """Point conversation `key`'s journal at an already-written file and keep its
     numbering, then mark the continuation in the log itself."""
-    if not SESSION_LOG:
+    if not state.SESSION_LOG:
         return
-    SESSION_FILES[key] = path
-    SESSION_SEQ[key] = max(0, start_seq)
+    state.SESSION_FILES[key] = path
+    state.SESSION_SEQ[key] = max(0, start_seq)
     # Restored messages carry the seqs their records already have: a compaction in
     # the resumed run names the turns it replaced in the same numbering.
-    SESSION_MSG_SEQ[key] = list(seqs or [])
+    state.SESSION_MSG_SEQ[key] = list(seqs or [])
     _session_append(key, record)
 
 
 def start_session(mode: str = "") -> str:
     """Begin a new top-level session: a fresh id, a fresh journal, its header."""
-    global SESSION_ID, SESSION_MODE
     if mode:
-        SESSION_MODE = mode
-    SESSION_ID = _session_new_id()
-    _session_open(MAIN_CONV_ID, _session_path(), {"depth": 0, "subagent_id": None})
+        state.SESSION_MODE = mode
+    state.SESSION_ID = _session_new_id()
+    _session_open(state.MAIN_CONV_ID, _session_path(), {"depth": 0, "subagent_id": None})
     return _session_path()
 
 
 def _session_note() -> str:
     """The line that tells you where this run's transcript is going (banner,
     /status): sub-agent runs get their own files alongside it."""
-    if not SESSION_LOG:
+    if not state.SESSION_LOG:
         return "session log: off (--no-session-log)"
-    return f"session log: {_session_path()} (sub-agents: {_session_path(SESSION_ID, '1')}, …)"
+    return f"session log: {_session_path()} (sub-agents: {_session_path(state.SESSION_ID, '1')}, …)"
 
 
 def _session_mtime_str(path: str) -> str:
@@ -708,14 +244,14 @@ def _session_mtime_str(path: str) -> str:
 def _session_files() -> list:
     """Every journal file in SESSION_DIR, newest first."""
     try:
-        names = os.listdir(SESSION_DIR)
+        names = os.listdir(state.SESSION_DIR)
     except OSError:
         return []
     paths = []
     for name in names:
         if not name.endswith(".jsonl"):
             continue
-        path = os.path.join(SESSION_DIR, name)
+        path = os.path.join(state.SESSION_DIR, name)
         if os.path.isfile(path):
             paths.append(path)
     paths.sort(key=_session_mtime_key, reverse=True)
@@ -755,7 +291,7 @@ def _session_read(path: str, kinds: tuple = ("message",)) -> tuple:
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             for index, line in enumerate(f):
-                if index >= SESSION_RECORD_LIMIT:
+                if index >= config.SESSION_RECORD_LIMIT:
                     break
                 line = line.strip()
                 if not line:
@@ -801,11 +337,11 @@ def _session_rebuild_pairs(records: list) -> list:
             pairs.append((None, {
                 "role": "tool",
                 "tool_call_id": call_id,
-                "content": SESSION_UNANSWERED_NOTE,
+                "content": config.SESSION_UNANSWERED_NOTE,
             }))
 
     for rec in records:
-        msg = {k: v for k, v in rec.items() if k not in _SESSION_META_KEYS}
+        msg = {k: v for k, v in rec.items() if k not in config._SESSION_META_KEYS}
         seq = rec.get("seq") if isinstance(rec.get("seq"), int) else None
         role = msg.get("role")
         if role == "tool":
@@ -845,7 +381,7 @@ def _session_resolve(spec: str) -> tuple:
     if spec.lower() in ("latest", "last", "newest", "-"):
         files = _session_main_files()
         if not files:
-            return "", f"no session logs in {SESSION_DIR}"
+            return "", f"no session logs in {state.SESSION_DIR}"
         return files[0], ""
     if spec.endswith(".jsonl") or os.sep in spec or "/" in spec or spec.startswith("~"):
         base = os.path.expanduser(spec)
@@ -853,12 +389,12 @@ def _session_resolve(spec: str) -> tuple:
             if os.path.isfile(candidate):
                 return candidate, ""
         return "", f"no session log at: {spec}"
-    path = os.path.join(SESSION_DIR, spec + ".jsonl")
+    path = os.path.join(state.SESSION_DIR, spec + ".jsonl")
     if os.path.isfile(path):
         return path, ""
     known = [_session_id_of(p) for p in _session_files()[:3]]
     hint = f" recent sessions: {', '.join(known)}" if known else ""
-    return "", f"no session log for '{spec}' in {SESSION_DIR};{hint} (see /sessions)"
+    return "", f"no session log for '{spec}' in {state.SESSION_DIR};{hint} (see /sessions)"
 
 
 def _session_injected_turn(rec: dict) -> bool:
@@ -868,7 +404,7 @@ def _session_injected_turn(rec: dict) -> bool:
     if rec.get("role") != "user":
         return False
     text = _record_text(rec.get("content")).lstrip()
-    return text.startswith(TODO_REMINDER_HEADER) or text.startswith(COMPACT_SUMMARY_HEADER)
+    return text.startswith(config.TODO_REMINDER_HEADER) or text.startswith(config.COMPACT_SUMMARY_HEADER)
 
 
 def _session_tail(records: list, items: int) -> list:
@@ -890,7 +426,7 @@ def _session_tail(records: list, items: int) -> list:
         return []
     start = max(
         spoken[-items] if len(spoken) >= items else 0,
-        len(records) - RESUME_TAIL_RECORDS,
+        len(records) - config.RESUME_TAIL_RECORDS,
     )
     if start > spoken[-1]:
         # The window cut off every turn but a run of tool answers that came after
@@ -900,7 +436,7 @@ def _session_tail(records: list, items: int) -> list:
 
 
 def replay_session_tail(
-    records: list, items: int = RESUME_TAIL_ITEMS, label: str = ""
+    records: list, items: int = config.RESUME_TAIL_ITEMS, label: str = ""
 ) -> int:
     """Print the last stretch of a journaled session the way the original session did.
 
@@ -935,7 +471,7 @@ def replay_session_tail(
             continue
         if role == "assistant":
             shown += 1
-            print_reasoning(rec.get("reasoning_content") or "", RESUME_TAIL_CHARS)
+            print_reasoning(rec.get("reasoning_content") or "", config.RESUME_TAIL_CHARS)
             calls = [tc for tc in (rec.get("tool_calls") or []) if isinstance(tc, dict)]
             content = _record_text(rec.get("content"))
             if content or not calls:
@@ -980,7 +516,6 @@ def resume_session(spec: str, keep: int = 0, mode: str = "", echo: int = 0) -> t
     (see replay_session_tail) — so the caller does not print the note itself. 0, what
     a one-shot run asks for, prints nothing and leaves the note to the caller.
     """
-    global SESSION_ID, SESSION_MODE
     path, error = _session_resolve(spec)
     if not path:
         return None, error
@@ -995,25 +530,25 @@ def resume_session(spec: str, keep: int = 0, mode: str = "", echo: int = 0) -> t
     if not messages:
         return None, f"no messages to resume in {os.path.basename(path)}"
     if mode:
-        SESSION_MODE = mode
-    SESSION_ID = _session_id_of(path)
+        state.SESSION_MODE = mode
+    state.SESSION_ID = _session_id_of(path)
     _session_continue(
-        MAIN_CONV_ID,
+        state.MAIN_CONV_ID,
         path,
         last_seq + 1,
         {
-            "harnless": VERSION,
-            "session_id": SESSION_ID,
-            "mode": SESSION_MODE,
+            "harnless": config.VERSION,
+            "session_id": state.SESSION_ID,
+            "mode": state.SESSION_MODE,
             "resumed_file": path,
             "restored": len(messages),
             "recorded": len(records),
-            "model": MODEL,
+            "model": state.MODEL,
             "type": "resume",
         },
         seqs=[seq for seq, _ in pairs],
     )
-    note = f"resumed session {SESSION_ID}: {len(messages)} messages from {path}"
+    note = f"resumed session {state.SESSION_ID}: {len(messages)} messages from {path}"
     if keep:
         note += f" (kept the last {keep} of {last_seq + 1} records)"
     if echo:
@@ -1022,7 +557,7 @@ def resume_session(spec: str, keep: int = 0, mode: str = "", echo: int = 0) -> t
         # back out of the records — the transcript as it happened, orphan answers and
         # all — through the same printers the session used live.
         print(colorize(note, "dim"))
-        replay_session_tail(records, echo, SESSION_ID)
+        replay_session_tail(records, echo, state.SESSION_ID)
     return messages, note
 
 
@@ -1040,7 +575,7 @@ def _resume_target(resume, resume_last) -> tuple:
     implied = not named and resume_last is not None
     return (
         named or ("latest" if implied else ""),
-        _clamp_int(resume_last or 0, 0, SESSION_KEEP_CEILING),
+        caps._clamp_int(resume_last or 0, 0, config.SESSION_KEEP_CEILING),
         implied,
     )
 
@@ -1053,18 +588,18 @@ def _session_prepend(msg: dict, key) -> int:
     to the slot the message actually occupies; left where it was, a later compact record
     would name the wrong turns."""
     seq = _session_message(msg, key)
-    entries = SESSION_MSG_SEQ.get(key)
+    entries = state.SESSION_MSG_SEQ.get(key)
     if seq >= 0 and entries is not None:
         entries.pop()
         entries.insert(0, seq)
     return seq
 
 
-def format_sessions(limit: int = SESSION_LIST_LIMIT) -> str:
+def format_sessions(limit: int = config.SESSION_LIST_LIMIT) -> str:
     """Describe the recorded sessions (newest first) for /resume and /sessions."""
     files = _session_files()
     if not files:
-        return f"no session logs in {SESSION_DIR}"
+        return f"no session logs in {state.SESSION_DIR}"
     sessions: dict = {}
     for path in files:
         name = os.path.basename(path)[: -len(".jsonl")]
@@ -1079,7 +614,7 @@ def format_sessions(limit: int = SESSION_LIST_LIMIT) -> str:
             info["log"] = path
             info["header"] = header
             info["messages"] = len(records)
-    lines = [f"session logs in {SESSION_DIR} (newest first):"]
+    lines = [f"session logs in {state.SESSION_DIR} (newest first):"]
     for session_id, info in list(sessions.items())[: max(1, limit)]:
         header = info["header"] or {}
         bits = [
@@ -1136,7 +671,7 @@ def _session_record_line(rec: dict) -> str:
             f"#{seq} [HARNLESS COMPACTED {rec.get('dropped', 0)} turns ({span_text}) into "
             f"{note} at seq {rec.get('summary_seq')}; reason: {rec.get('reason', '?')}]"
         )
-    msg = {k: v for k, v in rec.items() if k not in _SESSION_META_KEYS}
+    msg = {k: v for k, v in rec.items() if k not in config._SESSION_META_KEYS}
     role = msg.get("role") or "?"
     head = f"#{seq} {role}"
     if role == "tool":
@@ -1145,9 +680,9 @@ def _session_record_line(rec: dict) -> str:
     text = _record_text(msg.get("content"))
     if text:
         lines.append(
-            _truncate(
+            caps._truncate(
                 text,
-                SESSION_RECORD_CHARS,
+                config.SESSION_RECORD_CHARS,
                 hint="the rest of this turn is in the log file itself",
             )
         )
@@ -1155,7 +690,7 @@ def _session_record_line(rec: dict) -> str:
         if not isinstance(tc, dict):
             continue
         fn = tc.get("function") or {}
-        lines.append(f"    called {fn.get('name', '?')}({_clip_line(fn.get('arguments') or '', 200)})")
+        lines.append(f"    called {fn.get('name', '?')}({caps._clip_line(fn.get('arguments') or '', 200)})")
     if msg.get("reasoning_content"):
         lines.append("    (thinking recorded in the log)")
     return "\n".join(lines)
@@ -1183,8 +718,8 @@ def tool_sessions(args: dict) -> str:
     """
     action = (args.get("action") or "list").strip().lower()
     if action == "list":
-        limit = _limit_arg(args, "limit", SESSION_LIST_LIMIT, MAX_COUNT_LIMIT)
-        return _truncate(format_sessions(limit), SESSION_READ_LIMIT,
+        limit = caps._limit_arg(args, "limit", config.SESSION_LIST_LIMIT, config.MAX_COUNT_LIMIT)
+        return caps._truncate(format_sessions(limit), config.SESSION_READ_LIMIT,
                          hint="narrow it with the 'limit' argument")
     if action not in ("read", "spans", "compactions"):
         return "error: unknown action (use list, read, or spans)"
@@ -1201,9 +736,9 @@ def tool_sessions(args: dict) -> str:
             f"no records in {os.path.basename(path)} between seq {lo} and {hi} "
             f"(this log holds seqs 0-{last_seq}; 'list' shows the other sessions)"
         )
-    limit = _limit_arg(args, "limit", SESSION_LIST_LIMIT * 2, MAX_COUNT_LIMIT)
+    limit = caps._limit_arg(args, "limit", config.SESSION_LIST_LIMIT * 2, config.MAX_COUNT_LIMIT)
     shown = picked[-limit:] if len(picked) > limit else picked
-    max_chars = _limit_arg(args, "max_chars", SESSION_READ_LIMIT, TOOL_RESULT_LIMIT)
+    max_chars = caps._limit_arg(args, "max_chars", config.SESSION_READ_LIMIT, config.TOOL_RESULT_LIMIT)
     title = f"session {_session_id_of(path)} ({path}): records {lo}-{hi}, {len(picked)} found"
     if action in ("spans", "compactions"):
         title += f" — {len(picked)} compaction(s)"
@@ -1214,50 +749,11 @@ def tool_sessions(args: dict) -> str:
             f"{picked[0].get('seq')} — ask again with a narrower from/to)"
         )
     lines.extend(_session_record_line(r) for r in shown)
-    return _truncate("\n".join(lines), max_chars,
+    return caps._truncate("\n".join(lines), max_chars,
                      hint="narrow from/to, raise max_chars, or read the .jsonl file directly")
 
 
 # ------------------------------------------------------------ compaction
-
-
-class ContextOverflow(Exception):
-    """The server refused a request because the context is full.
-
-    Raised by `chat`/`stream_chat` in place of the bare HTTP error so the agent loop
-    can tell "compact and retry" from "the API is unhappy about something else"."""
-
-
-# What a rejection has to say to count as "out of context" rather than some other bad
-# request: llama.cpp (n_ctx, context exceeded), OpenAI-compatible servers ('prompt is
-# too long', maximum context length), and the proxies in between word it differently.
-_CONTEXT_OVERFLOW_RE = re.compile(
-    r"n_ctx|context[_ ]length|context[_ ]window|maximum context|context exceeded"
-    r"|too many tokens|prompt is too long|input length|token limit|outside the context",
-    re.IGNORECASE,
-)
-_CONTEXT_OVERFLOW_STATUS = (400, 413, 422)  # rejections worth reading the body of
-
-
-def _context_overflow_reason(exc) -> str:
-    """Why a request was rejected, when it looks like the context being full
-    ('' when it does not). Status plus a snippet: the wording is the server's own,
-    so this is the only place that has to know the shapes the message comes in."""
-    status = getattr(exc, "code", None) or getattr(exc, "status", None) or 0
-    try:
-        status = int(status)
-    except (TypeError, ValueError):
-        status = 0
-    if status not in _CONTEXT_OVERFLOW_STATUS:
-        return ""
-    try:
-        body = exc.read().decode("utf-8", "replace")  # an HTTPError is its own response
-    except (OSError, AttributeError, ValueError):
-        body = ""
-    text = " ".join((body or str(exc)).split())
-    if not text or not _CONTEXT_OVERFLOW_RE.search(text):
-        return ""
-    return f"HTTP {status}: {text[:300]}{'…' if len(text) > 300 else ''}"
 
 
 def _elision_note(dropped: int) -> str:
@@ -1294,15 +790,15 @@ def _compact_prune(msg: dict) -> tuple:
     """
     out = msg
     saved = 0
-    if COMPACT_PRUNE_TOOL_RESULTS and msg.get("role") == "tool":
+    if state.COMPACT_PRUNE_TOOL_RESULTS and msg.get("role") == "tool":
         text = msg.get("content")
         if isinstance(text, str):
-            pruned, dropped = _prune_text(text, COMPACT_TOOL_RESULT_KEEP)
+            pruned, dropped = _prune_text(text, config.COMPACT_TOOL_RESULT_KEEP)
             if dropped:
                 out = dict(msg)
                 out["content"] = pruned
                 saved += dropped
-    if COMPACT_DROP_REASONING and out.get("reasoning_content"):
+    if state.COMPACT_DROP_REASONING and out.get("reasoning_content"):
         if out is msg:
             out = dict(out)
         saved += len(out.get("reasoning_content") or "")
@@ -1317,7 +813,7 @@ def _compact_tail_prune(messages: list) -> int:
     the rest produced its tool calls and its answer already, and the log has it. Returns
     the chars taken out of every request from here on.
     """
-    if not COMPACT_DROP_REASONING or not messages:
+    if not state.COMPACT_DROP_REASONING or not messages:
         return 0
     last_assistant = -1
     for i, msg in enumerate(messages):
@@ -1342,7 +838,7 @@ def _system_prefix(messages: list) -> int:
 
 def _msg_tokens(msg: dict) -> int:
     """What one message costs the next request: content + reasoning + tool arguments."""
-    total = _content_chars(msg.get("content"))
+    total = caps._content_chars(msg.get("content"))
     total += len(msg.get("reasoning_content") or "")
     for tc in msg.get("tool_calls") or []:
         total += len((tc.get("function") or {}).get("arguments") or "")
@@ -1365,7 +861,7 @@ def _turn_tokens(messages: list) -> int:
 def _context_tokens_used(messages: list, conv_key) -> int:
     """How full this conversation is: what the server last reported for it, or the
     estimate of its turns (see _turn_tokens)."""
-    usage = USAGE_BY_CONV.get(conv_key)
+    usage = state.USAGE_BY_CONV.get(conv_key)
     if isinstance(usage, dict) and usage.get("prompt_tokens"):
         try:
             return int(usage["prompt_tokens"])
@@ -1405,7 +901,7 @@ def _compact_cut(messages: list, keep_tokens: int, scale: float = 1.0) -> int:
         if used > keep_tokens:
             cut = i + 1
             break
-    floor = len(messages) - COMPACT_KEEP_MIN_MESSAGES
+    floor = len(messages) - config.COMPACT_KEEP_MIN_MESSAGES
     if floor < cut:
         cut = floor  # never a tail smaller than the floor, however tight the budget
     if cut < start:
@@ -1437,7 +933,7 @@ def _fit_head(head: list, budget: int, scale: float = 1.0) -> list:
 def _session_span(key, start: int, end: int) -> list:
     """The [first, last] journal seqs of messages[start:end] ([] when none of them has
     a record of its own — a message a rebuild invented)."""
-    real = [s for s in (SESSION_MSG_SEQ.get(key) or [])[start:end] if isinstance(s, int)]
+    real = [s for s in (state.SESSION_MSG_SEQ.get(key) or [])[start:end] if isinstance(s, int)]
     return [real[0], real[-1]] if real else []
 
 
@@ -1451,23 +947,22 @@ def _compact_summary(head: list, budget: int, model: str, scale: float = 1.0) ->
     masquerades as the agent's own usage and nothing of its scaffolding is journaled
     into the transcript. Returns (note, error); an empty note means fall back.
     """
-    global _NEXT_CONV_ID
-    conv_id = _NEXT_CONV_ID
-    _NEXT_CONV_ID += 1
+    conv_id = state._NEXT_CONV_ID
+    state._NEXT_CONV_ID += 1
     room = max(512, budget)
     error = ""
-    for _ in range(max(1, COMPACT_SUMMARY_TRIMS)):
+    for _ in range(max(1, state.COMPACT_SUMMARY_TRIMS)):
         try:
             data = chat(
-                [{"role": "system", "content": COMPACT_SUMMARY_PROMPT}]
+                [{"role": "system", "content": config.COMPACT_SUMMARY_PROMPT}]
                 + _fit_head(head, room, scale),
-                model or MODEL,
+                model or state.MODEL,
                 interactive=False,
-                temperature=TEMPERATURE,
+                temperature=state.TEMPERATURE,
                 conv_id=conv_id,
                 send_tools=False,
             )
-        except ContextOverflow as e:
+        except errors.ContextOverflow as e:
             # The head we are trying to summarise is what overflowed: read less of it.
             error = f"the summarising request was itself too large ({e})"
             room = max(512, room // 2)
@@ -1477,7 +972,7 @@ def _compact_summary(head: list, budget: int, model: str, scale: float = 1.0) ->
         except (KeyError, IndexError, TypeError, AttributeError) as e:
             return "", f"the summarising request returned nothing usable ({e})"
         finally:
-            USAGE_BY_CONV.pop(conv_id, None)  # not the agent's own usage
+            state.USAGE_BY_CONV.pop(conv_id, None)  # not the agent's own usage
         choices = data.get("choices") or [{}]
         note = (choices[0].get("message") or {}).get("content") or ""
         if isinstance(note, str) and note.strip():
@@ -1490,9 +985,9 @@ def _transcript_note(conv_key, span: list) -> str:
     """Names the transcript a handoff note stands for, inside the conversation itself:
     the model can ask for the exact turns the note condensed (sessions tool) instead of
     re-deriving them with fresh tool calls."""
-    if not SESSION_LOG:
+    if not state.SESSION_LOG:
         return "[transcript: not journaled (--no-session-log), so these turns are gone]"
-    path = SESSION_FILES.get(conv_key) or _session_path()
+    path = state.SESSION_FILES.get(conv_key) or _session_path()
     replaced = f"seqs {span[0]}-{span[1]}" if len(span) == 2 else "the turns above"
     return (
         f"[transcript of this session: {_session_id_of(path)} — what this note replaced "
@@ -1520,9 +1015,9 @@ def compact_messages(messages: list, conv_key, model: str = "", reason: str = "m
     why nothing was.
     """
     total = len(messages)
-    if total < COMPACT_MIN_MESSAGES:
+    if total < state.COMPACT_MIN_MESSAGES:
         return False, (
-            f"only {total} messages in play — compaction waits for {COMPACT_MIN_MESSAGES} "
+            f"only {total} messages in play — compaction waits for {state.COMPACT_MIN_MESSAGES} "
             "before there is worth summarising"
         )
     start = _system_prefix(messages)
@@ -1534,8 +1029,8 @@ def compact_messages(messages: list, conv_key, model: str = "", reason: str = "m
     scale = _token_scale(used, turn_tokens)
     # With no window known (--context-window unset, nothing probed), compare against
     # what this conversation is actually using instead of a window we don't have.
-    window = CONTEXT_WINDOW if CONTEXT_WINDOW > 0 else max(used, 1)
-    keep_tokens = max(1, window * COMPACT_KEEP_TOKENS_PCT // 100)
+    window = state.CONTEXT_WINDOW if state.CONTEXT_WINDOW > 0 else max(used, 1)
+    keep_tokens = max(1, window * state.COMPACT_KEEP_TOKENS_PCT // 100)
     # The budget is the server's number, the turns are ours: scale reads them in the
     # same units, so a reported usage of 18k against a 4k-looking conversation cuts
     # where 18k says it should instead of finding nothing to drop.
@@ -1554,28 +1049,28 @@ def compact_messages(messages: list, conv_key, model: str = "", reason: str = "m
     # note it is writing, but not the tail — so what is left after reserving the note
     # (roughly COMPACT_SUMMARY_LIMIT tokens) is what it may read. _fit_head trims the
     # oldest turns out of it, and _compact_summary trims again if it is still refused.
-    budget = max(512, window - COMPACT_SUMMARY_LIMIT // 4)
+    budget = max(512, window - config.COMPACT_SUMMARY_LIMIT // 4)
     note, note_error = _compact_summary(head, budget, model, scale)
 
     span = _session_span(conv_key, start, cut)
     summary_msg = {
         "role": "user",
-        "content": COMPACT_SUMMARY_HEADER
+        "content": config.COMPACT_SUMMARY_HEADER
         + "\n\n"
         + (
-            _truncate(
+            caps._truncate(
                 note,
-                COMPACT_SUMMARY_LIMIT,
+                config.COMPACT_SUMMARY_LIMIT,
                 hint="the full transcript is in the session log (sessions tool)",
             )
             if note
-            else COMPACT_FALLBACK_NOTE
+            else config.COMPACT_FALLBACK_NOTE
         )
         + "\n\n"
         + _transcript_note(conv_key, span),
     }
 
-    seq_now = SESSION_SEQ.get(conv_key)
+    seq_now = state.SESSION_SEQ.get(conv_key)
     summary_seq = seq_now + 1 if isinstance(seq_now, int) else None  # this record takes seq_now
     _session_append(conv_key, {
         "type": "compact",
@@ -1599,7 +1094,7 @@ def compact_messages(messages: list, conv_key, model: str = "", reason: str = "m
 
     messages[start:cut] = [summary_msg]
     written = _session_message(summary_msg, conv_key)
-    entries = SESSION_MSG_SEQ.get(conv_key)
+    entries = state.SESSION_MSG_SEQ.get(conv_key)
     if entries is not None:
         # Keep the seq list aligned with the conversation it describes: the summary
         # takes the slot the replaced turns occupied.
@@ -1609,14 +1104,14 @@ def compact_messages(messages: list, conv_key, model: str = "", reason: str = "m
         else:
             entries[start:cut] = [None]
 
-    stats = COMPACT_STATS.setdefault(conv_key, {"rounds": 0, "dropped": 0})
+    stats = state.COMPACT_STATS.setdefault(conv_key, {"rounds": 0, "dropped": 0})
     stats["rounds"] += 1
     stats["dropped"] += len(dropped)
     # The server's last token count described the conversation *before* the cut, so it
     # is no evidence about the one we now have — leaving it in place would make the
     # proactive trigger compact again on every following turn. Until the next reply
     # reports usage, /status and the trigger fall back to the estimate.
-    USAGE_BY_CONV.pop(conv_key, None)
+    state.USAGE_BY_CONV.pop(conv_key, None)
 
     report = (
         f"compacted {len(dropped)} turns into a handoff note: {total} → {len(messages)} "
@@ -1641,27 +1136,27 @@ def _compact_if_needed(messages: list, conv_key, model: str = "", interactive: b
     Says what it did (or, once per conversation, why it is stuck) so a session that
     compacts itself is visible instead of mysterious. Returns whether it compacted.
     """
-    if not AUTO_COMPACT or CONTEXT_WINDOW <= 0:
+    if not state.AUTO_COMPACT or state.CONTEXT_WINDOW <= 0:
         return False  # no window to compare against: the reactive trigger covers that
     used = _context_tokens_used(messages, conv_key)
-    threshold = max(1, CONTEXT_WINDOW * COMPACT_THRESHOLD_PCT // 100)
+    threshold = max(1, state.CONTEXT_WINDOW * state.COMPACT_THRESHOLD_PCT // 100)
     if used < threshold:
         return False
     ok, note = compact_messages(
         messages, conv_key, model=model, reason="proactive", interactive=interactive
     )
     if ok:
-        print(OUTPUT_INDENT + colorize(f"{icon('wait')} {note}", "dim"))
+        print(state.OUTPUT_INDENT + colorize(f"{icon('wait')} {note}", "dim"))
         return True
-    stats = COMPACT_STATS.setdefault(conv_key, {"rounds": 0, "dropped": 0, "warned": False})
+    stats = state.COMPACT_STATS.setdefault(conv_key, {"rounds": 0, "dropped": 0, "warned": False})
     if not stats.get("warned"):
         # Said once: the threshold will keep being crossed from here, and repeating the
         # same refusal every turn is noise.
         stats["warned"] = True
         print(
-            OUTPUT_INDENT
+            state.OUTPUT_INDENT
             + colorize(
-                f"{icon('wait')} context is {used}/{CONTEXT_WINDOW} tokens but not compacting: {note}",
+                f"{icon('wait')} context is {used}/{state.CONTEXT_WINDOW} tokens but not compacting: {note}",
                 "dim",
             )
         )
@@ -1679,33 +1174,33 @@ def _recover_overflow(messages: list, conv_key, model: str, reason: str,
     Returns False when the run is genuinely out of context: the attempts are spent, or
     there is nothing left that compaction could drop.
     """
-    if attempts >= COMPACT_MAX_ATTEMPTS:
+    if attempts >= state.COMPACT_MAX_ATTEMPTS:
         return False
-    if not AUTO_COMPACT:
+    if not state.AUTO_COMPACT:
         print(
-            OUTPUT_INDENT
+            state.OUTPUT_INDENT
             + colorize(f"{icon('wait')} context is full ({reason}) and auto-compaction is off — /compact to make room", "dim")
         )
         return False
-    print(OUTPUT_INDENT + colorize(f"{icon('wait')} the server rejected the prompt: {reason}", "error"))
+    print(state.OUTPUT_INDENT + colorize(f"{icon('wait')} the server rejected the prompt: {reason}", "error"))
     ok, note = compact_messages(
         messages, conv_key, model=model, reason="overflow", interactive=interactive
     )
     if not ok:
         print(
-            OUTPUT_INDENT
+            state.OUTPUT_INDENT
             + colorize(f"{icon('error')} context is full and compaction cannot help: {note}", "error")
         )
         return False
-    print(OUTPUT_INDENT + colorize(f"{icon('wait')} {note} — retrying the request", "tool"))
+    print(state.OUTPUT_INDENT + colorize(f"{icon('wait')} {note} — retrying the request", "tool"))
     return True
 
 
 def _transcript_hint(conv_key) -> str:
     """Tells a stranded run where its transcript still is (out-of-context report)."""
-    if not SESSION_LOG:
+    if not state.SESSION_LOG:
         return "the transcript was not journaled (--no-session-log), so there is nothing to read back"
-    path = SESSION_FILES.get(conv_key) or _session_path()
+    path = state.SESSION_FILES.get(conv_key) or _session_path()
     return (
         f"the transcript is in {path}: read the turns that were dropped with the sessions "
         f"tool, or continue this session with --resume {_session_id_of(path)}"
@@ -1714,39 +1209,38 @@ def _transcript_hint(conv_key) -> str:
 
 def set_auto_compact(arg: str) -> str:
     """Apply an /auto-compact argument; return the status line to print ('' = unknown)."""
-    global AUTO_COMPACT, COMPACT_THRESHOLD_PCT
     v = arg.strip().lower()
     if v in ("on", "true", "yes", "1"):
-        AUTO_COMPACT = True
-        return f"auto-compact on — compaction starts at {COMPACT_THRESHOLD_PCT}% of the window"
+        state.AUTO_COMPACT = True
+        return f"auto-compact on — compaction starts at {state.COMPACT_THRESHOLD_PCT}% of the window"
     if v in ("off", "false", "no", "0"):
-        AUTO_COMPACT = False
+        state.AUTO_COMPACT = False
         return "auto-compact off — only /compact (and a rejected request) will compact"
     if v.startswith("threshold"):
         rest = v[len("threshold"):].strip()
         try:
-            COMPACT_THRESHOLD_PCT = _clamp_int(int(rest), 1, COMPACT_THRESHOLD_CEILING)
+            state.COMPACT_THRESHOLD_PCT = caps._clamp_int(int(rest), 1, config.COMPACT_THRESHOLD_CEILING)
         except ValueError:
             return ""
-        return f"auto-compact threshold: {COMPACT_THRESHOLD_PCT}% of the context window"
+        return f"auto-compact threshold: {state.COMPACT_THRESHOLD_PCT}% of the context window"
     if not v:
         return (
-            f"auto-compact {'on' if AUTO_COMPACT else 'off'} at "
-            f"{COMPACT_THRESHOLD_PCT}% of the window (/auto-compact on|off|threshold N)"
+            f"auto-compact {'on' if state.AUTO_COMPACT else 'off'} at "
+            f"{state.COMPACT_THRESHOLD_PCT}% of the window (/auto-compact on|off|threshold N)"
         )
     return ""
 
 
 def format_compaction() -> str:
     """The /status line on compaction: what it would do, and what it already did."""
-    window = f"{CONTEXT_WINDOW} tokens" if CONTEXT_WINDOW > 0 else "window unknown"
-    rounds = sum(int(s.get("rounds", 0)) for s in COMPACT_STATS.values())
-    dropped = sum(int(s.get("dropped", 0)) for s in COMPACT_STATS.values())
+    window = f"{state.CONTEXT_WINDOW} tokens" if state.CONTEXT_WINDOW > 0 else "window unknown"
+    rounds = sum(int(s.get("rounds", 0)) for s in state.COMPACT_STATS.values())
+    dropped = sum(int(s.get("dropped", 0)) for s in state.COMPACT_STATS.values())
     done = f"{rounds} round(s), {dropped} turns replaced" if rounds else "no compactions yet"
     return (
-        f"compaction: auto-compact {'on' if AUTO_COMPACT else 'off'} at "
-        f"{COMPACT_THRESHOLD_PCT}% of {window}, tail keeps {COMPACT_KEEP_TOKENS_PCT}% of it "
-        f"({COMPACT_KEEP_MIN_MESSAGES} messages minimum); {done}; /compact to do it now"
+        f"compaction: auto-compact {'on' if state.AUTO_COMPACT else 'off'} at "
+        f"{state.COMPACT_THRESHOLD_PCT}% of {window}, tail keeps {state.COMPACT_KEEP_TOKENS_PCT}% of it "
+        f"({config.COMPACT_KEEP_MIN_MESSAGES} messages minimum); {done}; /compact to do it now"
     )
 
 
@@ -1754,13 +1248,13 @@ def format_compaction() -> str:
 
 
 def tool_get_cwd(args: dict) -> str:
-    return CWD
+    return state.CWD
 
 
 def tool_exit(args: dict):
     code = int(args.get("code", 0))
     message = args.get("message", "")
-    raise ExitSignal(code, message)
+    raise errors.ExitSignal(code, message)
 
 
 def _prompt_line(prompt: str):
@@ -1774,7 +1268,7 @@ def _prompt_line(prompt: str):
 
 
 def _print_question(text: str):
-    print(OUTPUT_INDENT + colorize(f"{icon('thinking')} {text}", "assistant"), flush=True)
+    print(state.OUTPUT_INDENT + colorize(f"{icon('thinking')} {text}", "assistant"), flush=True)
 
 
 def tool_ask_user(args: dict) -> str:
@@ -1788,10 +1282,10 @@ def tool_ask_user(args: dict) -> str:
     print()
     _print_question(question)
     for i, opt in enumerate(options, 1):
-        print(OUTPUT_INDENT + colorize(f"  {i}) {opt}", "dim"))
+        print(state.OUTPUT_INDENT + colorize(f"  {i}) {opt}", "dim"))
     if options:
-        print(OUTPUT_INDENT + colorize("  (or type your own answer)", "dim"))
-    prompt = OUTPUT_INDENT + colorize(f"{icon('user')} answer> ", "user")
+        print(state.OUTPUT_INDENT + colorize("  (or type your own answer)", "dim"))
+    prompt = state.OUTPUT_INDENT + colorize(f"{icon('user')} answer> ", "user")
     answer = _prompt_line(prompt)
     if answer is None:
         return "user cancelled (no answer)"
@@ -1805,9 +1299,6 @@ def tool_ask_user(args: dict) -> str:
         if 1 <= idx <= len(options):
             return f"user selected: {options[idx - 1]}"
     return f"user answered: {answer}"
-
-
-_SHELL_CACHE: dict[str, tuple] = {}
 
 
 def _resolve_shell(preferred: str = "auto") -> tuple:
@@ -1827,8 +1318,8 @@ def _resolve_shell(preferred: str = "auto") -> tuple:
     """
     if os.name != "nt":
         return (None, "")
-    if preferred in _SHELL_CACHE:
-        return _SHELL_CACHE[preferred]
+    if preferred in state._SHELL_CACHE:
+        return state._SHELL_CACHE[preferred]
 
     def _pwsh():
         p = shutil.which("pwsh")
@@ -1854,7 +1345,7 @@ def _resolve_shell(preferred: str = "auto") -> tuple:
         if result is None:
             a = _ps()
             result = (a, utf8) if a else (None, "")
-    _SHELL_CACHE[preferred] = result
+    state._SHELL_CACHE[preferred] = result
     return result
 
 
@@ -1887,7 +1378,7 @@ def _kill_tree(proc) -> None:
             subprocess.run(
                 _TASKKILL + [str(proc.pid), "/T", "/F"],
                 capture_output=True,
-                timeout=TASKKILL_TIMEOUT,
+                timeout=config.TASKKILL_TIMEOUT,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             return
@@ -1920,7 +1411,7 @@ def _drain_killed(proc, exc) -> tuple:
     if isinstance(getattr(exc, "output", None), tuple):
         exc_out, exc_err = exc.output
     try:
-        out, err = proc.communicate(timeout=KILL_DRAIN_TIMEOUT)
+        out, err = proc.communicate(timeout=config.KILL_DRAIN_TIMEOUT)
     except subprocess.TimeoutExpired:
         out, err = None, None  # give up on the pipes rather than wait forever
         for pipe in (proc.stdout, proc.stderr):
@@ -1932,7 +1423,7 @@ def _drain_killed(proc, exc) -> tuple:
     except (OSError, ValueError):
         out, err = None, None
     try:
-        proc.wait(timeout=KILL_DRAIN_TIMEOUT)
+        proc.wait(timeout=config.KILL_DRAIN_TIMEOUT)
     except subprocess.TimeoutExpired:
         pass  # already killed: stop caring instead of hanging on it
     return (out or exc_out or ""), (err or exc_err or "")
@@ -1946,14 +1437,14 @@ def _shell_timeout(args: dict) -> tuple:
     """
     raw = args.get("timeout")
     if raw is None:
-        raw = SHELL_TIMEOUT_DEFAULT
+        raw = config.SHELL_TIMEOUT_DEFAULT
     try:
         timeout = int(float(raw))
     except (TypeError, ValueError):
         return 0, "error: timeout must be a number of seconds"
-    if timeout < SHELL_TIMEOUT_MIN:
-        return 0, f"error: timeout must be >= {SHELL_TIMEOUT_MIN}"
-    return min(timeout, SHELL_TIMEOUT_CEILING), None
+    if timeout < config.SHELL_TIMEOUT_MIN:
+        return 0, f"error: timeout must be >= {config.SHELL_TIMEOUT_MIN}"
+    return min(timeout, config.SHELL_TIMEOUT_CEILING), None
 
 
 def tool_run_shell(args: dict) -> str:
@@ -1963,8 +1454,8 @@ def tool_run_shell(args: dict) -> str:
     timeout, bad_timeout = _shell_timeout(args)
     if bad_timeout:
         return bad_timeout
-    limit = _limit_arg(args, "max_output", SHELL_OUTPUT_LIMIT, TOOL_RESULT_LIMIT)
-    argv_prefix, command_prefix = _resolve_shell(SHELL_PREFERRED)
+    limit = caps._limit_arg(args, "max_output", config.SHELL_OUTPUT_LIMIT, config.TOOL_RESULT_LIMIT)
+    argv_prefix, command_prefix = _resolve_shell(state.SHELL_PREFERRED)
     if argv_prefix is not None:
         # PowerShell -Command maps any non-zero native exit code to 1; append
         # `exit $LASTEXITCODE` so the real exit code of the last native command
@@ -1980,7 +1471,7 @@ def tool_run_shell(args: dict) -> str:
         encoding = None
     spawn = {
         "shell": shell,
-        "cwd": CWD,
+        "cwd": state.CWD,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "text": True,
@@ -2017,7 +1508,7 @@ def tool_run_shell(args: dict) -> str:
         if chunks:
             parts.append(
                 "[partial output]\n"
-                + _truncate(
+                + caps._truncate(
                     "\n".join(chunks),
                     limit,
                     hint=(
@@ -2033,7 +1524,7 @@ def tool_run_shell(args: dict) -> str:
     if stderr:
         out.append(f"[stderr]\n{stderr.rstrip()}")
     result = "\n".join(out) if out else "(no output)"
-    result = _truncate(
+    result = caps._truncate(
         result,
         limit,
         hint="re-run with a larger max_output, or redirect to a file and read it with read_file",
@@ -2042,22 +1533,14 @@ def tool_run_shell(args: dict) -> str:
 
 
 def tool_mkdir(args: dict) -> str:
-    path = safe_resolve(args["path"])
+    path = paths.safe_resolve(args["path"])
     os.makedirs(path, exist_ok=True)
     return f"created directory: {path}"
 
 
-def _read_lines(path: str) -> list:
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        lines = f.read().split("\n")
-    if lines and lines[-1] == "":
-        lines.pop()
-    return lines
-
-
 def tool_read_file(args: dict) -> str:
-    path = safe_resolve(args["path"])
-    lines = _read_lines(path)
+    path = paths.safe_resolve(args["path"])
+    lines = paths._read_lines(path)
     offset = int(args.get("offset", 1))
     count = int(args.get("lines", 0))
     if offset < 1:
@@ -2070,8 +1553,8 @@ def tool_read_file(args: dict) -> str:
     if args.get("line_numbers", True):
         selected = [f"{i + start + 1}: {line}" for i, line in enumerate(selected)]
     content = "\n".join(selected)
-    limit = _limit_arg(args, "max_chars", READ_FILE_LIMIT, TOOL_RESULT_LIMIT)
-    content = _truncate(
+    limit = caps._limit_arg(args, "max_chars", config.READ_FILE_LIMIT, config.TOOL_RESULT_LIMIT)
+    content = caps._truncate(
         content, limit, hint="read the rest with offset/lines, or raise max_chars"
     )
     if content and (offset != 1 or count != 0):
@@ -2080,7 +1563,7 @@ def tool_read_file(args: dict) -> str:
 
 
 def tool_write_file(args: dict) -> str:
-    path = safe_resolve(args["path"])
+    path = paths.safe_resolve(args["path"])
     content = args["content"]
     content_lines = content.split("\n")
     if content_lines and content_lines[-1] == "":
@@ -2095,7 +1578,7 @@ def tool_write_file(args: dict) -> str:
     if offset < 1 or n < 0:
         return "error: offset must be >= 1 and lines must be >= 0"
     try:
-        existing = _read_lines(path)
+        existing = paths._read_lines(path)
     except FileNotFoundError:
         return f"error: file does not exist, cannot modify line range: {path}"
     if offset > len(existing) + 1:
@@ -2232,7 +1715,7 @@ def _gitignore_file(dir_abs: str):
     """The rules declared by `dir_abs/.gitignore`, or None if it has no such file."""
     try:
         with open(
-            os.path.join(dir_abs, GITIGNORE_NAME), "r", encoding="utf-8", errors="replace"
+            os.path.join(dir_abs, config.GITIGNORE_NAME), "r", encoding="utf-8", errors="replace"
         ) as f:
             return _gitignore_rules(f.read(), dir_abs)
     except OSError:
@@ -2252,7 +1735,7 @@ def _gitignore_ancestors(root: str) -> list:
     if os.path.exists(os.path.join(os.path.abspath(root), ".git")):
         return []  # the searched directory is itself a work-tree root: nothing above applies
     chain = []
-    for _ in range(GITIGNORE_ANCESTOR_SCAN):
+    for _ in range(config.GITIGNORE_ANCESTOR_SCAN):
         if not d:
             break
         chain.append(d)
@@ -2301,7 +1784,7 @@ def _gitignored_note(ignored: int) -> str:
         return ""
     return (
         f"\n... [{ignored} gitignored path{'s' if ignored != 1 else ''} skipped per "
-        f"{GITIGNORE_NAME}; pass respect_gitignore:false to include them]"
+        f"{config.GITIGNORE_NAME}; pass respect_gitignore:false to include them]"
     )
 
 
@@ -2338,7 +1821,7 @@ def _iter_files(root: str, respect_gitignore: bool = True, ignored: list = None)
             continue
         subdirs = []
         for entry in entries:
-            if entry.name in GITIGNORE_SKIP_NAMES:
+            if entry.name in config.GITIGNORE_SKIP_NAMES:
                 continue
             try:
                 is_dir = entry.is_dir()
@@ -2359,41 +1842,41 @@ def _iter_files(root: str, respect_gitignore: bool = True, ignored: list = None)
 
 
 def tool_grep(args: dict) -> str:
-    root = safe_resolve(args["path"])
+    root = paths.safe_resolve(args["path"])
     if not os.path.exists(root):
         return f"error: path not found: {args['path']}"
-    case_sensitive = _bool_arg(args, "case_sensitive", True)
-    pattern = re.compile(args["pattern"], _case_flags(case_sensitive))
+    case_sensitive = caps._bool_arg(args, "case_sensitive", True)
+    pattern = re.compile(args["pattern"], paths._case_flags(case_sensitive))
     context = max(0, int(args.get("context", 0)))
-    limit = _limit_arg(args, "limit", GREP_MATCH_LIMIT, MAX_COUNT_LIMIT)
+    limit = caps._limit_arg(args, "limit", config.GREP_MATCH_LIMIT, config.MAX_COUNT_LIMIT)
     ignored = [0]
-    walk = _iter_files(root, _bool_arg(args, "respect_gitignore", True), ignored)
+    walk = _iter_files(root, caps._bool_arg(args, "respect_gitignore", True), ignored)
     file_pattern = args.get("file_pattern")
     file_re = (
-        _glob_to_regex(file_pattern, case_sensitive) if file_pattern else None
+        paths._glob_to_regex(file_pattern, case_sensitive) if file_pattern else None
     )
     matches = []
     used = 0
-    roots = _cwd_roots()
+    roots = paths._cwd_roots()
 
     def capped() -> str:
         """Build the truncation note: stopped by match count, or by output size."""
         if len(matches) >= limit:
             stat = f"{limit} matching lines shown, more exist"
         else:
-            stat = f"output capped at {GREP_TEXT_LIMIT} chars ({used} shown)"
-        return "\n".join(matches) + _cap_note(
+            stat = f"output capped at {config.GREP_TEXT_LIMIT} chars ({used} shown)"
+        return "\n".join(matches) + caps._cap_note(
             stat, "narrow the pattern or file_pattern, or raise limit"
         )
 
     for fp in walk:
-        rel = _rel_to_cwd(fp, roots)
+        rel = paths._rel_to_cwd(fp, roots)
         if file_re is not None and not (
             file_re.search(rel) or file_re.search(os.path.basename(rel))
         ):
             continue
         try:
-            lines = _read_lines(fp)
+            lines = paths._read_lines(fp)
         except (OSError, UnicodeDecodeError):
             continue
         hit_idx = [i for i, line in enumerate(lines) if pattern.search(line)]
@@ -2414,13 +1897,13 @@ def tool_grep(args: dict) -> str:
                     entries.append("--")
                 prefix = ">" if j in hits else " "
                 entries.append(
-                    f"{prefix} {rel}:{j + 1}: {_clip_line(lines[j], GREP_LINE_LIMIT)}"
+                    f"{prefix} {rel}:{j + 1}: {caps._clip_line(lines[j], config.GREP_LINE_LIMIT)}"
                 )
         else:
             for i in hit_idx:
-                entries.append(f"{rel}:{i + 1}: {_clip_line(lines[i], GREP_LINE_LIMIT)}")
+                entries.append(f"{rel}:{i + 1}: {caps._clip_line(lines[i], config.GREP_LINE_LIMIT)}")
         for entry in entries:
-            if len(matches) >= limit or used + len(entry) > GREP_TEXT_LIMIT:
+            if len(matches) >= limit or used + len(entry) > config.GREP_TEXT_LIMIT:
                 return capped()
             matches.append(entry)
             used += len(entry)
@@ -2432,7 +1915,7 @@ def tool_grep(args: dict) -> str:
 
 
 def tool_patch_file(args: dict) -> str:
-    path = safe_resolve(args["path"])
+    path = paths.safe_resolve(args["path"])
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         content = f.read()
     old = args["old_string"]
@@ -2482,34 +1965,34 @@ def tool_patch_file(args: dict) -> str:
 
 
 def tool_glob(args: dict) -> str:
-    root = safe_resolve(args["path"])
+    root = paths.safe_resolve(args["path"])
     if not os.path.exists(root):
         return f"error: path not found: {args['path']}"
     pattern = args["pattern"]
-    case_sensitive = _bool_arg(args, "case_sensitive", True)
-    regex = _glob_to_regex(pattern, case_sensitive)
+    case_sensitive = caps._bool_arg(args, "case_sensitive", True)
+    regex = paths._glob_to_regex(pattern, case_sensitive)
     results = []
-    roots = _cwd_roots()
+    roots = paths._cwd_roots()
     ignored = [0]
-    walk = _iter_files(root, _bool_arg(args, "respect_gitignore", True), ignored)
+    walk = _iter_files(root, caps._bool_arg(args, "respect_gitignore", True), ignored)
     for fp in walk:
-        rel = _rel_to_cwd(fp, roots)
+        rel = paths._rel_to_cwd(fp, roots)
         if regex.search(rel):
             results.append(rel)
     if not results:
         return "no files matched" + _gitignored_note(ignored[0])
-    limit = _limit_arg(args, "limit", LIST_LIMIT, MAX_COUNT_LIMIT)
-    return _cap_count(
+    limit = caps._limit_arg(args, "limit", config.LIST_LIMIT, config.MAX_COUNT_LIMIT)
+    return caps._cap_count(
         sorted(results), limit, unit="files", hint="narrow the pattern, or raise limit"
     )
 
 
 def tool_list_dir(args: dict) -> str:
-    path = safe_resolve(args["path"])
+    path = paths.safe_resolve(args["path"])
     if not os.path.isdir(path):
         return f"error: not a directory: {args['path']}"
     entries = sorted(os.listdir(path))
-    limit = _limit_arg(args, "limit", LIST_LIMIT, MAX_COUNT_LIMIT)
+    limit = caps._limit_arg(args, "limit", config.LIST_LIMIT, config.MAX_COUNT_LIMIT)
     out = []
     for name in entries[:limit]:
         full = os.path.join(path, name)
@@ -2518,7 +2001,7 @@ def tool_list_dir(args: dict) -> str:
         return "(empty)"
     result = "\n".join(out)
     if len(entries) > limit:
-        result += _cap_note(
+        result += caps._cap_note(
             f"{len(entries)} entries, showing first {limit}",
             "raise limit, or glob the directory for a narrower match",
         )
@@ -2526,7 +2009,7 @@ def tool_list_dir(args: dict) -> str:
 
 
 def tool_delete_file(args: dict) -> str:
-    path = safe_resolve(args["path"])
+    path = paths.safe_resolve(args["path"])
     if not os.path.exists(path):
         return f"error: file does not exist: {args['path']}"
     if os.path.isdir(path):
@@ -2536,8 +2019,8 @@ def tool_delete_file(args: dict) -> str:
 
 
 def tool_move_file(args: dict) -> str:
-    src = safe_resolve(args["src"])
-    dst = safe_resolve(args["dst"])
+    src = paths.safe_resolve(args["src"])
+    dst = paths.safe_resolve(args["dst"])
     if not os.path.exists(src):
         return f"error: source does not exist: {args['src']}"
     os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
@@ -2546,22 +2029,13 @@ def tool_move_file(args: dict) -> str:
 
 
 def tool_copy_file(args: dict) -> str:
-    src = safe_resolve(args["src"])
-    dst = safe_resolve(args["dst"])
+    src = paths.safe_resolve(args["src"])
+    dst = paths.safe_resolve(args["dst"])
     if not os.path.exists(src):
         return f"error: source does not exist: {args['src']}"
     os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
     shutil.copy2(src, dst)
     return f"copied {src} -> {dst}"
-
-
-_HTML_BLOCK_TAGS = {
-    "address", "article", "aside", "blockquote", "br", "dd", "div", "dl", "dt",
-    "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4",
-    "h5", "h6", "header", "hr", "li", "main", "nav", "ol", "p", "pre", "section",
-    "table", "tbody", "td", "tfoot", "th", "thead", "tr", "ul",
-}
-_HTML_SKIP_TAGS = {"script", "style", "head", "noscript", "template", "svg"}
 
 
 class _HTMLTextExtractor(html.parser.HTMLParser):
@@ -2571,19 +2045,19 @@ class _HTMLTextExtractor(html.parser.HTMLParser):
         self._skip = 0
 
     def handle_starttag(self, tag, attrs):
-        if tag in _HTML_SKIP_TAGS:
+        if tag in config._HTML_SKIP_TAGS:
             self._skip += 1
-        elif tag in _HTML_BLOCK_TAGS:
+        elif tag in config._HTML_BLOCK_TAGS:
             self.parts.append("\n")
 
     def handle_startendtag(self, tag, attrs):
-        if tag in _HTML_BLOCK_TAGS:
+        if tag in config._HTML_BLOCK_TAGS:
             self.parts.append("\n")
 
     def handle_endtag(self, tag):
-        if tag in _HTML_SKIP_TAGS:
+        if tag in config._HTML_SKIP_TAGS:
             self._skip = max(0, self._skip - 1)
-        elif tag in _HTML_BLOCK_TAGS:
+        elif tag in config._HTML_BLOCK_TAGS:
             self.parts.append("\n")
 
     def handle_data(self, data):
@@ -2648,34 +2122,15 @@ def tool_fetch_url(args: dict) -> str:
         text = data.decode("utf-8", errors="replace")
     if args.get("strip_html"):
         text = _html_to_text(text)
-    limit = _limit_arg(args, "max_chars", FETCH_TEXT_LIMIT, TOOL_RESULT_LIMIT)
+    limit = caps._limit_arg(args, "max_chars", config.FETCH_TEXT_LIMIT, config.TOOL_RESULT_LIMIT)
     clipped = len(text) > limit
-    text = _truncate(text, limit, hint="raise max_chars, or fetch a narrower URL")
+    text = caps._truncate(text, limit, hint="raise max_chars, or fetch a narrower URL")
     if truncated and not clipped:
-        text += _cap_note(
+        text += caps._cap_note(
             f"body read stopped at {max_bytes} bytes",
             "the response is larger than the harness read ceiling",
         )
     return text if text else "(empty)"
-
-
-SUBAGENT_NOTE = (
-    "You are a sub-agent delegated a specific task. Work autonomously using the tools. "
-    "The parent receives only your closing message: none of your tool output and nothing "
-    "you merely print reaches it. Make that message carry the result — self-contained and "
-    "concise, key findings with file paths and line numbers, decisions, and caveats, "
-    "omitting intermediate detail (aim for under 50 lines unless the task asks for more). "
-    "When the task is complete, write that summary as your reply and then call the exit "
-    "tool with code 0 — or pass the same summary as exit's `message` argument; the harness "
-    "reads either and keeps the more substantive one. If the task cannot be completed, say "
-    "why in your closing message and call exit with a non-zero code."
-)
-# Result a delegating agent gets when its sub-agent was interrupted. The note
-# is carried further up the delegation chain as-is instead of being re-wrapped
-# at every level.
-SUBAGENT_INTERRUPT_PREFIX = (
-    "(sub-agent interrupted by the user; the output below is partial)"
-)
 
 
 def _closing_summary(messages: list, exit_note: str) -> str:
@@ -2712,7 +2167,7 @@ def _closing_summary(messages: list, exit_note: str) -> str:
         return closing
     for salvage in (reasoning, earlier_content):
         if salvage:
-            return SALVAGED_SUMMARY_NOTE + "\n" + salvage
+            return config.SALVAGED_SUMMARY_NOTE + "\n" + salvage
     return ""
 
 
@@ -2726,13 +2181,13 @@ def tool_task(args: dict) -> str:
     task = (args.get("task") or "").strip()
     if not task:
         return "error: empty task"
-    if _AGENT_DEPTH >= MAX_SUBAGENT_DEPTH:
+    if state._AGENT_DEPTH >= state.MAX_SUBAGENT_DEPTH:
         return (
             "error: sub-agent depth limit reached — nesting is capped at "
-            f"{MAX_SUBAGENT_DEPTH} level(s) and this call would be level "
-            f"{_AGENT_DEPTH + 1}; do the work yourself"
+            f"{state.MAX_SUBAGENT_DEPTH} level(s) and this call would be level "
+            f"{state._AGENT_DEPTH + 1}; do the work yourself"
         )
-    system = get_system_prompt(CWD, SUBAGENT_NOTE)
+    system = get_system_prompt(state.CWD, config.SUBAGENT_NOTE)
     agents_md = load_agents_md()
     if agents_md:
         system += (
@@ -2746,29 +2201,28 @@ def tool_task(args: dict) -> str:
         {"role": "system", "content": system},
         {"role": "user", "content": task},
     ]
-    global OUTPUT_INDENT, TODO_LAST_INJECTED, _NEXT_CONV_ID, AGENT_LOG_ID, SUBAGENT_CHILDREN
-    old_indent = OUTPUT_INDENT
-    old_todo_state = TODO_LAST_INJECTED
-    old_log_id = AGENT_LOG_ID
-    conv_id = _NEXT_CONV_ID
-    _NEXT_CONV_ID += 1
+    old_indent = state.OUTPUT_INDENT
+    old_todo_state = state.TODO_LAST_INJECTED
+    old_log_id = state.AGENT_LOG_ID
+    conv_id = state._NEXT_CONV_ID
+    state._NEXT_CONV_ID += 1
     # A sub-agent's log is named after where it sits in the delegation chain: the
     # session's first sub-agent is '1', the next is '2', and one of them
     # delegating again is '1.1' — so <session>.1.2.jsonl says who delegated it.
-    parent_log_id = AGENT_LOG_ID
-    child_n = SUBAGENT_CHILDREN.get(parent_log_id, 0) + 1
-    SUBAGENT_CHILDREN[parent_log_id] = child_n
+    parent_log_id = state.AGENT_LOG_ID
+    child_n = state.SUBAGENT_CHILDREN.get(parent_log_id, 0) + 1
+    state.SUBAGENT_CHILDREN[parent_log_id] = child_n
     log_id = f"{parent_log_id}.{child_n}" if parent_log_id else str(child_n)
-    OUTPUT_INDENT = old_indent + "  "
-    AGENT_LOG_ID = log_id
+    state.OUTPUT_INDENT = old_indent + "  "
+    state.AGENT_LOG_ID = log_id
     _session_open(
         conv_id,
-        _session_path(SESSION_ID, log_id),
+        _session_path(state.SESSION_ID, log_id),
         {
-            "depth": _AGENT_DEPTH + 1,
+            "depth": state._AGENT_DEPTH + 1,
             "mode": "sub-agent",
             "subagent_id": log_id,
-            "parent_log": _session_path(SESSION_ID, parent_log_id),
+            "parent_log": _session_path(state.SESSION_ID, parent_log_id),
             "task": task,
         },
     )
@@ -2781,10 +2235,10 @@ def tool_task(args: dict) -> str:
         try:
             code = run_agent(
                 messages,
-                MODEL,
+                state.MODEL,
                 interactive=False,
-                temperature=TEMPERATURE,
-                depth=_AGENT_DEPTH + 1,
+                temperature=state.TEMPERATURE,
+                depth=state._AGENT_DEPTH + 1,
                 conv_id=conv_id,
             )
         except StreamInterrupted as e:
@@ -2796,11 +2250,11 @@ def tool_task(args: dict) -> str:
             code = 0
         except SubagentStepLimit:
             step_limited = True
-            code = SUBAGENT_STEP_LIMIT_CODE
+            code = config.SUBAGENT_STEP_LIMIT_CODE
     finally:
-        OUTPUT_INDENT = old_indent
-        TODO_LAST_INJECTED = old_todo_state
-        AGENT_LOG_ID = old_log_id
+        state.OUTPUT_INDENT = old_indent
+        state.TODO_LAST_INJECTED = old_todo_state
+        state.AGENT_LOG_ID = old_log_id
         if code is not None:
             # The sub-agent's own log closes with how it ended: a reader (and the
             # next compaction pass) can tell a clean exit from a stop.
@@ -2815,18 +2269,18 @@ def tool_task(args: dict) -> str:
             )
         # The sub-agent's messages list is freed on return; drop its usage
         # entry so the address can't be recycled and resurrect stale usage.
-        USAGE_BY_CONV.pop(conv_id, None)
+        state.USAGE_BY_CONV.pop(conv_id, None)
         # Same for its journal state: the file stays on disk, but the conversation
         # key is free again (an id() fallback could otherwise land on it later).
-        SESSION_FILES.pop(conv_id, None)
-        SESSION_SEQ.pop(conv_id, None)
-        SESSION_MSG_SEQ.pop(conv_id, None)
-        COMPACT_STATS.pop(conv_id, None)
-        SUBAGENT_CHILDREN.pop(log_id, None)
+        state.SESSION_FILES.pop(conv_id, None)
+        state.SESSION_SEQ.pop(conv_id, None)
+        state.SESSION_MSG_SEQ.pop(conv_id, None)
+        state.COMPACT_STATS.pop(conv_id, None)
+        state.SUBAGENT_CHILDREN.pop(log_id, None)
         # An `exit(message=...)` argument is the sub-agent's own closing
         # statement: _agent_loop prints it, and only here does it reach the
         # parent.
-        exit_note = EXIT_NOTE_BY_CONV.pop(conv_id, "") or ""
+        exit_note = state.EXIT_NOTE_BY_CONV.pop(conv_id, "") or ""
     final = _closing_summary(messages, exit_note)
     if interrupt_note:
         final = interrupt_note
@@ -2834,46 +2288,38 @@ def tool_task(args: dict) -> str:
         # No hand-off text anywhere: say so. A bare "exit code: 0" reads to the
         # model as "the sub-agent found nothing", which is how a lost summary
         # gets paid for twice.
-        final = NO_SUMMARY_NOTE
+        final = config.NO_SUMMARY_NOTE
     if step_limited:
         final = (
             final
             + "\n\n(sub-agent stopped: it reached its step limit of "
-            f"{SUBAGENT_STEP_LIMIT} model turns; this summary may be incomplete)"
+            f"{state.SUBAGENT_STEP_LIMIT} model turns; this summary may be incomplete)"
         ).strip()
-    final = _truncate(
+    final = caps._truncate(
         final,
-        SUBAGENT_SUMMARY_LIMIT,
+        config.SUBAGENT_SUMMARY_LIMIT,
         hint="delegate a narrower task, or ask the sub-agent for a shorter summary",
     )
     if interrupted:
-        if final.startswith(SUBAGENT_INTERRUPT_PREFIX):
-            body = final[len(SUBAGENT_INTERRUPT_PREFIX):]  # wrapped already, deeper up
+        if final.startswith(config.SUBAGENT_INTERRUPT_PREFIX):
+            body = final[len(config.SUBAGENT_INTERRUPT_PREFIX):]  # wrapped already, deeper up
         else:
             body = f"\n{final}" if final else ""
         raise SubagentInterrupted(
-            {"role": "assistant", "content": SUBAGENT_INTERRUPT_PREFIX + body}
+            {"role": "assistant", "content": config.SUBAGENT_INTERRUPT_PREFIX + body}
         )
     return f"exit code: {code}\n{final}"
 
 
 # ---------------------------------------------------------------- state tools
 
-TODO_ITEMS = []  # [{"id": int, "text": str, "status": "pending"|"in_progress"|"done"}]
-TODO_NEXT_ID = 1
-TODO_FILE = os.path.join(CWD, ".harnless", "todo.md")
-TODO_LAST_INJECTED = None  # serialized list state last injected as a reminder
-
-MEMORY_PROJECT_FILE = os.path.join(CWD, ".harnless", "memory.md")
-MEMORY_GLOBAL_FILE = os.path.join(os.path.expanduser("~"), ".harnless", "memory.md")
-
 
 def _todo_render() -> str:
-    if not TODO_ITEMS:
+    if not state.TODO_ITEMS:
         return "(empty)"
     marks = {"pending": " ", "in_progress": "~", "done": "x"}
     return "\n".join(
-        f"- [{marks.get(i['status'], ' ')}] {i['id']}. {i['text']}" for i in TODO_ITEMS
+        f"- [{marks.get(i['status'], ' ')}] {i['id']}. {i['text']}" for i in state.TODO_ITEMS
     )
 
 
@@ -2883,9 +2329,9 @@ def _todo_block() -> str:
     _todo_render() stays uncapped for the file on disk; only what enters the
     conversation is trimmed.
     """
-    return _truncate(
+    return caps._truncate(
         _todo_render(),
-        TODO_BLOCK_LIMIT,
+        config.TODO_BLOCK_LIMIT,
         unit="chars",
         hint="the list is long; mark finished items done and use action 'clear'",
     )
@@ -2893,18 +2339,17 @@ def _todo_block() -> str:
 
 def _todo_save():
     try:
-        os.makedirs(os.path.dirname(TODO_FILE), exist_ok=True)
-        with open(TODO_FILE, "w", encoding="utf-8") as f:
-            f.write(_todo_render() + "\n" if TODO_ITEMS else "")
+        os.makedirs(os.path.dirname(state.TODO_FILE), exist_ok=True)
+        with open(state.TODO_FILE, "w", encoding="utf-8") as f:
+            f.write(_todo_render() + "\n" if state.TODO_ITEMS else "")
     except OSError:
         pass
 
 
 def _todo_load():
     """Load the todo list from TODO_FILE (best effort)."""
-    global TODO_ITEMS, TODO_NEXT_ID, TODO_LAST_INJECTED
     try:
-        with open(TODO_FILE, "r", encoding="utf-8", errors="replace") as f:
+        with open(state.TODO_FILE, "r", encoding="utf-8", errors="replace") as f:
             lines = f.read().splitlines()
     except OSError:
         return
@@ -2922,9 +2367,9 @@ def _todo_load():
             }
         )
     if items:
-        TODO_ITEMS = items
-        TODO_NEXT_ID = max(i["id"] for i in items) + 1
-        TODO_LAST_INJECTED = None
+        state.TODO_ITEMS = items
+        state.TODO_NEXT_ID = max(i["id"] for i in items) + 1
+        state.TODO_LAST_INJECTED = None
 
 
 def _todo_update_one(args: dict):
@@ -2935,7 +2380,7 @@ def _todo_update_one(args: dict):
         tid = int(args["id"])
     except (TypeError, ValueError):
         return "error: id must be an integer"
-    item = next((i for i in TODO_ITEMS if i["id"] == tid), None)
+    item = next((i for i in state.TODO_ITEMS if i["id"] == tid), None)
     if item is None:
         return f"error: no todo with id {tid}"
     if args.get("text"):
@@ -2949,7 +2394,6 @@ def _todo_update_one(args: dict):
 
 
 def tool_todo(args: dict) -> str:
-    global TODO_NEXT_ID
     action = (args.get("action") or "list").strip().lower()
     if action == "add":
         items = args.get("items")
@@ -2961,8 +2405,8 @@ def tool_todo(args: dict) -> str:
         if not texts:
             return "error: 'add' requires text or a non-empty items array"
         for t in texts:
-            TODO_ITEMS.append({"id": TODO_NEXT_ID, "text": t, "status": "pending"})
-            TODO_NEXT_ID += 1
+            state.TODO_ITEMS.append({"id": state.TODO_NEXT_ID, "text": t, "status": "pending"})
+            state.TODO_NEXT_ID += 1
     elif action == "update":
         updates = args.get("updates")
         if isinstance(updates, list):
@@ -2977,7 +2421,7 @@ def tool_todo(args: dict) -> str:
             if err:
                 return err
     elif action == "clear":
-        TODO_ITEMS.clear()
+        state.TODO_ITEMS.clear()
     elif action != "list":
         return f"error: unknown action '{action}' (use add, update, list, or clear)"
     _todo_save()
@@ -2992,16 +2436,15 @@ def _todo_reminder(messages: list, conv_key=None):
     reminder would make the server reject the whole request. It is journaled like
     any other message the model is about to see — the log is the conversation.
     """
-    global TODO_LAST_INJECTED
-    if not TODO_ITEMS:
-        TODO_LAST_INJECTED = None
+    if not state.TODO_ITEMS:
+        state.TODO_LAST_INJECTED = None
         return
-    state = json.dumps(TODO_ITEMS, sort_keys=True)
-    if state == TODO_LAST_INJECTED:
+    signature = json.dumps(state.TODO_ITEMS, sort_keys=True)
+    if signature == state.TODO_LAST_INJECTED:
         return
     messages.append({"role": "user", "content": "Current todo list:\n" + _todo_block()})
     _session_message(messages[-1], conv_key)
-    TODO_LAST_INJECTED = state
+    state.TODO_LAST_INJECTED = signature
 
 
 def _memory_read(path: str) -> list:
@@ -3022,7 +2465,7 @@ def _memory_write(path: str, notes: list):
 
 
 def _memory_path(scope: str) -> str:
-    return MEMORY_PROJECT_FILE if scope == "project" else MEMORY_GLOBAL_FILE
+    return state.MEMORY_PROJECT_FILE if scope == "project" else state.MEMORY_GLOBAL_FILE
 
 
 def tool_memory(args: dict) -> str:
@@ -3058,9 +2501,9 @@ def tool_memory(args: dict) -> str:
         for s in scopes:
             notes = _memory_read(_memory_path(s))
             body = "\n".join(f"- {n}" for n in notes) if notes else "(empty)"
-            body = _truncate(
+            body = caps._truncate(
                 body,
-                MEMORY_BLOCK_LIMIT,
+                config.MEMORY_BLOCK_LIMIT,
                 unit="chars",
                 hint=f"the {s} memory is long; remove stale notes with action 'remove'",
             )
@@ -3076,13 +2519,13 @@ def load_memory() -> str:
     sub-agents), so an unbounded memory file would silently eat context.
     """
     parts = []
-    for label, path in (("project", MEMORY_PROJECT_FILE), ("global", MEMORY_GLOBAL_FILE)):
+    for label, path in (("project", state.MEMORY_PROJECT_FILE), ("global", state.MEMORY_GLOBAL_FILE)):
         notes = _memory_read(path)
         if notes:
             parts.append(f"{label}:\n" + "\n".join(f"- {n}" for n in notes))
-    return _truncate(
+    return caps._truncate(
         "\n\n".join(parts),
-        MEMORY_BLOCK_LIMIT,
+        config.MEMORY_BLOCK_LIMIT,
         unit="chars",
         hint="memory is long; remove stale or superseded notes",
     )
@@ -3114,7 +2557,7 @@ TOOLS = {
             "function": {
                 "name": "run_shell",
                 "description": "Run a command in the current working directory."
-                + SHELL_NOTE,
+                + config.SHELL_NOTE,
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -3125,16 +2568,16 @@ TOOLS = {
                         "timeout": {
                             "type": "integer",
                             "description": (
-                                f"Timeout in seconds (default {SHELL_TIMEOUT_DEFAULT}, max "
-                                f"{SHELL_TIMEOUT_CEILING}); on expiry the command and everything "
+                                f"Timeout in seconds (default {config.SHELL_TIMEOUT_DEFAULT}, max "
+                                f"{config.SHELL_TIMEOUT_CEILING}); on expiry the command and everything "
                                 "it started are killed and whatever it printed so far is returned"
                             ),
                         },
                         "max_output": {
                             "type": "integer",
                             "description": (
-                                f"Max characters of stdout+stderr to return (default {SHELL_OUTPUT_LIMIT}, "
-                                f"max {TOOL_RESULT_LIMIT}); the rest is dropped with a truncation note"
+                                f"Max characters of stdout+stderr to return (default {config.SHELL_OUTPUT_LIMIT}, "
+                                f"max {config.TOOL_RESULT_LIMIT}); the rest is dropped with a truncation note"
                             ),
                         },
                     },
@@ -3192,7 +2635,7 @@ TOOLS = {
                         "max_chars": {
                             "type": "integer",
                             "description": (
-                                f"Max characters to return (default {READ_FILE_LIMIT}, max {TOOL_RESULT_LIMIT}); "
+                                f"Max characters to return (default {config.READ_FILE_LIMIT}, max {config.TOOL_RESULT_LIMIT}); "
                                 "prefer offset/lines to read a file in chunks"
                             ),
                         },
@@ -3277,8 +2720,8 @@ TOOLS = {
                         "limit": {
                             "type": "integer",
                             "description": (
-                                f"Max matching lines to return (default {GREP_MATCH_LIMIT}, max {MAX_COUNT_LIMIT}); "
-                                f"lines longer than {GREP_LINE_LIMIT} chars are clipped"
+                                f"Max matching lines to return (default {config.GREP_MATCH_LIMIT}, max {config.MAX_COUNT_LIMIT}); "
+                                f"lines longer than {config.GREP_LINE_LIMIT} chars are clipped"
                             ),
                         },
                     },
@@ -3362,7 +2805,7 @@ TOOLS = {
                         "limit": {
                             "type": "integer",
                             "description": (
-                                f"Max files to return (default {LIST_LIMIT}, max {MAX_COUNT_LIMIT})"
+                                f"Max files to return (default {config.LIST_LIMIT}, max {config.MAX_COUNT_LIMIT})"
                             ),
                         },
                     },
@@ -3388,7 +2831,7 @@ TOOLS = {
                         "limit": {
                             "type": "integer",
                             "description": (
-                                f"Max entries to return (default {LIST_LIMIT}, max {MAX_COUNT_LIMIT})"
+                                f"Max entries to return (default {config.LIST_LIMIT}, max {config.MAX_COUNT_LIMIT})"
                             ),
                         },
                     },
@@ -3490,8 +2933,8 @@ TOOLS = {
                         "max_chars": {
                             "type": "integer",
                             "description": (
-                                f"Max characters of response body to return (default {FETCH_TEXT_LIMIT}, "
-                                f"max {TOOL_RESULT_LIMIT})"
+                                f"Max characters of response body to return (default {config.FETCH_TEXT_LIMIT}, "
+                                f"max {config.TOOL_RESULT_LIMIT})"
                             ),
                         },
                     },
@@ -3750,17 +3193,6 @@ DISPATCH = {name: fn for name, (_, fn) in TOOLS.items()}
 
 # ---------------------------------------------------------------- mcp
 
-MCP_PROTOCOL_VERSION = "2025-06-18"
-MCP_TIMEOUT = 60  # seconds per request
-MCP_HOME_CONFIG = os.path.join(os.path.expanduser("~"), ".harnless", "mcp.json")
-
-MCP_TOOLS = []      # OpenAI tool specs for MCP tools
-MCP_DISPATCH = {}   # tool name -> (MCPClient, tool name)
-MCP_CLIENTS = []    # all configured MCP clients (for /status)
-PENDING_MCP = []    # [(name, config)] servers with "enabled": false; enable via /tools
-
-DISABLED_TOOLS = set()  # tool names toggled off via /tools
-
 
 class MCPError(Exception):
     pass
@@ -3789,9 +3221,9 @@ def _mcp_content_to_text(result: dict) -> str:
         text = "(no content)"
     if result.get("isError"):
         text = "error: " + text
-    return _truncate(
+    return caps._truncate(
         text,
-        MCP_RESULT_LIMIT,
+        config.MCP_RESULT_LIMIT,
         unit="chars",
         hint="the MCP server returned more than the harness keeps; ask it for a narrower result",
     )
@@ -3900,9 +3332,9 @@ class MCPClient:
         info = self._request(
             "initialize",
             {
-                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "protocolVersion": config.MCP_PROTOCOL_VERSION,
                 "capabilities": {},
-                "clientInfo": {"name": "harnless", "version": VERSION},
+                "clientInfo": {"name": "harnless", "version": config.VERSION},
             },
         )
         self._notify("notifications/initialized", {})
@@ -3951,7 +3383,7 @@ class MCPClient:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            cwd=CWD,
+            cwd=state.CWD,
             env=env,
             text=True,
             shell=shell,
@@ -4000,9 +3432,9 @@ class MCPClient:
         if self._out_q is None:
             raise MCPError(f"stdio server '{self.name}' is not connected")
         try:
-            line = self._out_q.get(timeout=MCP_TIMEOUT)
+            line = self._out_q.get(timeout=config.MCP_TIMEOUT)
         except queue.Empty:
-            raise MCPError(f"stdio server '{self.name}' timed out after {MCP_TIMEOUT}s")
+            raise MCPError(f"stdio server '{self.name}' timed out after {config.MCP_TIMEOUT}s")
         if line is None:
             raise MCPError(f"stdio server '{self.name}' closed the connection")
         line = line.strip()
@@ -4030,7 +3462,7 @@ class MCPClient:
             headers["Mcp-Session-Id"] = self._session_id
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(self._url, data=data, headers=headers)
-        with urllib.request.urlopen(req, timeout=MCP_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=config.MCP_TIMEOUT) as resp:
             sid = resp.headers.get("Mcp-Session-Id")
             if sid:
                 self._session_id = sid
@@ -4120,8 +3552,7 @@ def _register_mcp_client(client) -> bool:
     Returns True if the server connected (its tools, if any, are registered),
     False if the connection failed.
     """
-    global MCP_CLIENTS
-    MCP_CLIENTS.append(client)
+    state.MCP_CLIENTS.append(client)
     try:
         client.connect()
     except Exception as e:
@@ -4147,7 +3578,7 @@ def _register_mcp_client(client) -> bool:
         name = t.get("name")
         if not name:
             continue
-        if name in DISPATCH or name in MCP_DISPATCH:
+        if name in DISPATCH or name in state.MCP_DISPATCH:
             print(
                 colorize(
                     f"{icon('error')} mcp tool '{name}' (server '{client.name}') "
@@ -4165,8 +3596,8 @@ def _register_mcp_client(client) -> bool:
                 or {"type": "object", "properties": {}},
             },
         }
-        MCP_TOOLS.append(spec)
-        MCP_DISPATCH[name] = (client, name)
+        state.MCP_TOOLS.append(spec)
+        state.MCP_DISPATCH[name] = (client, name)
         client.tool_names.append(name)
     return True
 
@@ -4177,10 +3608,9 @@ def register_mcp_tools(clients: list) -> None:
     Tool names are used as-is. A name that collides with a built-in tool or an
     earlier-registered MCP tool is skipped (built-ins win, then first server).
     """
-    global MCP_TOOLS, MCP_DISPATCH, MCP_CLIENTS
-    MCP_TOOLS = []
-    MCP_DISPATCH = {}
-    MCP_CLIENTS = []
+    state.MCP_TOOLS = []
+    state.MCP_DISPATCH = {}
+    state.MCP_CLIENTS = []
     for client in clients:
         _register_mcp_client(client)
 
@@ -4191,12 +3621,12 @@ def _enable_pending_mcp(name: str) -> tuple:
     Returns (ok, message). On failure the server stays pending so the user can
     retry from /tools.
     """
-    for i, (n, cfg) in enumerate(PENDING_MCP):
+    for i, (n, cfg) in enumerate(state.PENDING_MCP):
         if n == name:
             client = MCPClient(n, cfg)
             ok = _register_mcp_client(client)
             if ok:
-                PENDING_MCP.pop(i)
+                state.PENDING_MCP.pop(i)
                 return True, f"{icon('ok')} mcp server '{n}' enabled ({len(client.tool_names)} tools)"
             return False, f"{icon('error')} mcp server '{n}' failed to connect"
     return False, f"{icon('error')} mcp server '{name}' is not pending"
@@ -4205,7 +3635,7 @@ def _enable_pending_mcp(name: str) -> tuple:
 def _mcp_server_tools(server: str) -> list:
     """Sorted names of the tools registered from the given MCP server."""
     return sorted(
-        name for name, (client, _) in MCP_DISPATCH.items() if client.name == server
+        name for name, (client, _) in state.MCP_DISPATCH.items() if client.name == server
     )
 
 
@@ -4239,19 +3669,19 @@ def get_system_prompt(cwd, additional) -> str:
 
 def load_agents_md() -> str:
     """Read AGENTS.md (case-insensitive) from CWD, truncated. Returns "" if absent."""
-    path = os.path.join(CWD, "AGENTS.md")
+    path = os.path.join(state.CWD, "AGENTS.md")
     if not os.path.exists(path):
-        for name in os.listdir(CWD):
+        for name in os.listdir(state.CWD):
             if name.upper() == "AGENTS.MD":
-                path = os.path.join(CWD, name)
+                path = os.path.join(state.CWD, name)
                 break
         else:
             return ""
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         content = f.read()
-    return _truncate(
+    return caps._truncate(
         content,
-        AGENTS_MD_LIMIT,
+        config.AGENTS_MD_LIMIT,
         unit="chars",
         hint="AGENTS.md is long; trim the project instructions",
     )
@@ -4260,49 +3690,27 @@ def load_agents_md() -> str:
 # ---------------------------------------------------------------- file references
 
 
-def _content_chars(content) -> int:
-    """Approximate character length of a message content value.
-
-    Handles both plain strings and OpenAI multimodal content (a list of
-    parts) so /status can estimate context usage for either.
-    """
-    if isinstance(content, str):
-        return len(content)
-    if isinstance(content, list):
-        total = 0
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            ptype = part.get("type")
-            if ptype == "text":
-                total += len(part.get("text", ""))
-            elif ptype == "image_url":
-                total += len((part.get("image_url") or {}).get("url", ""))
-        return total
-    return 0
-
-
 def _read_local_file(path: str, label: str) -> dict:
     """Read a local file into a content part (text or image_url)."""
     ext = os.path.splitext(path)[1].lower()
-    if ext in IMAGE_MIME:
-        if not VISION_ENABLED:
+    if ext in config.IMAGE_MIME:
+        if not state.VISION_ENABLED:
             return {"type": "text", "text": f"[image: {label} (not sent; vision disabled)]"}
         size = os.path.getsize(path)
-        if size > MAX_IMAGE_BYTES:
+        if size > config.MAX_IMAGE_BYTES:
             return {"type": "text", "text": f"[error: image too large ({size} bytes): {label}]"}
         with open(path, "rb") as f:
             data = f.read()
         b64 = base64.b64encode(data).decode("ascii")
         return {
             "type": "image_url",
-            "image_url": {"url": f"data:{IMAGE_MIME[ext]};base64,{b64}"},
+            "image_url": {"url": f"data:{config.IMAGE_MIME[ext]};base64,{b64}"},
         }
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         content = f.read()
-    content = _truncate(
+    content = caps._truncate(
         content,
-        READ_FILE_LIMIT,
+        config.READ_FILE_LIMIT,
         unit="chars",
         hint="the referenced file is large; reference a narrower file",
     )
@@ -4312,7 +3720,7 @@ def _read_local_file(path: str, label: str) -> dict:
 def _read_cwd_relative(rel: str) -> dict:
     """Resolve a cwd:// reference (CWD-relative, sandboxed) to a content part."""
     try:
-        path = safe_resolve(rel)
+        path = paths.safe_resolve(rel)
     except ValueError as e:
         return {"type": "text", "text": f"[error: {e}]"}
     if not os.path.isfile(path):
@@ -4334,17 +3742,17 @@ def _fetch_remote(uri: str) -> dict:
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "harnless/1.0"})
         with urllib.request.urlopen(req, timeout=30) as resp:
-            data = resp.read(MAX_REMOTE_BYTES + 1)
+            data = resp.read(config.MAX_REMOTE_BYTES + 1)
             ctype = resp.headers.get_content_type() or ""
     except Exception as e:
         return {"type": "text", "text": f"[error: could not fetch {uri}: {e}]"}
-    truncated = len(data) > MAX_REMOTE_BYTES
+    truncated = len(data) > config.MAX_REMOTE_BYTES
     if truncated:
-        data = data[:MAX_REMOTE_BYTES]
+        data = data[:config.MAX_REMOTE_BYTES]
     ext = os.path.splitext(urlparse(uri).path)[1].lower()
-    mime = ctype if ctype.startswith("image/") else IMAGE_MIME.get(ext)
+    mime = ctype if ctype.startswith("image/") else config.IMAGE_MIME.get(ext)
     if mime:
-        if not VISION_ENABLED:
+        if not state.VISION_ENABLED:
             return {"type": "text", "text": f"[image: {uri} (not sent; vision disabled)]"}
         b64 = base64.b64encode(data).decode("ascii")
         return {
@@ -4352,15 +3760,15 @@ def _fetch_remote(uri: str) -> dict:
             "image_url": {"url": f"data:{mime};base64,{b64}"},
         }
     text = data.decode("utf-8", errors="replace")
-    clipped = len(text) > FETCH_TEXT_LIMIT
-    text = _truncate(
+    clipped = len(text) > config.FETCH_TEXT_LIMIT
+    text = caps._truncate(
         text,
-        FETCH_TEXT_LIMIT,
+        config.FETCH_TEXT_LIMIT,
         hint="the referenced URL is large; reference a narrower page",
     )
     if truncated and not clipped:
-        text += _cap_note(
-            f"body read stopped at {MAX_REMOTE_BYTES} bytes",
+        text += caps._cap_note(
+            f"body read stopped at {config.MAX_REMOTE_BYTES} bytes",
             "the response is larger than the harness read ceiling",
         )
     return {"type": "text", "text": f"[file: {uri}]\n{text}"}
@@ -4387,7 +3795,7 @@ def expand_file_refs(text: str):
     refs_found = False
     parts = []
     last = 0
-    for m in _REF_RE.finditer(text):
+    for m in config._REF_RE.finditer(text):
         if m.start() > last:
             parts.append(("text", text[last:m.start()]))
         part = _resolve_uri(m.group(1))
@@ -4418,30 +3826,24 @@ def build_user_message(text: str) -> dict:
 
 # ---------------------------------------------------------------- line editor
 
-HISTORY = []
-HISTORY_MAX = 1000
-HISTORY_FILE = os.environ.get("HARNLESS_HISTORY") or os.path.join(
-    os.path.expanduser("~"), ".harnless_history"
-)
-
 
 def _history_load():
     """Load persisted history (last HISTORY_MAX entries) into HISTORY."""
     try:
-        with open(HISTORY_FILE, "r", encoding="utf-8", errors="replace") as f:
+        with open(state.HISTORY_FILE, "r", encoding="utf-8", errors="replace") as f:
             lines = [ln.rstrip("\n") for ln in f]
     except OSError:
         return
-    HISTORY.extend(ln for ln in lines if ln.strip())
-    if len(HISTORY) > HISTORY_MAX:
-        del HISTORY[: len(HISTORY) - HISTORY_MAX]
+    state.HISTORY.extend(ln for ln in lines if ln.strip())
+    if len(state.HISTORY) > state.HISTORY_MAX:
+        del state.HISTORY[: len(state.HISTORY) - state.HISTORY_MAX]
 
 
 def _history_save():
     """Write the current HISTORY to HISTORY_FILE (best effort)."""
     try:
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            for entry in HISTORY:
+        with open(state.HISTORY_FILE, "w", encoding="utf-8") as f:
+            for entry in state.HISTORY:
                 f.write(entry + "\n")
     except OSError:
         pass
@@ -4451,26 +3853,12 @@ def _history_add(entry: str):
     entry = entry.strip()
     if not entry:
         return
-    if HISTORY and HISTORY[-1] == entry:
+    if state.HISTORY and state.HISTORY[-1] == entry:
         return
-    HISTORY.append(entry)
-    if len(HISTORY) > HISTORY_MAX:
-        HISTORY.pop(0)
+    state.HISTORY.append(entry)
+    if len(state.HISTORY) > state.HISTORY_MAX:
+        state.HISTORY.pop(0)
     _history_save()
-
-
-_WINDOWS_EXT_MAP = {
-    "H": "up",
-    "P": "down",
-    "K": "left",
-    "M": "right",
-    "G": "home",
-    "O": "end",
-    "R": "ignore",
-    "S": "delete",
-    "I": "ignore",
-    "Q": "ignore",
-}
 
 
 def _windows_ctrl_held() -> bool:
@@ -4493,7 +3881,7 @@ def _windows_key_token(getwch):
     """Read one key via getwch and return its token."""
     ch = getwch()
     if ch in ("\x00", "\xe0"):
-        return _WINDOWS_EXT_MAP.get(getwch(), "ignore")
+        return config._WINDOWS_EXT_MAP.get(getwch(), "ignore")
     if ch == "\r":
         return "ctrl_enter" if _windows_ctrl_held() else "enter"
     if ch == "\n":
@@ -4746,18 +4134,18 @@ def _iter_keys_interrupt(stop_event):
         yield from _iter_keys_posix_poll(stop_event)
 
 
-def check_double_esc(state: dict, token, now: float) -> bool:
-    """Track ESC presses in `state` ({"last_esc": float}).
+def check_double_esc(presses: dict, token, now: float) -> bool:
+    """Track ESC presses in `presses` ({"last_esc": float}).
 
     Returns True when a second ESC arrives within DOUBLE_ESC_WINDOW seconds
     of the first; any other key resets the wait.
     """
     if token == "esc":
-        if now - state["last_esc"] < DOUBLE_ESC_WINDOW:
+        if now - presses["last_esc"] < config.DOUBLE_ESC_WINDOW:
             return True
-        state["last_esc"] = now
+        presses["last_esc"] = now
     else:
-        state["last_esc"] = 0.0
+        presses["last_esc"] = 0.0
     return False
 
 
@@ -4863,10 +4251,10 @@ class InterruptWatcher:
                 pass
 
     def _run(self):
-        state = {"last_esc": 0.0}
+        presses = {"last_esc": 0.0}
         hinted = False
         for token in _iter_keys_interrupt(self._stop):
-            if check_double_esc(state, token, time.monotonic()):
+            if check_double_esc(presses, token, time.monotonic()):
                 self._cancel()
                 return
             if token == "esc" and not hinted:
@@ -4924,7 +4312,7 @@ class ContextProgress:
         return self._thread is not None
 
     def start(self):
-        if self.tokens < CONTEXT_PROGRESS_THRESHOLD:
+        if self.tokens < config.CONTEXT_PROGRESS_THRESHOLD:
             return
         if not sys.stdout.isatty():
             return
@@ -4957,7 +4345,7 @@ class ContextProgress:
         self.extra_lines += n
 
     def _run(self):
-        if self._stop.wait(CONTEXT_PROGRESS_DELAY):
+        if self._stop.wait(state.CONTEXT_PROGRESS_DELAY):
             return
         with self._lock:
             self._hint_before = self.extra_lines > 0
@@ -4991,7 +4379,7 @@ class ContextProgress:
                 f"({_format_tokens(sent_tokens)}/{_format_tokens(self.tokens)} tokens) "
                 f"{elapsed}"
             )
-        return OUTPUT_INDENT + colorize(text, "dim")
+        return state.OUTPUT_INDENT + colorize(text, "dim")
 
 
 def _edit_cur(row: int, total: int, width: int) -> tuple:
@@ -5058,7 +4446,7 @@ def _edit_line(prompt: str, keys) -> str:
     draft, so subsequent downs walk history forward as usual."""
     buf = []
     pos = 0
-    hist_idx = len(HISTORY)
+    hist_idx = len(state.HISTORY)
     draft = None  # (buf, pos) of the line being edited when a history recall
     # started, so the first down press returns to it (with its caret)
 
@@ -5070,7 +4458,7 @@ def _edit_line(prompt: str, keys) -> str:
         nonlocal prev_rows, prev_cur_row, prev_rendered
         line = "".join(buf)
         width = terminal_width()
-        prompt_w = display_width(_ANSI_RE.sub("", prompt))
+        prompt_w = display_width(config._ANSI_RE.sub("", prompt))
         # An explicit CR: the render must land rows correctly whatever the
         # terminal's output translation is doing (input-only raw mode keeps
         # ONLCR on, but the editor does not depend on it — an extra CR at
@@ -5141,7 +4529,7 @@ def _edit_line(prompt: str, keys) -> str:
     while True:
         token = next(keys)
         if token == "enter":
-            if AUTO_SEND:
+            if state.AUTO_SEND:
                 break
             # Auto-send off: Enter inserts a newline; Ctrl+Enter sends.
             draft = None
@@ -5193,10 +4581,10 @@ def _edit_line(prompt: str, keys) -> str:
                 # it as the draft, so the first down press restores it; from
                 # an empty line nothing is saved, so downs walk history
                 # forward as usual (the last one clears the line).
-                if hist_idx == len(HISTORY) and buf:
+                if hist_idx == len(state.HISTORY) and buf:
                     draft = (list(buf), pos)
                 hist_idx -= 1
-                buf = list(HISTORY[hist_idx])
+                buf = list(state.HISTORY[hist_idx])
                 pos = len(buf)
         elif token == "down":
             if draft is not None:
@@ -5204,7 +4592,7 @@ def _edit_line(prompt: str, keys) -> str:
                 # (buffer and caret).
                 buf, pos = draft
                 draft = None
-                hist_idx = len(HISTORY)
+                hist_idx = len(state.HISTORY)
             else:
                 line = "".join(buf)
                 if line.rfind("\n", pos) >= 0:
@@ -5215,9 +4603,9 @@ def _edit_line(prompt: str, keys) -> str:
                     next_end = line.find("\n", next_start)
                     next_len = (len(line) if next_end < 0 else next_end) - next_start
                     pos = next_start + min(pos - line_start, next_len)
-                elif hist_idx < len(HISTORY):
+                elif hist_idx < len(state.HISTORY):
                     hist_idx += 1
-                    buf = list(HISTORY[hist_idx]) if hist_idx < len(HISTORY) else []
+                    buf = list(state.HISTORY[hist_idx]) if hist_idx < len(state.HISTORY) else []
                     pos = len(buf)
         elif token == "newline":
             draft = None
@@ -5276,8 +4664,8 @@ def normalize_api_url(url: str | None) -> str:
 
 def _headers() -> dict:
     headers = {"Content-Type": "application/json"}
-    if API_KEY:
-        headers["Authorization"] = f"Bearer {API_KEY}"
+    if state.API_KEY:
+        headers["Authorization"] = f"Bearer {state.API_KEY}"
     return headers
 
 
@@ -5287,9 +4675,9 @@ def probe_context_window() -> int:
     Returns the model's context window in tokens, or 0 if it cannot be
     determined (server unreachable, no /models endpoint, field missing).
     """
-    if not API_URL.endswith("/chat/completions"):
+    if not state.API_URL.endswith("/chat/completions"):
         return 0
-    models_url = API_URL[: -len("/chat/completions")] + "/models"
+    models_url = state.API_URL[: -len("/chat/completions")] + "/models"
     try:
         req = urllib.request.Request(models_url, headers=_headers())
         with urllib.request.urlopen(req, timeout=5) as resp:
@@ -5302,7 +4690,7 @@ def probe_context_window() -> int:
     model = models[0]
     if len(models) > 1:
         for m in models:
-            if m.get("id") == MODEL:
+            if m.get("id") == state.MODEL:
                 model = m
                 break
 
@@ -5331,7 +4719,7 @@ def _record_usage(messages: list, usage, conv_id: int = None) -> None:
     """
     if isinstance(usage, dict) and usage.get("prompt_tokens"):
         key = conv_id if conv_id is not None else id(messages)
-        USAGE_BY_CONV[key] = usage
+        state.USAGE_BY_CONV[key] = usage
         _session_append(
             key,
             {"messages": len(messages), "usage": usage, "type": "usage"},
@@ -5375,11 +4763,11 @@ def _progress_opener(upload: _UploadProgress) -> urllib.request.OpenerDirector:
 
                     def send(self, data):
                         total = len(data)
-                        if total <= PROGRESS_CHUNK:
+                        if total <= config.PROGRESS_CHUNK:
                             return super().send(data)
                         mv = memoryview(data)
-                        for i in range(0, total, PROGRESS_CHUNK):
-                            piece = bytes(mv[i : i + PROGRESS_CHUNK])
+                        for i in range(0, total, config.PROGRESS_CHUNK):
+                            piece = bytes(mv[i : i + config.PROGRESS_CHUNK])
                             super().send(piece)
                             upload.add(len(piece))
 
@@ -5424,7 +4812,7 @@ def chat(
             send_tools=send_tools,
         )
     ).encode("utf-8")
-    req = urllib.request.Request(API_URL, data=payload, headers=_headers())
+    req = urllib.request.Request(state.API_URL, data=payload, headers=_headers())
     spinner = ContextProgress(messages, interactive)
     spinner.start()
     try:
@@ -5433,9 +4821,9 @@ def chat(
     except urllib.error.HTTPError as e:
         # A prompt the server refuses because it is too long is something the agent can
         # act on — compact and retry. Anything else stays the error it was.
-        reason = _context_overflow_reason(e)
+        reason = errors._context_overflow_reason(e)
         if reason:
-            raise ContextOverflow(reason) from e
+            raise errors.ContextOverflow(reason) from e
         raise
     finally:
         spinner.stop()
@@ -5487,7 +4875,7 @@ def _build_request(
             send_tools=send_tools,
         )
     ).encode("utf-8")
-    return urllib.request.Request(API_URL, data=payload, headers=_headers())
+    return urllib.request.Request(state.API_URL, data=payload, headers=_headers())
 
 
 def parse_sse_line(line: str):
@@ -5542,9 +4930,9 @@ def stream_chat(
     except urllib.error.HTTPError as e:
         # Refused before the stream even started: if it is a size rejection, raise the
         # thing the agent loop knows how to recover from.
-        reason = _context_overflow_reason(e)
+        reason = errors._context_overflow_reason(e)
         if reason:
-            raise ContextOverflow(reason) from e
+            raise errors.ContextOverflow(reason) from e
         if watcher is None or not watcher.triggered:
             raise
         return
@@ -5620,25 +5008,6 @@ def display_width(text: str) -> int:
     return width
 
 
-_MD_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})([^\r\n]*)$")
-_MD_HEADING = re.compile(r"^\s{0,3}(#{1,6})\s+(.*)$")
-_MD_HR = re.compile(r"^\s{0,3}(-{3,}|\*{3,}|_{3,})\s*$")
-_MD_LIST = re.compile(r"^(\s*)([-*+]|\d+[.)])\s+(.*)$")
-_MD_QUOTE = re.compile(r"^\s{0,3}>\s?(.*)$")
-_MD_ESCAPABLE = frozenset(r"!\"#$%&'()*+,-./:;<=>?@[\]^_`{|}~" + "\\")
-_MD_BOLD = re.compile(r"\*\*(.+?)\*\*")
-_MD_ITALIC = re.compile(r"(?<!\*)\*([^*\s](?:[^*]*[^*\s])?)\*(?!\*)")
-_MD_LINK = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
-# Delimiter row of a pipe table. The trailing group is optional so a
-# single-column table (| A | / |---|) is recognized; callers must also
-# require a '|' so a bare "---" horizontal rule is never mistaken for one.
-_MD_TABLE_SEP = re.compile(r"^\s{0,3}\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?\s*$")
-_MD_PIPE_SPLIT = re.compile(r"(?<!\\)\|")
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-
-_TABLE_MIN_COL = 3
-
-
 def terminal_width() -> int:
     """Current terminal column count (falls back to 80)."""
     return shutil.get_terminal_size((80, 24)).columns
@@ -5646,7 +5015,7 @@ def terminal_width() -> int:
 
 def _is_table_sep(line: str) -> bool:
     """True if line is a table delimiter row (must contain a pipe)."""
-    return "|" in line and bool(_MD_TABLE_SEP.match(line))
+    return "|" in line and bool(config._MD_TABLE_SEP.match(line))
 
 
 def _split_table_row(line: str) -> list:
@@ -5659,7 +5028,7 @@ def _split_table_row(line: str) -> list:
         s = s[1:]
     if s.endswith("|") and not s.endswith("\\|"):
         s = s[:-1]
-    return [c.strip().replace("\\|", "|") for c in _MD_PIPE_SPLIT.split(s)]
+    return [c.strip().replace("\\|", "|") for c in config._MD_PIPE_SPLIT.split(s)]
 
 
 def _table_alignments(sep: str, ncols: int) -> list:
@@ -5722,7 +5091,7 @@ class MarkdownRenderer:
         self._table = None  # rows of the table currently being buffered
 
     def write(self, chunk: str):
-        if not COLORS_ENABLED:
+        if not state.COLORS_ENABLED:
             self._out.write(chunk)
             self._out.flush()
             return
@@ -5732,7 +5101,7 @@ class MarkdownRenderer:
             self._emit(line)
 
     def flush(self):
-        if not COLORS_ENABLED:
+        if not state.COLORS_ENABLED:
             return
         if self._buf:
             self._emit(self._buf)
@@ -5754,7 +5123,7 @@ class MarkdownRenderer:
         if self._in_code:
             prefix = "" if self._first else self._indent
             self._first = False
-            fence = _MD_FENCE.match(line)
+            fence = config._MD_FENCE.match(line)
             if (fence and fence.group(1)[0] == self._fence[0]
                     and len(fence.group(1)) >= len(self._fence)
                     and not fence.group(2).strip()):
@@ -5770,13 +5139,13 @@ class MarkdownRenderer:
                 self._table = [pending, line]
                 return
             self._emit(pending, defer=False)
-        fence = _MD_FENCE.match(line)
+        fence = config._MD_FENCE.match(line)
         if fence and fence.group(1)[0] == "`" and "`" in fence.group(2):
             fence = None
         if self._table is not None:
             if (line.strip() and "|" in line and not fence
-                    and not _MD_HEADING.match(line) and not _MD_QUOTE.match(line)
-                    and not _MD_LIST.match(line)):
+                    and not config._MD_HEADING.match(line) and not config._MD_QUOTE.match(line)
+                    and not config._MD_LIST.match(line)):
                 self._table.append(line)
                 return
             table, self._table = self._table, None
@@ -5795,20 +5164,20 @@ class MarkdownRenderer:
             return
         prefix = "" if self._first else self._indent
         self._first = False
-        m = _MD_HEADING.match(line)
+        m = config._MD_HEADING.match(line)
         if m:
             self._line(prefix + colorize(self._inline(m.group(2).strip()), "heading"))
             return
-        if _MD_HR.match(line):
+        if config._MD_HR.match(line):
             self._line(prefix + colorize("─" * 20, "dim"))
             return
-        m = _MD_LIST.match(line)
+        m = config._MD_LIST.match(line)
         if m:
             pad, marker, rest = m.groups()
             bullet = "• " if marker in ("-", "*", "+") else f"{marker} "
             self._line(prefix + pad + colorize(bullet, "bullet") + self._inline(rest))
             return
-        m = _MD_QUOTE.match(line)
+        m = config._MD_QUOTE.match(line)
         if m:
             self._line(prefix + colorize("> " + self._inline(m.group(1)), "quote"))
             return
@@ -5828,10 +5197,10 @@ class MarkdownRenderer:
         widths = []
         for i in range(ncols):
             w = max(
-                display_width(_ANSI_RE.sub("", self._inline(row[i])))
+                display_width(config._ANSI_RE.sub("", self._inline(row[i])))
                 for row in plain
             )
-            widths.append(max(w, _TABLE_MIN_COL))
+            widths.append(max(w, config._TABLE_MIN_COL))
 
         columns = max(1, terminal_width())
         # Reserve the label width even when the first line has no prefix.
@@ -5849,7 +5218,7 @@ class MarkdownRenderer:
             self._first = False
 
         budget = available - (3 * ncols + 1)
-        if budget < ncols * _TABLE_MIN_COL:
+        if budget < ncols * config._TABLE_MIN_COL:
             # A box cannot fit: preserve cells as wrapped header/value records.
             # Plain text avoids splitting ANSI escapes when wrapping.
             def wrapped(text):
@@ -5865,16 +5234,16 @@ class MarkdownRenderer:
                     used += w
                 table_line(chunk)
 
-            labels = [_ANSI_RE.sub("", self._inline(c)) for c in header]
+            labels = [config._ANSI_RE.sub("", self._inline(c)) for c in header]
             for index, record in enumerate(body or [None]):
                 if index:
                     table_line("")
                 for i, label in enumerate(labels):
-                    value = (_ANSI_RE.sub("", self._inline(record[i]))
+                    value = (config._ANSI_RE.sub("", self._inline(record[i]))
                              if record is not None else None)
                     wrapped(label if value is None else f"{label}: {value}")
             return
-        while sum(widths) > budget and max(widths) > _TABLE_MIN_COL:
+        while sum(widths) > budget and max(widths) > config._TABLE_MIN_COL:
             i = widths.index(max(widths))
             widths[i] -= 1
 
@@ -5883,7 +5252,7 @@ class MarkdownRenderer:
 
         def cell(text, i, align):
             width = widths[i]
-            w = display_width(_ANSI_RE.sub("", text))
+            w = display_width(config._ANSI_RE.sub("", text))
             pad = max(width - w, 0)
             if align == "right":
                 left, right = pad, 0
@@ -5906,8 +5275,8 @@ class MarkdownRenderer:
             out = []
             for i in range(ncols):
                 visible = self._inline(r[i])
-                if display_width(_ANSI_RE.sub("", visible)) > widths[i]:
-                    visible = _truncate_visible(_ANSI_RE.sub("", visible), widths[i])
+                if display_width(config._ANSI_RE.sub("", visible)) > widths[i]:
+                    visible = _truncate_visible(config._ANSI_RE.sub("", visible), widths[i])
                 out.append(visible)
             return out
 
@@ -5938,7 +5307,7 @@ class MarkdownRenderer:
         i = 0
         while i < len(text):
             if (text[i] == "\\" and i + 1 < len(text)
-                    and text[i + 1] in _MD_ESCAPABLE):
+                    and text[i + 1] in config._MD_ESCAPABLE):
                 protect(text[i + 1])
                 i += 2
                 continue
@@ -5960,7 +5329,7 @@ class MarkdownRenderer:
                 i = end
                 continue
             if text[i] == "[":
-                link = _MD_LINK.match(text, i)
+                link = config._MD_LINK.match(text, i)
                 if link:
                     protect(colorize(self._inline(link.group(1)), "underline")
                             + colorize(f" ({link.group(2)})", "dim"))
@@ -5975,8 +5344,8 @@ class MarkdownRenderer:
 
     @staticmethod
     def _emphasis(text: str) -> str:
-        text = _MD_BOLD.sub(lambda m: colorize(m.group(1), "bold"), text)
-        return _MD_ITALIC.sub(lambda m: colorize(m.group(1), "italic"), text)
+        text = config._MD_BOLD.sub(lambda m: colorize(m.group(1), "bold"), text)
+        return config._MD_ITALIC.sub(lambda m: colorize(m.group(1), "italic"), text)
 
 
 def stream_once(
@@ -5997,7 +5366,7 @@ def stream_once(
     started_reasoning = False
     renderer = None
     streamed = False
-    watcher = InterruptWatcher() if INTERRUPT_ENABLED else None
+    watcher = InterruptWatcher() if state.INTERRUPT_ENABLED else None
     if watcher is not None:
         watcher.start()
     spinner = ContextProgress(messages, interactive)
@@ -6022,7 +5391,7 @@ def stream_once(
             if reasoning:
                 if not started_reasoning:
                     print(
-                        OUTPUT_INDENT
+                        state.OUTPUT_INDENT
                         + colorize(f"{icon('thinking')} thinking: ", "thinking"),
                         end="",
                         flush=True,
@@ -6036,12 +5405,12 @@ def stream_once(
                         print()
                     label = f"{icon('assistant')} assistant> "
                     print(
-                        OUTPUT_INDENT + colorize(label, "assistant"),
+                        state.OUTPUT_INDENT + colorize(label, "assistant"),
                         end="",
                         flush=True,
                     )
                     renderer = MarkdownRenderer(
-                        indent=display_width(OUTPUT_INDENT + label)
+                        indent=display_width(state.OUTPUT_INDENT + label)
                     )
                 renderer.write(content)
             accumulate_delta(message, delta)
@@ -6055,7 +5424,7 @@ def stream_once(
         if renderer is not None:
             renderer.flush()
             print()
-        print(OUTPUT_INDENT + colorize("(interrupted)", "dim"))
+        print(state.OUTPUT_INDENT + colorize("(interrupted)", "dim"))
         raise StreamInterrupted(message)
     if started_reasoning:
         print()
@@ -6069,8 +5438,8 @@ def print_assistant(content: str):
     """Print a complete (non-streamed) assistant message with Markdown styling."""
     label = f"{icon('assistant')} assistant> "
     print()
-    print(OUTPUT_INDENT + colorize(label, "assistant"), end="", flush=True)
-    renderer = MarkdownRenderer(indent=display_width(OUTPUT_INDENT + label))
+    print(state.OUTPUT_INDENT + colorize(label, "assistant"), end="", flush=True)
+    renderer = MarkdownRenderer(indent=display_width(state.OUTPUT_INDENT + label))
     renderer.write(content or "")
     renderer.flush()
     print()
@@ -6091,15 +5460,15 @@ def print_reasoning(reasoning: str, limit: int = 0):
         return
     if limit and len(text) > limit:
         text = text[:limit] + f"... [+{len(text) - limit} chars in the session log]"
-    print(OUTPUT_INDENT + colorize(f"{icon('thinking')} thinking: {text}", "thinking"))
+    print(state.OUTPUT_INDENT + colorize(f"{icon('thinking')} thinking: {text}", "thinking"))
 
 
 def print_tool_call(name: str, raw_args: str):
     """How the loop shows a call before running it: the name and its arguments, previewed."""
     args = raw_args or ""
     print(
-        OUTPUT_INDENT
-        + colorize(f"{icon('tool')} {name}({args[:TOOL_ARG_ECHO]})", "tool")
+        state.OUTPUT_INDENT
+        + colorize(f"{icon('tool')} {name}({args[:config.TOOL_ARG_ECHO]})", "tool")
     )
 
 
@@ -6107,10 +5476,10 @@ def print_tool_result(result: str):
     """How the loop shows what a call returned: its first TOOL_RESULT_ECHO characters."""
     text = result or ""
     print(
-        OUTPUT_INDENT
+        state.OUTPUT_INDENT
         + colorize(
-            f"{icon('result')} {text[:TOOL_RESULT_ECHO]}"
-            f"{'...' if len(text) > TOOL_RESULT_ECHO else ''}",
+            f"{icon('result')} {text[:config.TOOL_RESULT_ECHO]}"
+            f"{'...' if len(text) > config.TOOL_RESULT_ECHO else ''}",
             "result",
         )
     )
@@ -6121,11 +5490,11 @@ def execute_tool(name: str, raw_args: str) -> str:
         args = json.loads(raw_args) if raw_args else {}
     except json.JSONDecodeError:
         return f"error: invalid JSON arguments: {raw_args}"
-    if name in DISABLED_TOOLS:
+    if name in state.DISABLED_TOOLS:
         return f"error: tool '{name}' is disabled (use /tools to re-enable)"
     fn = DISPATCH.get(name)
     if fn is None:
-        mcp = MCP_DISPATCH.get(name)
+        mcp = state.MCP_DISPATCH.get(name)
         if mcp is not None:
             client, tool_name = mcp
             try:
@@ -6139,7 +5508,7 @@ def execute_tool(name: str, raw_args: str) -> str:
     else:
         try:
             result = str(fn(args))
-        except (ExitSignal, StreamInterrupted):
+        except (errors.ExitSignal, StreamInterrupted):
             # Control-flow, not a tool failure: `exit` ends the agent's loop,
             # an interrupt ends the whole delegation chain.
             raise
@@ -6147,9 +5516,9 @@ def execute_tool(name: str, raw_args: str) -> str:
             return f"error: {type(e).__name__}: {e}"
     # Final backstop: no single tool result may exceed this, whatever the
     # built-in tool (or an external MCP server) decided to return.
-    return _truncate(
+    return caps._truncate(
         result,
-        TOOL_RESULT_LIMIT,
+        config.TOOL_RESULT_LIMIT,
         unit="chars",
         hint="output exceeded the harness limit; split the work or narrow the request",
     )
@@ -6158,11 +5527,11 @@ def execute_tool(name: str, raw_args: str) -> str:
 def _active_tools(interactive: bool) -> list:
     """Tool specs to send to the API, excluding tools toggled off via /tools."""
     base = OPENAI_TOOLS_INTERACTIVE if interactive else OPENAI_TOOLS
-    return [s for s in base + MCP_TOOLS if s["function"]["name"] not in DISABLED_TOOLS]
+    return [s for s in base + state.MCP_TOOLS if s["function"]["name"] not in state.DISABLED_TOOLS]
 
 
 def _all_tool_names() -> set:
-    return {s["function"]["name"] for s in OPENAI_TOOLS_INTERACTIVE + MCP_TOOLS}
+    return {s["function"]["name"] for s in OPENAI_TOOLS_INTERACTIVE + state.MCP_TOOLS}
 
 
 def format_tools() -> str:
@@ -6175,26 +5544,26 @@ def format_tools() -> str:
     for s in sorted(OPENAI_TOOLS_INTERACTIVE, key=lambda s: s["function"]["name"]):
         name = s["function"]["name"]
         desc = s["function"].get("description", "")
-        mark = " " if name in DISABLED_TOOLS else "X"
+        mark = " " if name in state.DISABLED_TOOLS else "X"
         lines.append(f"[{mark}] {name} — {desc}")
-    mcp_descs = {s["function"]["name"]: s["function"].get("description", "") for s in MCP_TOOLS}
+    mcp_descs = {s["function"]["name"]: s["function"].get("description", "") for s in state.MCP_TOOLS}
     mcp_by_server = {}
-    for name, (client, _) in MCP_DISPATCH.items():
+    for name, (client, _) in state.MCP_DISPATCH.items():
         mcp_by_server.setdefault(client.name, []).append(name)
-    server_order = [c.name for c in MCP_CLIENTS if c.name in mcp_by_server]
+    server_order = [c.name for c in state.MCP_CLIENTS if c.name in mcp_by_server]
     if server_order:
         lines.append("mcp servers:")
         for server in server_order:
             tools = sorted(mcp_by_server[server])
-            off = sum(1 for t in tools if t in DISABLED_TOOLS)
+            off = sum(1 for t in tools if t in state.DISABLED_TOOLS)
             mark = "X" if off == 0 else (" " if off == len(tools) else "-")
             lines.append(f"[{mark}] mcp: {server} ({len(tools)} tools)")
             for t in tools:
-                tmark = " " if t in DISABLED_TOOLS else "X"
+                tmark = " " if t in state.DISABLED_TOOLS else "X"
                 lines.append(f"  [{tmark}] {t} — {mcp_descs.get(t, '')}")
-    if PENDING_MCP:
+    if state.PENDING_MCP:
         lines.append("mcp servers (disabled in config):")
-        for n, _ in PENDING_MCP:
+        for n, _ in state.PENDING_MCP:
             lines.append(f"[ ] {n}")
     return "\n".join(lines)
 
@@ -6214,20 +5583,20 @@ def toggle_tools(names: list) -> list:
             if not tools:
                 results.append((n, "unknown"))
             else:
-                any_off = any(t in DISABLED_TOOLS for t in tools)
+                any_off = any(t in state.DISABLED_TOOLS for t in tools)
                 for t in tools:
                     if any_off:
-                        DISABLED_TOOLS.discard(t)
+                        state.DISABLED_TOOLS.discard(t)
                     else:
-                        DISABLED_TOOLS.add(t)
+                        state.DISABLED_TOOLS.add(t)
                 results.append((n, "on" if any_off else "off"))
         elif n not in known:
             results.append((n, "unknown"))
-        elif n in DISABLED_TOOLS:
-            DISABLED_TOOLS.discard(n)
+        elif n in state.DISABLED_TOOLS:
+            state.DISABLED_TOOLS.discard(n)
             results.append((n, "on"))
         else:
-            DISABLED_TOOLS.add(n)
+            state.DISABLED_TOOLS.add(n)
             results.append((n, "off"))
     return results
 
@@ -6248,10 +5617,10 @@ def tools_menu(keys=None) -> bool:
         OPENAI_TOOLS_INTERACTIVE, key=lambda s: s["function"]["name"]
     )
     mcp_by_server = {}
-    for name, (client, _) in MCP_DISPATCH.items():
+    for name, (client, _) in state.MCP_DISPATCH.items():
         mcp_by_server.setdefault(client.name, []).append(name)
-    server_order = [c.name for c in MCP_CLIENTS if c.name in mcp_by_server]
-    pending_names = [n for n, _ in PENDING_MCP]
+    server_order = [c.name for c in state.MCP_CLIENTS if c.name in mcp_by_server]
+    pending_names = [n for n, _ in state.PENDING_MCP]
     rows = [("tool", s["function"]["name"]) for s in builtin_specs]
     for server in server_order:
         rows.append(("server", server))
@@ -6261,9 +5630,9 @@ def tools_menu(keys=None) -> bool:
     if not rows:
         return False
     descs = {s["function"]["name"]: s["function"].get("description", "") for s in builtin_specs}
-    for s in MCP_TOOLS:
+    for s in state.MCP_TOOLS:
         descs[s["function"]["name"]] = s["function"].get("description", "")
-    disabled = set(DISABLED_TOOLS)
+    disabled = set(state.DISABLED_TOOLS)
     pending_on = set()
     collapsed = set(server_order)  # mcp groups start collapsed
     tool_server = {}
@@ -6371,8 +5740,8 @@ def tools_menu(keys=None) -> bool:
                 if kind == "server":
                     collapsed.add(name)
             elif token in ("enter", "ctrl_enter"):
-                DISABLED_TOOLS.clear()
-                DISABLED_TOOLS.update(disabled)
+                state.DISABLED_TOOLS.clear()
+                state.DISABLED_TOOLS.update(disabled)
                 for name in pending_on:
                     _, msg = _enable_pending_mcp(name)
                     enable_msgs.append(msg)
@@ -6422,7 +5791,7 @@ def estimate_context_chars(messages: list, interactive: bool = False) -> int:
     """
     total = len(json.dumps(_active_tools(interactive)))
     for m in messages:
-        total += _content_chars(m.get("content"))
+        total += caps._content_chars(m.get("content"))
         total += len(m.get("reasoning_content") or "")
         for tc in m.get("tool_calls") or []:
             total += len((tc.get("function") or {}).get("arguments") or "")
@@ -6439,7 +5808,7 @@ def format_status(messages: list, context_window: int = 0, conv_id: int = None) 
     tools = _active_tools(True)
     total_chars = estimate_context_chars(messages, interactive=True)
     approx_tokens = total_chars // 4
-    usage = USAGE_BY_CONV.get(conv_id if conv_id is not None else id(messages))
+    usage = state.USAGE_BY_CONV.get(conv_id if conv_id is not None else id(messages))
     prompt_tokens = (
         int(usage["prompt_tokens"])
         if isinstance(usage, dict) and usage.get("prompt_tokens")
@@ -6457,19 +5826,19 @@ def format_status(messages: list, context_window: int = 0, conv_id: int = None) 
         ctx += f" ({pct_str} of {context_window} window)"
     lines = [
         ctx,
-        f"api url: {API_URL}",
+        f"api url: {state.API_URL}",
         f"tools: {tool_names}",
-        f"session: {SESSION_ID or '(no session id)'}  {_session_note()}",
+        f"session: {state.SESSION_ID or '(no session id)'}  {_session_note()}",
         format_compaction(),
     ]
-    if MCP_CLIENTS:
+    if state.MCP_CLIENTS:
         mcp_lines = []
-        for c in MCP_CLIENTS:
+        for c in state.MCP_CLIENTS:
             names = ", ".join(c.tool_names) if c.tool_names else "no tools"
             mcp_lines.append(f"  {c.name} ({c.transport}): {names}")
         lines.append("mcp servers:\n" + "\n".join(mcp_lines))
-    if PENDING_MCP:
-        pend_lines = [f"  {n} (disabled in config; enable via /tools)" for n, _ in PENDING_MCP]
+    if state.PENDING_MCP:
+        pend_lines = [f"  {n} (disabled in config; enable via /tools)" for n, _ in state.PENDING_MCP]
         lines.append("mcp servers (disabled):\n" + "\n".join(pend_lines))
     return "\n".join(lines)
 
@@ -6494,16 +5863,15 @@ def set_auto_send(arg: str) -> str:
 
     Returns '' for an unknown argument (the caller prints a usage error).
     """
-    global AUTO_SEND
     v = arg.strip().lower()
     if v in ("on", "true", "yes", "1"):
-        AUTO_SEND = True
+        state.AUTO_SEND = True
         return "auto-send on — Enter submits, Ctrl+J inserts a newline"
     if v in ("off", "false", "no", "0"):
-        AUTO_SEND = False
+        state.AUTO_SEND = False
         return "auto-send off — Enter inserts a newline, Ctrl+Enter (or Ctrl+D) submits"
     if not v:
-        return f"auto-send: {'on' if AUTO_SEND else 'off'}"
+        return f"auto-send: {'on' if state.AUTO_SEND else 'off'}"
     return ""
 
 
@@ -6622,13 +5990,12 @@ def run_agent(
     `task` call in the same turn, top-level ones included — would still be
     sitting at level 2 and wrongly told the nesting limit was reached.
     """
-    global _AGENT_DEPTH
-    previous_depth = _AGENT_DEPTH
-    _AGENT_DEPTH = max(0, depth)
+    previous_depth = state._AGENT_DEPTH
+    state._AGENT_DEPTH = max(0, depth)
     try:
         return _agent_loop(messages, model, interactive, temperature, conv_id)
     finally:
-        _AGENT_DEPTH = previous_depth
+        state._AGENT_DEPTH = previous_depth
 
 
 def _agent_loop(
@@ -6643,7 +6010,7 @@ def _agent_loop(
     # A sub-agent must not loop forever: uncapped, a model that keeps calling
     # tools burns its context (and the summary it hands back) unattended. A
     # top-level agent is user-steered and double-ESC-able, so it stays uncapped.
-    is_subagent = _AGENT_DEPTH > 0
+    is_subagent = state._AGENT_DEPTH > 0
     steps = 0
     # A capped run gets one extra turn devoted to the hand-off. A sub-agent cut
     # off at the top of this loop has usually just finished a tool-call turn, so
@@ -6655,29 +6022,29 @@ def _agent_loop(
     conv_key = conv_id if conv_id is not None else id(messages)
     def _step_limited() -> None:
         print(
-            OUTPUT_INDENT
+            state.OUTPUT_INDENT
             + colorize(
                 f"{icon('exit')} sub-agent stopped: step limit "
-                f"({SUBAGENT_STEP_LIMIT}) reached",
+                f"({state.SUBAGENT_STEP_LIMIT}) reached",
                 "error",
             )
         )
-        raise SubagentStepLimit(f"sub-agent exceeded {SUBAGENT_STEP_LIMIT} model turns")
+        raise SubagentStepLimit(f"sub-agent exceeded {state.SUBAGENT_STEP_LIMIT} model turns")
 
     while True:
-        if is_subagent and SUBAGENT_STEP_LIMIT and steps >= SUBAGENT_STEP_LIMIT:
+        if is_subagent and state.SUBAGENT_STEP_LIMIT and steps >= state.SUBAGENT_STEP_LIMIT:
             if closing_turn:
                 _step_limited()
             closing_turn = True
             print(
-                OUTPUT_INDENT
+                state.OUTPUT_INDENT
                 + colorize(
                     f"{icon('exit')} sub-agent reached its step limit "
-                    f"({SUBAGENT_STEP_LIMIT}) — one closing turn to summarise",
+                    f"({state.SUBAGENT_STEP_LIMIT}) — one closing turn to summarise",
                     "error",
                 )
             )
-            messages.append({"role": "user", "content": STEP_LIMIT_CLOSE_PROMPT})
+            messages.append({"role": "user", "content": config.STEP_LIMIT_CLOSE_PROMPT})
             _session_message(messages[-1], conv_key)
         # Make room before asking, not after the server refuses: compact when this
         # conversation's usage has crossed the threshold of the window.
@@ -6700,14 +6067,14 @@ def _agent_loop(
                 )
                 if not streamed:
                     message = None
-            except ContextOverflow as e:
+            except errors.ContextOverflow as e:
                 if not _recover_overflow(messages, conv_key, model, str(e), attempts, interactive):
                     print(
-                        OUTPUT_INDENT
+                        state.OUTPUT_INDENT
                         + colorize(f"{icon('error')} out of context ({e}) — this run stops here", "error")
                     )
-                    print(OUTPUT_INDENT + colorize(_transcript_hint(conv_key), "dim"))
-                    return CONTEXT_OVERFLOW_CODE
+                    print(state.OUTPUT_INDENT + colorize(_transcript_hint(conv_key), "dim"))
+                    return config.CONTEXT_OVERFLOW_CODE
                 attempts += 1
                 continue
             except StreamInterrupted as e:
@@ -6730,7 +6097,7 @@ def _agent_loop(
                 return 0
             except (urllib.error.URLError, ConnectionError, OSError) as e:
                 print(
-                    OUTPUT_INDENT
+                    state.OUTPUT_INDENT
                     + colorize(
                         f"{icon('error')} streaming failed ({e}); retrying non-streaming",
                         "error",
@@ -6745,19 +6112,19 @@ def _agent_loop(
                         temperature=temperature,
                         conv_id=conv_id,
                     )
-                except ContextOverflow as e:
+                except errors.ContextOverflow as e:
                     if not _recover_overflow(messages, conv_key, model, str(e), attempts, interactive):
                         print(
-                            OUTPUT_INDENT
+                            state.OUTPUT_INDENT
                             + colorize(f"{icon('error')} out of context ({e}) — this run stops here", "error")
                         )
-                        print(OUTPUT_INDENT + colorize(_transcript_hint(conv_key), "dim"))
-                        return CONTEXT_OVERFLOW_CODE
+                        print(state.OUTPUT_INDENT + colorize(_transcript_hint(conv_key), "dim"))
+                        return config.CONTEXT_OVERFLOW_CODE
                     attempts += 1
                     continue
                 except urllib.error.URLError as e:
                     print(
-                        OUTPUT_INDENT
+                        state.OUTPUT_INDENT
                         + colorize(f"{icon('error')} connection error: {e}", "error")
                     )
                     return 1
@@ -6788,15 +6155,15 @@ def _agent_loop(
             print_tool_call(name, raw_args)
             try:
                 result = execute_tool(name, raw_args)
-            except ExitSignal as e:
+            except errors.ExitSignal as e:
                 if e.message:
                     print(
-                        OUTPUT_INDENT + colorize(f"{icon('exit')} {e.message}", "tool")
+                        state.OUTPUT_INDENT + colorize(f"{icon('exit')} {e.message}", "tool")
                     )
                 if is_subagent and conv_id is not None and e.message:
                     # A closing statement the parent would otherwise never see:
                     # tool_task harvests it as the sub-agent's summary.
-                    EXIT_NOTE_BY_CONV[conv_id] = e.message
+                    state.EXIT_NOTE_BY_CONV[conv_id] = e.message
                 # Answer the exit call and everything queued behind it, so the
                 # batch never leaves tool_calls unanswered (as the interrupt
                 # branch below does) — harmless today, since this agent's
@@ -6852,10 +6219,6 @@ def _agent_loop(
 
 
 def main():
-    global API_URL, API_KEY, MODEL, TEMPERATURE, MAX_SUBAGENT_DEPTH, VISION_ENABLED
-    global INTERRUPT_ENABLED, SHELL_PREFERRED, SUBAGENT_STEP_LIMIT
-    global SESSION_LOG, SESSION_DIR, SESSION_MODE
-    global AUTO_COMPACT, COMPACT_THRESHOLD_PCT, CONTEXT_WINDOW
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[reportAttributeAccessIssue]
@@ -6863,21 +6226,21 @@ def main():
             pass
 
     parser = argparse.ArgumentParser(
-        description=f"harnless {VERSION}: minimal LLM agent harness"
+        description=f"harnless {config.VERSION}: minimal LLM agent harness"
     )
     parser.add_argument(
         "--version",
         action="version",
-        version=f"harnless {VERSION}",
+        version=f"harnless {config.VERSION}",
         help="show the harnless version and exit",
     )
     parser.add_argument(
         "--api-url",
-        default=API_URL,
+        default=state.API_URL,
         help=(
             "OpenAI-compatible API URL: either a base URL "
             "(e.g. https://openrouter.ai/api/v1) or a full chat completions "
-            f"endpoint (default: {API_URL})"
+            f"endpoint (default: {state.API_URL})"
         ),
     )
     parser.add_argument(
@@ -6911,7 +6274,7 @@ def main():
         type=int,
         default=2,
         help="maximum sub-agent nesting depth for the task tool (default: 2; "
-        f"0 disables sub-agents, max {SUBAGENT_DEPTH_CEILING})",
+        f"0 disables sub-agents, max {config.SUBAGENT_DEPTH_CEILING})",
     )
     parser.add_argument(
         "--max-subagent-steps",
@@ -6938,9 +6301,9 @@ def main():
     parser.add_argument(
         "--compact-threshold",
         type=int,
-        default=COMPACT_THRESHOLD_PCT,
+        default=state.COMPACT_THRESHOLD_PCT,
         metavar="PCT",
-        help=f"auto-compact once usage reaches this percentage of the context window (default: {COMPACT_THRESHOLD_PCT}, max {COMPACT_THRESHOLD_CEILING})",
+        help=f"auto-compact once usage reaches this percentage of the context window (default: {state.COMPACT_THRESHOLD_PCT}, max {config.COMPACT_THRESHOLD_CEILING})",
     )
     parser.add_argument(
         "--no-session-log",
@@ -6974,7 +6337,7 @@ def main():
         metavar="N",
         help=(
             f"continue the newest recorded session, keeping only its last N "
-            f"messages (no value or 0 = all, max {SESSION_KEEP_CEILING}); "
+            f"messages (no value or 0 = all, max {config.SESSION_KEEP_CEILING}); "
             f"with --resume it only trims that session"
         ),
     )
@@ -7025,33 +6388,33 @@ def main():
     )
     args = parser.parse_args()
 
-    API_URL = normalize_api_url(args.api_url)
-    API_KEY = args.api_key
-    MODEL = args.model
-    TEMPERATURE = args.temperature
-    MAX_SUBAGENT_DEPTH = _clamp_int(args.max_subagents, 0, SUBAGENT_DEPTH_CEILING)
-    SUBAGENT_STEP_LIMIT = _clamp_int(args.max_subagent_steps, 0, SUBAGENT_STEPS_CEILING)
-    VISION_ENABLED = not args.no_vision
-    SHELL_PREFERRED = args.shell
-    SESSION_LOG = not args.no_session_log
+    state.API_URL = normalize_api_url(args.api_url)
+    state.API_KEY = args.api_key
+    state.MODEL = args.model
+    state.TEMPERATURE = args.temperature
+    state.MAX_SUBAGENT_DEPTH = caps._clamp_int(args.max_subagents, 0, config.SUBAGENT_DEPTH_CEILING)
+    state.SUBAGENT_STEP_LIMIT = caps._clamp_int(args.max_subagent_steps, 0, config.SUBAGENT_STEPS_CEILING)
+    state.VISION_ENABLED = not args.no_vision
+    state.SHELL_PREFERRED = args.shell
+    state.SESSION_LOG = not args.no_session_log
     if args.sessions_dir:
-        SESSION_DIR = os.path.abspath(os.path.expanduser(args.sessions_dir))
-    AUTO_COMPACT = not args.no_auto_compact
-    COMPACT_THRESHOLD_PCT = _clamp_int(args.compact_threshold, 1, COMPACT_THRESHOLD_CEILING)
+        state.SESSION_DIR = os.path.abspath(os.path.expanduser(args.sessions_dir))
+    state.AUTO_COMPACT = not args.no_auto_compact
+    state.COMPACT_THRESHOLD_PCT = caps._clamp_int(args.compact_threshold, 1, config.COMPACT_THRESHOLD_CEILING)
 
     context_window = args.context_window
     if context_window == 0 and args.prompt is None:
         context_window = probe_context_window()
     # The compaction triggers compare against this: 0 (no flag, nothing probed) means
     # no proactive compaction — the reactive one still fires if the server complains.
-    CONTEXT_WINDOW = max(0, int(context_window or 0))
+    state.CONTEXT_WINDOW = max(0, int(context_window or 0))
 
     set_color_enabled(not args.no_color and color_enabled())
-    set_emoji_enabled(not args.no_emoji and _stdout_can_encode_emoji())
+    set_emoji_enabled(not args.no_emoji and state._stdout_can_encode_emoji())
 
     mcp_servers = {}
-    if os.path.exists(MCP_HOME_CONFIG):
-        _load_mcp_config_into(mcp_servers, MCP_HOME_CONFIG)
+    if os.path.exists(config.MCP_HOME_CONFIG):
+        _load_mcp_config_into(mcp_servers, config.MCP_HOME_CONFIG)
     for path in args.mcp_config or []:
         _load_mcp_config_into(mcp_servers, path)
     for spec in args.mcp_stdio or []:
@@ -7074,15 +6437,15 @@ def main():
     for name in [n for n, cfg in mcp_servers.items() if not cfg.get("enabled", True)]:
         cfg = mcp_servers.pop(name)
         cfg.pop("enabled", None)
-        PENDING_MCP.append((name, cfg))
+        state.PENDING_MCP.append((name, cfg))
 
     if mcp_servers:
         mcp_clients = [MCPClient(name, cfg) for name, cfg in mcp_servers.items()]
         register_mcp_tools(mcp_clients)
 
-    if mcp_servers or PENDING_MCP:
+    if mcp_servers or state.PENDING_MCP:
         def _close_mcp():
-            for c in MCP_CLIENTS:
+            for c in state.MCP_CLIENTS:
                 try:
                     c.close()
                 except Exception:
@@ -7102,7 +6465,7 @@ def main():
     system_prompt = (
         args.system_prompt
         if args.system_prompt is not None
-        else get_system_prompt(CWD, system_prompt_additions)
+        else get_system_prompt(state.CWD, system_prompt_additions)
     )
 
     agents_md = load_agents_md()
@@ -7115,15 +6478,15 @@ def main():
     if additions:
         system_prompt += "\n\n" + additions
     _todo_load()
-    SESSION_MODE = "one-shot" if args.prompt is not None else "interactive"
+    state.SESSION_MODE = "one-shot" if args.prompt is not None else "interactive"
     resume_spec, resume_keep, resume_implied = _resume_target(args.resume, args.resume_last)
     resumed = None  # restored messages; None means this run starts fresh
     # A resumed session is replayed back to the user only in the REPL: a one-shot run
     # has nobody standing there to read it.
-    resume_echo = 0 if args.prompt is not None else RESUME_TAIL_ITEMS
+    resume_echo = 0 if args.prompt is not None else config.RESUME_TAIL_ITEMS
     if resume_spec:
         restored, note = resume_session(
-            resume_spec, keep=resume_keep, mode=SESSION_MODE, echo=resume_echo
+            resume_spec, keep=resume_keep, mode=state.SESSION_MODE, echo=resume_echo
         )
         if restored is None:
             if not resume_implied:
@@ -7137,7 +6500,7 @@ def main():
             if not resume_echo:  # with echo on, resume_session already said it
                 print(colorize(note, "dim"))
     if resumed is None:
-        start_session(SESSION_MODE)
+        start_session(state.SESSION_MODE)
         messages = [{"role": "system", "content": system_prompt}]
     else:
         # The transcript comes back; the system prompt does not. The resumed run
@@ -7146,30 +6509,30 @@ def main():
         messages = [{"role": "system", "content": system_prompt}] + resumed
     # The log starts where the conversation does. Restored messages are not
     # re-journaled: the file is one continuous transcript, not a copy per resume.
-    _session_prepend(messages[0], MAIN_CONV_ID)
+    _session_prepend(messages[0], state.MAIN_CONV_ID)
 
     if args.prompt is not None:
-        print(colorize(f"harnless {VERSION} one-shot in {CWD} (api: {API_URL})", "dim"))
+        print(colorize(f"harnless {config.VERSION} one-shot in {state.CWD} (api: {state.API_URL})", "dim"))
         print(colorize(_session_note(), "dim"))
         messages.append(build_user_message(args.prompt))
-        _session_message(messages[-1], MAIN_CONV_ID)
+        _session_message(messages[-1], state.MAIN_CONV_ID)
         sys.exit(
             run_agent(messages, args.model, temperature=args.temperature,
-                      conv_id=MAIN_CONV_ID)
+                      conv_id=state.MAIN_CONV_ID)
         )
 
     _history_load()
 
-    INTERRUPT_ENABLED = sys.stdin.isatty()
+    state.INTERRUPT_ENABLED = sys.stdin.isatty()
 
-    print(colorize(f"harnless {VERSION} ready in {CWD} (api: {API_URL})", "dim"))
+    print(colorize(f"harnless {config.VERSION} ready in {state.CWD} (api: {state.API_URL})", "dim"))
     banner = (
         "type / for a command menu, /help for all commands, /exit to quit\n"
         "attach files with @[cwd://rel/path], @[file:///abs/path] or @[http(s)://host/file]\n"
         "use up/down arrows to recall previous input, Ctrl+J inserts a newline (multi-line prompt)\n"
         "Enter submits — /auto-send off switches to Ctrl+Enter to send\n"
     )
-    if INTERRUPT_ENABLED:
+    if state.INTERRUPT_ENABLED:
         banner += "press esc twice (within 2 s) to interrupt generation\n"
     banner += _session_note() + "\n"
     print(colorize(banner, "dim"))
@@ -7185,12 +6548,12 @@ def main():
         if user_input in ("/exit", "/quit"):
             break
         if user_input == "/new":
-            _session_append(MAIN_CONV_ID, {"next": "a new session id", "type": "cleared"})
+            _session_append(state.MAIN_CONV_ID, {"next": "a new session id", "type": "cleared"})
             # A cleared conversation is a new conversation, so it gets its own log:
             # a later /resume then rebuilds one conversation, never two at once.
             start_session()
             messages = [{"role": "system", "content": system_prompt}]
-            _session_message(messages[0], MAIN_CONV_ID)
+            _session_message(messages[0], state.MAIN_CONV_ID)
             print(colorize(f"session cleared — starting over ({_session_note()})\n", "dim"))
             continue
         if user_input == "/sessions":
@@ -7201,13 +6564,13 @@ def main():
             if not spec:
                 print(colorize(format_sessions(), "dim"))
                 continue
-            resumed, note = resume_session(spec, echo=RESUME_TAIL_ITEMS)
+            resumed, note = resume_session(spec, echo=config.RESUME_TAIL_ITEMS)
             if resumed is None:
                 print(colorize(f"{icon('error')} {note}", "error"))
                 continue
             messages = [{"role": "system", "content": system_prompt}] + resumed
-            _session_prepend(messages[0], MAIN_CONV_ID)
-            if not RESUME_TAIL_ITEMS:  # echo off: the note is the only word on it
+            _session_prepend(messages[0], state.MAIN_CONV_ID)
+            if not config.RESUME_TAIL_ITEMS:  # echo off: the note is the only word on it
                 print(colorize(note, "dim"))
             continue
         if user_input == "/clear-screen":
@@ -7216,7 +6579,7 @@ def main():
         if user_input == "/status":
             print(
                 colorize(
-                    format_status(messages, context_window, conv_id=MAIN_CONV_ID),
+                    format_status(messages, context_window, conv_id=state.MAIN_CONV_ID),
                     "dim",
                 )
             )
@@ -7232,11 +6595,11 @@ def main():
                 else:
                     print(colorize(format_tools(), "dim"))
             else:
-                for name, state in toggle_tools(rest.split()):
-                    if state == "unknown":
+                for name, toggled in toggle_tools(rest.split()):
+                    if toggled == "unknown":
                         print(colorize(f"{icon('error')} unknown tool: {name}", "error"))
                     else:
-                        print(colorize(f"{name}: {state}", "dim"))
+                        print(colorize(f"{name}: {toggled}", "dim"))
             continue
         if user_input == "/auto-compact" or user_input.startswith("/auto-compact "):
             msg = set_auto_compact(user_input[len("/auto-compact"):])
@@ -7247,7 +6610,7 @@ def main():
             continue
         if user_input == "/compact":
             ok, note = compact_messages(
-                messages, MAIN_CONV_ID, model=args.model, reason="manual", interactive=True
+                messages, state.MAIN_CONV_ID, model=args.model, reason="manual", interactive=True
             )
             print(colorize(note, "dim" if ok else "error"))
             continue
@@ -7262,15 +6625,29 @@ def main():
             print(colorize(format_help(), "dim"))
             continue
         messages.append(build_user_message(user_input))
-        _session_message(messages[-1], MAIN_CONV_ID)
+        _session_message(messages[-1], state.MAIN_CONV_ID)
         run_agent(
             messages,
             args.model,
             interactive=True,
             temperature=args.temperature,
-            conv_id=MAIN_CONV_ID,
+            conv_id=state.MAIN_CONV_ID,
         )
 
 
 if __name__ == "__main__":
     main()
+
+
+def __getattr__(name: str):
+    """Resolve a name the split moved out, so `import harnless` still
+    exposes the whole harness. Reads stay live (state and the moved modules
+    are consulted per lookup); a write has to target the owning module —
+    `harnless.state.CONTEXT_WINDOW`, not `harnless.CONTEXT_WINDOW`.
+    """
+    for mod in _MODULES:
+        try:
+            return getattr(mod, name)
+        except AttributeError:
+            pass
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
