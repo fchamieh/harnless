@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import threading
 import urllib
+
 from harnless_core import caps, config, render, state
 
 class MCPError(Exception):

@@ -142,17 +142,17 @@ class TestSymlinkedCwd(Base):
             _remove_dir_link(escape)
 
     def test_grep_reports_cwd_relative_paths(self):
-        self.assertEqual(h.tool_grep({"path": "./", "pattern": "AAA"}), "top.txt:1: AAA")
+        self.assertEqual(h.search.tool_grep({"path": "./", "pattern": "AAA"}), "top.txt:1: AAA")
         self.assertEqual(
-            h.tool_grep({"path": "./", "pattern": "def calc"}), "src/main.py:1: def calc(x):"
+            h.search.tool_grep({"path": "./", "pattern": "def calc"}), "src/main.py:1: def calc(x):"
         )
 
     def test_glob_reports_cwd_relative_paths(self):
-        self.assertEqual(h.tool_glob({"path": "./", "pattern": "**/*.py"}), "src/main.py")
-        self.assertEqual(h.tool_glob({"path": "./", "pattern": "*.txt"}), "top.txt")
+        self.assertEqual(h.search.tool_glob({"path": "./", "pattern": "**/*.py"}), "src/main.py")
+        self.assertEqual(h.search.tool_glob({"path": "./", "pattern": "*.txt"}), "top.txt")
 
     def test_list_dir(self):
-        self.assertEqual(h.tool_list_dir({"path": "./"}), "src/\ntop.txt")
+        self.assertEqual(h.search.tool_list_dir({"path": "./"}), "src/\ntop.txt")
 
     def test_write_then_read_through_the_link(self):
         msg = h.tool_write_file({"path": "./new.txt", "content": "hello\n"})
@@ -324,7 +324,7 @@ class TestPatchFile(Base):
     def patch(self, rel, old, new, **kw):
         args = {"path": os.path.join(self.tmp, rel).replace("\\", "/"), "old_string": old, "new_string": new}
         args.update(kw)
-        return h.tool_patch_file(args)
+        return h.search.tool_patch_file(args)
 
     def test_simple(self):
         self.w("t.txt", "foo\nbar\n")
@@ -389,7 +389,7 @@ class TestGrep(Base):
     def grep(self, pattern, **kw):
         args = {"path": self.tmp, "pattern": pattern}
         args.update(kw)
-        return h.tool_grep(args)
+        return h.search.tool_grep(args)
 
     def test_basic(self):
         self.w("st/g1.txt", "l1\nAAA mid\nl3\n")
@@ -509,7 +509,7 @@ class TestGlob(Base):
     def glob(self, pattern, **kw):
         args = {"path": self.tmp, "pattern": pattern}
         args.update(kw)
-        return h.tool_glob(args)
+        return h.search.tool_glob(args)
 
     def test_star(self):
         self.w("a.txt", "x")
@@ -605,24 +605,24 @@ class TestGitignoreRules(unittest.TestCase):
         """One synthetic .gitignore, as the rules applied at a search root."""
         return [
             (regex, negate, dir_only, "")
-            for regex, negate, dir_only, _ in h._gitignore_rules("\n".join(patterns), "")
+            for regex, negate, dir_only, _ in h.search._gitignore_rules("\n".join(patterns), "")
         ]
 
     def hidden(self, pattern, path, is_dir=False):
         """Would one directory entry (name + kind) be refused by that pattern?"""
-        return h._is_ignored(self._view([pattern]), path, is_dir)
+        return h.search._is_ignored(self._view([pattern]), path, is_dir)
 
     def survive(self, patterns, entries):
         """Which entries a walk of the directory holding these rules yields, with
         ignored directories pruned (`entries`: list of (path, is_dir))."""
         view = [(regex, negate, dir_only, "") for regex, negate, dir_only, _
-                in h._gitignore_rules("\n".join(patterns), "")]
+                in h.search._gitignore_rules("\n".join(patterns), "")]
         kept, pruned = [], set()
         for path, is_dir in entries:
             parent = path.rsplit("/", 1)[0] if "/" in path else ""
             if any(p and (parent == p or parent.startswith(p + "/")) for p in pruned):
                 continue  # its directory was pruned: the walk never gets there
-            if h._is_ignored(view, path, is_dir):
+            if h.search._is_ignored(view, path, is_dir):
                 if is_dir:
                     pruned.add(path)
                 continue
@@ -631,8 +631,8 @@ class TestGitignoreRules(unittest.TestCase):
         return kept
 
     def test_comments_and_blank_lines_are_not_rules(self):
-        self.assertEqual(h._gitignore_rules("# dist/\n\n   \ndist/\n", ""),
-                         h._gitignore_rules("dist/\n", ""))
+        self.assertEqual(h.search._gitignore_rules("# dist/\n\n   \ndist/\n", ""),
+                         h.search._gitignore_rules("dist/\n", ""))
 
     def test_a_bare_pattern_matches_at_any_depth(self):
         self.assertTrue(self.hidden("foo", "foo"))
@@ -698,12 +698,12 @@ class TestGitignoreRules(unittest.TestCase):
         self.assertTrue(self.hidden("[!ab]x.txt", "!x.txt"))  # a negated class matches '!'
 
     def test_the_last_matching_line_of_a_file_decides(self):
-        self.assertTrue(h._is_ignored(self._view(["!first.log", "*.log"]), "first.log", False))
+        self.assertTrue(h.search._is_ignored(self._view(["!first.log", "*.log"]), "first.log", False))
         self.assertFalse(
-            h._is_ignored(self._view(["*.log", "!important.log"]), "important.log", False)
+            h.search._is_ignored(self._view(["*.log", "!important.log"]), "important.log", False)
         )
         self.assertFalse(
-            h._is_ignored(self._view(["*.log", "!important.log"]), "a/important.log", False)
+            h.search._is_ignored(self._view(["*.log", "!important.log"]), "a/important.log", False)
         )
 
     def test_escapes_make_hash_and_bang_ordinary_characters(self):
@@ -717,10 +717,10 @@ class TestGitignoreRules(unittest.TestCase):
 
     def test_a_pattern_git_cannot_use_is_dropped(self):
         # git check-ignore matches nothing at all for these, so neither does harnless
-        self.assertEqual(h._gitignore_rules("[ab\n[z-a].txt\n", ""), [])
+        self.assertEqual(h.search._gitignore_rules("[ab\n[z-a].txt\n", ""), [])
         self.assertFalse(self.hidden("[ab", "[ab"))
         self.assertFalse(self.hidden("[z-a].txt", "azz.txt"))
-        self.assertEqual(h._gitignore_rules("\n", ""), [])
+        self.assertEqual(h.search._gitignore_rules("\n", ""), [])
 
     def test_case_follows_the_filesystem(self):
         # git's core.ignorecase defaults to true where the filesystem is
@@ -752,12 +752,12 @@ class TestGitignoreTools(Base):
     def grep(self, **kw):
         args = {"path": kw.pop("path", self.tree()), "pattern": "NEEDLE"}
         args.update(kw)
-        return h.tool_grep(args)
+        return h.search.tool_grep(args)
 
     def glob(self, pattern, **kw):
         args = {"path": kw.pop("path", self.tree()), "pattern": pattern}
         args.update(kw)
-        return h.tool_glob(args)
+        return h.search.tool_glob(args)
 
     @staticmethod
     def matched(out):
@@ -873,7 +873,7 @@ class TestGitignoreTools(Base):
 
     def test_list_dir_still_reports_what_is_on_disk(self):
         self.tree()
-        self.assertIn("logs/", h.tool_list_dir({"path": f"{self.tmp}/ig"}))
+        self.assertIn("logs/", h.search.tool_list_dir({"path": f"{self.tmp}/ig"}))
 
 
 class TestGitignoreAgainstGit(unittest.TestCase):
@@ -1001,7 +1001,7 @@ class TestGitignoreAgainstGit(unittest.TestCase):
 
     def harness_visible(self, where):
         return {
-            os.path.relpath(fp, where).replace("\\", "/") for fp in h._iter_files(where)
+            os.path.relpath(fp, where).replace("\\", "/") for fp in h.search._iter_files(where)
         }
 
     def test_git_and_harnless_see_the_same_files(self):
@@ -1054,20 +1054,20 @@ class TestDirOps(Base):
         os.makedirs(os.path.join(self.tmp, "st", "empty"))
         self.w("st/a.txt", "one")
         self.w("st/sub/b.txt", "one")
-        self.assertEqual(h.tool_list_dir({"path": f"{self.tmp}/st"}), "a.txt\nempty/\nsub/")
+        self.assertEqual(h.search.tool_list_dir({"path": f"{self.tmp}/st"}), "a.txt\nempty/\nsub/")
 
     def test_list_dir_empty(self):
         os.makedirs(os.path.join(self.tmp, "empty"))
-        self.assertEqual(h.tool_list_dir({"path": f"{self.tmp}/empty"}), "(empty)")
+        self.assertEqual(h.search.tool_list_dir({"path": f"{self.tmp}/empty"}), "(empty)")
 
     def test_list_dir_missing(self):
-        self.assertEqual(h.tool_list_dir({"path": f"{self.tmp}/missing"}), "error: not a directory: " + f"{self.tmp}/missing")
+        self.assertEqual(h.search.tool_list_dir({"path": f"{self.tmp}/missing"}), "error: not a directory: " + f"{self.tmp}/missing")
 
     def test_list_dir_truncation(self):
         for i in range(502):
             with open(os.path.join(self.tmp, f"f{i:03d}.txt"), "w") as f:
                 f.write("x")
-        out = h.tool_list_dir({"path": self.tmp})
+        out = h.search.tool_list_dir({"path": self.tmp})
         self.assertEqual(len(out.split("\n")), 501)
         self.assertTrue(
             out.endswith(
@@ -1080,36 +1080,36 @@ class TestDirOps(Base):
         for i in range(20):
             with open(os.path.join(self.tmp, f"g{i:03d}.txt"), "w") as f:
                 f.write("x")
-        out = h.tool_list_dir({"path": self.tmp, "limit": 5})
+        out = h.search.tool_list_dir({"path": self.tmp, "limit": 5})
         self.assertEqual(len(out.split("\n")), 6)
         self.assertIn("[truncated: 20 entries, showing first 5;", out)
 
     def test_copy(self):
         self.w("st/a.txt", "one\ntwo\n")
-        self.assertEqual(h.tool_copy_file({"src": f"{self.tmp}/st/a.txt", "dst": f"{self.tmp}/st/c.txt"}),
+        self.assertEqual(h.search.tool_copy_file({"src": f"{self.tmp}/st/a.txt", "dst": f"{self.tmp}/st/c.txt"}),
                          f"copied {self.p('st/a.txt')} -> {self.p('st/c.txt')}")
         self.assertEqual(self.r("st/c.txt"), "one\ntwo")
 
     def test_move_creates_parents(self):
         self.w("st/a.txt", "one")
-        self.assertEqual(h.tool_move_file({"src": f"{self.tmp}/st/a.txt", "dst": f"{self.tmp}/st/new/d.txt"}),
+        self.assertEqual(h.search.tool_move_file({"src": f"{self.tmp}/st/a.txt", "dst": f"{self.tmp}/st/new/d.txt"}),
                          f"moved {self.p('st/a.txt')} -> {self.p('st/new/d.txt')}")
         self.assertEqual(self.r("st/new/d.txt"), "one")
 
     def test_delete(self):
         self.w("st/a.txt", "one")
-        self.assertEqual(h.tool_delete_file({"path": f"{self.tmp}/st/a.txt"}), f"deleted {self.p('st/a.txt')}")
+        self.assertEqual(h.search.tool_delete_file({"path": f"{self.tmp}/st/a.txt"}), f"deleted {self.p('st/a.txt')}")
         self.assertFalse(os.path.exists(self.p("st/a.txt")))
 
     def test_delete_missing(self):
-        self.assertEqual(h.tool_delete_file({"path": f"{self.tmp}/nope.txt"}), f"error: file does not exist: {self.tmp}/nope.txt")
+        self.assertEqual(h.search.tool_delete_file({"path": f"{self.tmp}/nope.txt"}), f"error: file does not exist: {self.tmp}/nope.txt")
 
     def test_delete_dir_rejected(self):
         os.makedirs(os.path.join(self.tmp, "d"))
-        self.assertEqual(h.tool_delete_file({"path": f"{self.tmp}/d"}), f"error: cannot delete a directory: {self.tmp}/d")
+        self.assertEqual(h.search.tool_delete_file({"path": f"{self.tmp}/d"}), f"error: cannot delete a directory: {self.tmp}/d")
 
     def test_copy_missing(self):
-        self.assertEqual(h.tool_copy_file({"src": f"{self.tmp}/nope.txt", "dst": f"{self.tmp}/x.txt"}),
+        self.assertEqual(h.search.tool_copy_file({"src": f"{self.tmp}/nope.txt", "dst": f"{self.tmp}/x.txt"}),
                          f"error: source does not exist: {self.tmp}/nope.txt")
 
 
@@ -3925,11 +3925,11 @@ class TestEndToEndScenario(Base):
         h.tool_write_file({"path": f"{proj}/src/util.py", "content": "def other():\n    pass\n"})
         h.tool_write_file({"path": f"{proj}/README.md", "content": "# demo\n"})
 
-        found = h.tool_grep({"path": proj, "pattern": "def calc"})
+        found = h.search.tool_grep({"path": proj, "pattern": "def calc"})
         self.assertEqual(found, "_test_tmp/proj/src/main.py:1: def calc(x):")
 
         self.assertEqual(
-            h.tool_patch_file({"path": f"{proj}/src/main.py", "old_string": "return x + 1", "new_string": "return x * 2"}),
+            h.search.tool_patch_file({"path": f"{proj}/src/main.py", "old_string": "return x + 1", "new_string": "return x * 2"}),
             f"patched {self.p('proj/src/main.py')}: replaced 1 occurrence(s)")
 
         self.assertEqual(self.r("proj/src/main.py"), "def calc(x):\n    return x * 2\n\nprint(calc(5))")
