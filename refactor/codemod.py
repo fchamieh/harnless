@@ -137,11 +137,14 @@ STAGES = {
         "_read_cwd_relative", "_fetch_remote", "_resolve_uri", "expand_file_refs",
         "build_user_message", "re:^_history",
     ]},
+    "shell": {"shell": [
+        "_resolve_shell", "_taskkill_cmd", "_kill_tree", "_drain_killed",
+        "_shell_timeout", "tool_run_shell",
+    ]},
     "agent": {"agent": [
-        "TOOLS", "OPENAI_TOOLS", "OPENAI_TOOLS_INTERACTIVE", "DISPATCH", "REPL_COMMANDS",
-        "tool_get_cwd", "tool_exit", "_prompt_line", "_print_question", "tool_ask_user",
-        "_resolve_shell", "_taskkill_cmd", "_kill_tree", "_drain_killed", "_shell_timeout",
-        "tool_run_shell", "tool_mkdir", "tool_read_file", "tool_write_file",
+        "TOOLS", "OPENAI_TOOLS", "OPENAI_TOOLS_INTERACTIVE", "DISPATCH",
+        "_prompt_line", "_print_question", "tool_ask_user",
+        "tool_get_cwd", "tool_exit", "tool_mkdir", "tool_read_file", "tool_write_file",
         "_html_to_text", "tool_fetch_url", "_closing_summary", "tool_task", "execute_tool",
         "_active_tools", "_all_tool_names", "format_tools", "toggle_tools", "tools_menu",
         "format_status", "set_auto_send", "commands_menu", "format_help",

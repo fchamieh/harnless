@@ -12,6 +12,7 @@ import urllib
 
 from harnless_core import caps, config, render, state
 
+
 class MCPError(Exception):
     pass
 
@@ -182,7 +183,7 @@ class MCPClient:
         env = os.environ.copy()
         for k, v in (self.config.get("env") or {}).items():
             env[k] = v
-        shell = False
+        use_shell = False  # `shell` is the shell module's alias in this file
         if os.name == "nt":
             # Windows: PATH entries like npx/npm/uvx are .cmd shims, which
             # CreateProcess (shell=False) cannot launch (WinError 2) — route
@@ -190,7 +191,7 @@ class MCPClient:
             # safe even with spaces in arguments.
             resolved = shutil.which(command)
             if resolved and resolved.lower().endswith((".cmd", ".bat")):
-                shell = True
+                use_shell = True
         self._proc = subprocess.Popen(
             args,
             stdin=subprocess.PIPE,
@@ -199,7 +200,7 @@ class MCPClient:
             cwd=state.CWD,
             env=env,
             text=True,
-            shell=shell,
+            shell=use_shell,
         )
         self._out_q = queue.Queue()
         threading.Thread(target=self._drain_stdout, daemon=True).start()

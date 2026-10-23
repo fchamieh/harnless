@@ -1117,7 +1117,7 @@ class TestRunShell(Base):
     def sh(self, command, **kw):
         args = {"command": command}
         args.update(kw)
-        return h.tool_run_shell(args)
+        return h.shell.tool_run_shell(args)
 
     def test_success(self):
         out = self.sh("python -c \"print('hello')\"")
@@ -1195,13 +1195,13 @@ class TestRunShell(Base):
         self.assertIn("half a build log", out)
 
     def test_timeout_argument_validation(self):
-        self.assertEqual(h._shell_timeout({}), (h.config.SHELL_TIMEOUT_DEFAULT, None))
-        self.assertEqual(h._shell_timeout({"timeout": 5}), (5, None))
-        self.assertEqual(h._shell_timeout({"timeout": 2.7}), (2, None))
-        self.assertEqual(h._shell_timeout({"timeout": 10**6}), (h.config.SHELL_TIMEOUT_CEILING, None))
-        self.assertEqual(h._shell_timeout({"timeout": 0})[1], "error: timeout must be >= 1")
+        self.assertEqual(h.shell._shell_timeout({}), (h.config.SHELL_TIMEOUT_DEFAULT, None))
+        self.assertEqual(h.shell._shell_timeout({"timeout": 5}), (5, None))
+        self.assertEqual(h.shell._shell_timeout({"timeout": 2.7}), (2, None))
+        self.assertEqual(h.shell._shell_timeout({"timeout": 10**6}), (h.config.SHELL_TIMEOUT_CEILING, None))
+        self.assertEqual(h.shell._shell_timeout({"timeout": 0})[1], "error: timeout must be >= 1")
         self.assertEqual(
-            h._shell_timeout({"timeout": "abc"})[1], "error: timeout must be a number of seconds"
+            h.shell._shell_timeout({"timeout": "abc"})[1], "error: timeout must be a number of seconds"
         )
         self.assertTrue(self.sh("Write-Output 'x'", timeout=0).startswith("error: timeout"))
         self.assertTrue(self.sh("Write-Output 'x'", timeout="soon").startswith("error: timeout"))
@@ -1247,11 +1247,11 @@ class TestResolveShell(Base):
 
     def test_non_windows_uses_shell_true(self):
         with mock.patch.object(h.os, "name", "posix"):
-            self.assertEqual(h._resolve_shell("auto"), (None, ""))
+            self.assertEqual(h.shell._resolve_shell("auto"), (None, ""))
 
     def test_auto_prefers_pwsh(self):
         with self._fake_windows({"pwsh": "C:/pwsh.exe", "powershell": "C:/powershell.exe"}):
-            argv, prefix = h._resolve_shell("auto")
+            argv, prefix = h.shell._resolve_shell("auto")
         self.assertEqual(argv, ["C:/pwsh.exe", "-NoProfile", "-NonInteractive", "-Command"])
         # pwsh 7 can also emit the ANSI code page on redirected stdout, so
         # the UTF-8-forcing prefix is applied to it as well.
@@ -1259,35 +1259,35 @@ class TestResolveShell(Base):
 
     def test_auto_falls_back_to_powershell(self):
         with self._fake_windows({"powershell": "C:/powershell.exe"}):
-            argv, prefix = h._resolve_shell("auto")
+            argv, prefix = h.shell._resolve_shell("auto")
         self.assertEqual(argv, ["C:/powershell.exe", "-NoProfile", "-NonInteractive", "-Command"])
         self.assertIn("OutputEncoding", prefix)
 
     def test_auto_falls_back_to_cmd(self):
         with self._fake_windows({}):
-            self.assertEqual(h._resolve_shell("auto"), (None, ""))
+            self.assertEqual(h.shell._resolve_shell("auto"), (None, ""))
 
     def test_force_pwsh(self):
         with self._fake_windows({"pwsh": "C:/pwsh.exe"}):
-            argv, prefix = h._resolve_shell("pwsh")
+            argv, prefix = h.shell._resolve_shell("pwsh")
         self.assertEqual(argv[0], "C:/pwsh.exe")
         self.assertIn("OutputEncoding", prefix)
 
     def test_force_pwsh_missing_falls_back(self):
         with self._fake_windows({"powershell": "C:/powershell.exe"}):
-            argv, prefix = h._resolve_shell("pwsh")
+            argv, prefix = h.shell._resolve_shell("pwsh")
         self.assertEqual(argv[0], "C:/powershell.exe")
         self.assertIn("OutputEncoding", prefix)
 
     def test_force_powershell(self):
         with self._fake_windows({"powershell": "C:/powershell.exe"}):
-            argv, prefix = h._resolve_shell("powershell")
+            argv, prefix = h.shell._resolve_shell("powershell")
         self.assertEqual(argv[0], "C:/powershell.exe")
         self.assertIn("OutputEncoding", prefix)
 
     def test_force_cmd(self):
         with self._fake_windows({"pwsh": "C:/pwsh.exe"}):
-            self.assertEqual(h._resolve_shell("cmd"), (None, ""))
+            self.assertEqual(h.shell._resolve_shell("cmd"), (None, ""))
 
 
 class TestFetchUrl(unittest.TestCase):
@@ -3934,7 +3934,7 @@ class TestEndToEndScenario(Base):
 
         self.assertEqual(self.r("proj/src/main.py"), "def calc(x):\n    return x * 2\n\nprint(calc(5))")
 
-        out = h.tool_run_shell({"command": f"python {proj}/src/main.py".replace("\\", "/")})
+        out = h.shell.tool_run_shell({"command": f"python {proj}/src/main.py".replace("\\", "/")})
         self.assertEqual(out, "exit code: 0\n10")
 
 

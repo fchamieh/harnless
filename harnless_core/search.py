@@ -7,7 +7,9 @@ skipped unless the caller asks for them."""
 import os
 import re
 import shutil
+
 from harnless_core import caps, config, paths
+
 
 def _ignore_case_flag() -> int:
     """git matches ignore patterns case-insensitively where the filesystem is
