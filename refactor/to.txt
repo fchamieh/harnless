@@ -157,9 +157,7 @@ test_empty (__main__.TestFetchUrl.test_empty) ... ok
 test_entities_decoded_when_stripping (__main__.TestFetchUrl.test_entities_decoded_when_stripping) ... ok
 test_http_error (__main__.TestFetchUrl.test_http_error) ... ok
 test_invalid_scheme (__main__.TestFetchUrl.test_invalid_scheme) ... ok
-test_max_chars_arg (__main__.TestFetchUrl.test_max_chars_arg) ... C:\Python314\Lib\tempfile.py:484: ResourceWarning: Implicitly cleaning up <HTTPError 404: 'Not Found'>
-  _warnings.warn(self.warn_message, ResourceWarning)
-ok
+test_max_chars_arg (__main__.TestFetchUrl.test_max_chars_arg) ... ok
 test_raw_html_kept_by_default (__main__.TestFetchUrl.test_raw_html_kept_by_default) ... ok
 test_registered (__main__.TestFetchUrl.test_registered) ... ok
 test_strip_html (__main__.TestFetchUrl.test_strip_html) ... ok
@@ -395,12 +393,16 @@ test_register_mcp_client_connect_fail (__main__.TestMcpPending.test_register_mcp
 test_register_mcp_client_connects (__main__.TestMcpPending.test_register_mcp_client_connects) ... ok
 test_tools_menu_enables_pending (__main__.TestMcpPending.test_tools_menu_enables_pending) ... ok
 test_tools_menu_rendering_shows_pending (__main__.TestMcpPending.test_tools_menu_rendering_shows_pending) ... ok
-test_registers_and_collides (__main__.TestMcpRegister.test_registers_and_collides) ... FAIL
+test_registers_and_collides (__main__.TestMcpRegister.test_registers_and_collides) ... ok
 test_spec_shape (__main__.TestMcpRegister.test_spec_shape) ... ok
-test_connect_list_call (__main__.TestMcpStdioIntegration.test_connect_list_call) ... X:\Development\Fadi Projects\ai\fadiz-harness\harnless_core\mcp.py:173: ResourceWarning: unclosed file <_io.TextIOWrapper name=5 encoding='cp1256'>
+test_the_agent_layer_hands_its_own_names_down (__main__.TestMcpRegister.test_the_agent_layer_hands_its_own_names_down)
+_builtin_tool_names() is the other half of the seam: what startup passes as ... ok
+test_the_caller_has_to_say_which_names_are_taken (__main__.TestMcpRegister.test_the_caller_has_to_say_which_names_are_taken)
+The MCP module does not know the harness's built-in tools: it refuses a name ... ok
+test_connect_list_call (__main__.TestMcpStdioIntegration.test_connect_list_call) ... X:\Development\Fadi Projects\ai\fadiz-harness\harnless_core\mcp.py:175: ResourceWarning: unclosed file <_io.TextIOWrapper name=5 encoding='cp1256'>
   self._proc = None
 ResourceWarning: Enable tracemalloc to get the object allocation traceback
-X:\Development\Fadi Projects\ai\fadiz-harness\harnless_core\mcp.py:173: ResourceWarning: unclosed file <_io.TextIOWrapper name=4 encoding='cp1256'>
+X:\Development\Fadi Projects\ai\fadiz-harness\harnless_core\mcp.py:175: ResourceWarning: unclosed file <_io.TextIOWrapper name=4 encoding='cp1256'>
   self._proc = None
 ResourceWarning: Enable tracemalloc to get the object allocation traceback
 ok
@@ -432,12 +434,12 @@ test_bool_arg_default_and_strings (__main__.TestOutputCaps.test_bool_arg_default
 test_cap_constants_are_ordered (__main__.TestOutputCaps.test_cap_constants_are_ordered) ... ok
 test_cap_count_helper (__main__.TestOutputCaps.test_cap_count_helper) ... ok
 test_cap_count_noop_when_under_limit (__main__.TestOutputCaps.test_cap_count_noop_when_under_limit) ... ok
-test_case_knobs_are_exposed_in_schemas (__main__.TestOutputCaps.test_case_knobs_are_exposed_in_schemas) ... ok
+test_case_knobs_are_exposed_in_schemas (__main__.TestOutputCaps.test_case_knobs_are_exposed_in_schemas) ... ERROR
 test_clip_line_helper (__main__.TestOutputCaps.test_clip_line_helper) ... ok
 test_execute_tool_backstop_applies_to_mcp_path (__main__.TestOutputCaps.test_execute_tool_backstop_applies_to_mcp_path) ... ok
 test_execute_tool_backstop_caps_any_result (__main__.TestOutputCaps.test_execute_tool_backstop_caps_any_result) ... ok
 test_limit_arg_default_clamp_and_fallback (__main__.TestOutputCaps.test_limit_arg_default_clamp_and_fallback) ... ok
-test_limit_args_are_exposed_in_schemas (__main__.TestOutputCaps.test_limit_args_are_exposed_in_schemas) ... ok
+test_limit_args_are_exposed_in_schemas (__main__.TestOutputCaps.test_limit_args_are_exposed_in_schemas) ... ERROR
 test_mcp_structured_content_capped (__main__.TestOutputCaps.test_mcp_structured_content_capped) ... ok
 test_mcp_text_result_capped (__main__.TestOutputCaps.test_mcp_text_result_capped) ... ok
 test_truncate_helper (__main__.TestOutputCaps.test_truncate_helper) ... ok
@@ -720,30 +722,34 @@ test_offset_zero (__main__.TestWriteFile.test_offset_zero) ... ok
 test_replace_range (__main__.TestWriteFile.test_replace_range) ... ok
 
 ======================================================================
-FAIL: test_registers_and_collides (__main__.TestMcpRegister.test_registers_and_collides)
+ERROR: test_case_knobs_are_exposed_in_schemas (__main__.TestOutputCaps.test_case_knobs_are_exposed_in_schemas)
 ----------------------------------------------------------------------
 Traceback (most recent call last):
-  File "X:\Development\Fadi Projects\ai\fadiz-harness\tests.py", line 4129, in test_registers_and_collides
-    self.assertEqual(names, ["echo", "dup"])
-    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
-AssertionError: Lists differ: ['read_file', 'echo', 'dup'] != ['echo', 'dup']
+  File "X:\Development\Fadi Projects\ai\fadiz-harness\tests.py", line 1483, in test_case_knobs_are_exposed_in_schemas
+    props = h.TOOLS[name][0]["function"]["parameters"]["properties"]
+            ^^^^^^^
+  File "X:\Development\Fadi Projects\ai\fadiz-harness\harnless.py", line 1638, in __getattr__
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+AttributeError: module 'harnless' has no attribute 'TOOLS'
 
-First differing element 0:
-'read_file'
-'echo'
-
-First list contains 1 additional elements.
-First extra element 2:
-'dup'
-
-- ['read_file', 'echo', 'dup']
-+ ['echo', 'dup']
+======================================================================
+ERROR: test_limit_args_are_exposed_in_schemas (__main__.TestOutputCaps.test_limit_args_are_exposed_in_schemas)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "X:\Development\Fadi Projects\ai\fadiz-harness\tests.py", line 1478, in test_limit_args_are_exposed_in_schemas
+    props = h.TOOLS[name][0]["function"]["parameters"]["properties"]
+            ^^^^^^^
+  File "X:\Development\Fadi Projects\ai\fadiz-harness\harnless.py", line 1638, in __getattr__
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+AttributeError: module 'harnless' has no attribute 'TOOLS'
 
 ----------------------------------------------------------------------
-Ran 677 tests in 30.409s
+Ran 679 tests in 30.488s
 
-FAILED (failures=1, skipped=8)
-you> [1;31merr mcp tool 'dup' (server 'c') collides with an existing tool; skipped[0m
+FAILED (errors=2, skipped=8)
+you> [1;31merr mcp tool 'read_file' (server 'a') collides with an existing tool; skipped[0m
+[1;31merr mcp tool 'dup' (server 'c') collides with an existing tool; skipped[0m
+[1;31merr mcp tool 'read_file' (server 'a') collides with an existing tool; skipped[0m
 [1;33mtool get_cwd({})[0m
 [2mout X:\Development\Fadi Projects\ai\fadiz-harness[0m
 [1;33mtool task({"task": "deeper from level 0"})[0m

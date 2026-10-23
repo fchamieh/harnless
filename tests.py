@@ -1382,8 +1382,8 @@ class TestFetchUrl(unittest.TestCase):
         self.assertEqual(self._fetch(""), "(empty)")
 
     def test_registered(self):
-        all_names = [s["function"]["name"] for s in h.OPENAI_TOOLS]
-        interactive_names = [s["function"]["name"] for s in h.OPENAI_TOOLS_INTERACTIVE]
+        all_names = [s["function"]["name"] for s in h.toolspec.OPENAI_TOOLS]
+        interactive_names = [s["function"]["name"] for s in h.toolspec.OPENAI_TOOLS_INTERACTIVE]
         self.assertIn("fetch_url", all_names)
         self.assertIn("fetch_url", interactive_names)
         self.assertIn("fetch_url", h.DISPATCH)
@@ -1391,6 +1391,16 @@ class TestFetchUrl(unittest.TestCase):
 
 class TestOutputCaps(unittest.TestCase):
     """Two layers: model-facing limit args, and harness-side ceilings that clamp them."""
+
+    def test_the_two_halves_of_the_tool_table_match(self):
+        """SPECS (harnless_core/toolspec.py) and DISPATCH (harnless.py) are one table cut in
+        two: a schema with no function is a tool the model can ask for and the harness
+        cannot answer, a function with no schema is behaviour the model never hears about."""
+        self.assertEqual(list(h.toolspec.SPECS), list(h.DISPATCH))
+        for name, spec in h.toolspec.SPECS.items():
+            self.assertEqual(spec["function"]["name"], name)
+            self.assertTrue(spec["function"]["description"].strip())
+            self.assertTrue(callable(h.DISPATCH[name]))
 
     def test_limit_arg_default_clamp_and_fallback(self):
         self.assertEqual(h.caps._limit_arg({}, "limit", 200, 5000), 200)
@@ -1475,18 +1485,18 @@ class TestOutputCaps(unittest.TestCase):
             "fetch_url": "max_chars",
         }
         for name, arg in expected.items():
-            props = h.TOOLS[name][0]["function"]["parameters"]["properties"]
+            props = h.toolspec.SPECS[name]["function"]["parameters"]["properties"]
             self.assertIn(arg, props, f"{name} schema should expose {arg}")
 
     def test_case_knobs_are_exposed_in_schemas(self):
         for name in ("grep", "glob"):
-            props = h.TOOLS[name][0]["function"]["parameters"]["properties"]
+            props = h.toolspec.SPECS[name]["function"]["parameters"]["properties"]
             self.assertIn("case_sensitive", props, f"{name} schema should expose case_sensitive")
             knob = props["case_sensitive"]
             self.assertEqual(knob["type"], "boolean")
             self.assertIn("default true", knob["description"])
         self.assertNotIn("case_sensitive",
-                         h.TOOLS["list_dir"][0]["function"]["parameters"]["properties"])
+                         h.toolspec.SPECS["list_dir"]["function"]["parameters"]["properties"])
 
     def test_cap_constants_are_ordered(self):
         # The backstop must sit above every per-tool cap, otherwise a tool that
@@ -1933,8 +1943,8 @@ class TestDispatch(Base):
         self.assertEqual(ctx.exception.message, "done")
 
     def test_interactive_tools_exclude_exit(self):
-        interactive_names = [s["function"]["name"] for s in h.OPENAI_TOOLS_INTERACTIVE]
-        all_names = [s["function"]["name"] for s in h.OPENAI_TOOLS]
+        interactive_names = [s["function"]["name"] for s in h.toolspec.OPENAI_TOOLS_INTERACTIVE]
+        all_names = [s["function"]["name"] for s in h.toolspec.OPENAI_TOOLS]
         self.assertNotIn("exit", interactive_names)
         self.assertEqual(
             interactive_names, [n for n in all_names if n != "exit"]
@@ -2027,8 +2037,8 @@ class TestSubagents(unittest.TestCase):
         self.addCleanup(setattr, h, "run_agent", old)
 
     def test_task_registered_in_both_tool_lists(self):
-        all_names = [s["function"]["name"] for s in h.OPENAI_TOOLS]
-        interactive_names = [s["function"]["name"] for s in h.OPENAI_TOOLS_INTERACTIVE]
+        all_names = [s["function"]["name"] for s in h.toolspec.OPENAI_TOOLS]
+        interactive_names = [s["function"]["name"] for s in h.toolspec.OPENAI_TOOLS_INTERACTIVE]
         self.assertIn("task", all_names)
         self.assertIn("task", interactive_names)
         self.assertIn("task", h.DISPATCH)
@@ -2766,7 +2776,7 @@ class TestProbeContextWindow(unittest.TestCase):
 
     def test_tool_names(self):
         out = h.format_status([{"role": "system", "content": "x"}])
-        names = sorted(s["function"]["name"] for s in h.OPENAI_TOOLS_INTERACTIVE)
+        names = sorted(s["function"]["name"] for s in h.toolspec.OPENAI_TOOLS_INTERACTIVE)
         self.assertIn("tools: " + ", ".join(names), out)
         self.assertNotIn("exit", out.split("tools: ")[1])
 
@@ -4232,7 +4242,7 @@ class TestMcpPending(Base):
             h.state.PENDING_MCP.append(("pwserver", {"transport": "http", "url": f"http://127.0.0.1:{port}/mcp"}))
             # rows = built-ins + one row per mcp server + one row per mcp tool + pending
             n_servers = len({client.name for _, (client, _) in h.state.MCP_DISPATCH.items()})
-            n_rows = len(h.OPENAI_TOOLS_INTERACTIVE) + n_servers + len(h.state.MCP_TOOLS)
+            n_rows = len(h.toolspec.OPENAI_TOOLS_INTERACTIVE) + n_servers + len(h.state.MCP_TOOLS)
             keys = ["down"] * n_rows + [("char", " "), "enter"]
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
@@ -4739,7 +4749,7 @@ class TestToolsMenu(unittest.TestCase):
 
     def sorted_names(self):
         specs = sorted(
-            h.OPENAI_TOOLS_INTERACTIVE + h.state.MCP_TOOLS,
+            h.toolspec.OPENAI_TOOLS_INTERACTIVE + h.state.MCP_TOOLS,
             key=lambda s: s["function"]["name"],
         )
         return [s["function"]["name"] for s in specs]
@@ -4825,7 +4835,7 @@ class TestToolsMenu(unittest.TestCase):
 
     def test_mcp_group_rendering(self):
         self._register("srv", [self._mcp_tool("t1", "d1"), self._mcp_tool("t2", "d2")])
-        n_builtin = len(h.OPENAI_TOOLS_INTERACTIVE)
+        n_builtin = len(h.toolspec.OPENAI_TOOLS_INTERACTIVE)
         applied, out = self.menu(["down"] * n_builtin + [("char", "+"), "enter"])
         self.assertTrue(applied)
         self.assertIn("mcp servers:", out)
@@ -4836,7 +4846,7 @@ class TestToolsMenu(unittest.TestCase):
 
     def test_mcp_group_collapsed_by_default(self):
         self._register("srv", [self._mcp_tool("t1", "d1"), self._mcp_tool("t2", "d2")])
-        n_builtin = len(h.OPENAI_TOOLS_INTERACTIVE)
+        n_builtin = len(h.toolspec.OPENAI_TOOLS_INTERACTIVE)
         applied, out = self.menu(["down"] * n_builtin + ["enter"])
         self.assertTrue(applied)
         self.assertIn("> [x] srv", out)
@@ -4846,7 +4856,7 @@ class TestToolsMenu(unittest.TestCase):
 
     def test_expand_collapse_roundtrip(self):
         self._register("srv", [self._mcp_tool("t1", "d1"), self._mcp_tool("t2", "d2")])
-        n_builtin = len(h.OPENAI_TOOLS_INTERACTIVE)
+        n_builtin = len(h.toolspec.OPENAI_TOOLS_INTERACTIVE)
         applied, out = self.menu(["down"] * n_builtin + [("char", "+"), "enter"])
         self.assertTrue(applied)
         self.assertIn("[x] t1", out)
@@ -4862,7 +4872,7 @@ class TestToolsMenu(unittest.TestCase):
 
     def test_expand_equals_alias(self):
         self._register("srv", [self._mcp_tool("t1", "d1")])
-        n_builtin = len(h.OPENAI_TOOLS_INTERACTIVE)
+        n_builtin = len(h.toolspec.OPENAI_TOOLS_INTERACTIVE)
         applied, out = self.menu(["down"] * n_builtin + [("char", "="), "enter"])
         self.assertTrue(applied)
         self.assertIn("[x] t1", out)
@@ -4870,7 +4880,7 @@ class TestToolsMenu(unittest.TestCase):
     def test_navigation_skips_collapsed_rows(self):
         self._register("srv", [self._mcp_tool("t1", "d1"), self._mcp_tool("t2", "d2")])
         h.state.PENDING_MCP.append(("pend", {"transport": "http", "url": "http://x/mcp"}))
-        n_builtin = len(h.OPENAI_TOOLS_INTERACTIVE)
+        n_builtin = len(h.toolspec.OPENAI_TOOLS_INTERACTIVE)
         # visible rows: built-ins, 'srv' (collapsed), 'pend' — so n_builtin+1
         # downs lands on the pending row, not on the hidden t1
         applied, out = self.menu(["down"] * (n_builtin + 1) + ["enter"])
@@ -4879,7 +4889,7 @@ class TestToolsMenu(unittest.TestCase):
 
     def test_server_row_toggles_all_off(self):
         self._register("srv", [self._mcp_tool("t1"), self._mcp_tool("t2")])
-        n_builtin = len(h.OPENAI_TOOLS_INTERACTIVE)
+        n_builtin = len(h.toolspec.OPENAI_TOOLS_INTERACTIVE)
         applied, _ = self.menu(["down"] * n_builtin + [("char", " "), "enter"])
         self.assertTrue(applied)
         self.assertEqual(h.state.DISABLED_TOOLS, {"t1", "t2"})
@@ -4887,7 +4897,7 @@ class TestToolsMenu(unittest.TestCase):
     def test_server_row_mixed_toggles_all_on(self):
         self._register("srv", [self._mcp_tool("t1"), self._mcp_tool("t2")])
         h.state.DISABLED_TOOLS.add("t2")
-        n_builtin = len(h.OPENAI_TOOLS_INTERACTIVE)
+        n_builtin = len(h.toolspec.OPENAI_TOOLS_INTERACTIVE)
         applied, out = self.menu(["down"] * n_builtin + [("char", " "), "enter"])
         self.assertTrue(applied)
         self.assertEqual(h.state.DISABLED_TOOLS, set())
@@ -4902,7 +4912,7 @@ class TestToolsMenu(unittest.TestCase):
 
     def test_individual_mcp_tool_toggle(self):
         self._register("srv", [self._mcp_tool("t1"), self._mcp_tool("t2")])
-        n_builtin = len(h.OPENAI_TOOLS_INTERACTIVE)
+        n_builtin = len(h.toolspec.OPENAI_TOOLS_INTERACTIVE)
         # rows: built-ins, then the 'srv' server row (expand it), then its tools
         applied, _ = self.menu(
             ["down"] * n_builtin + [("char", "+"), "down", ("char", " "), "enter"]
@@ -5250,8 +5260,8 @@ class TestMemory(Base):
 
 class TestStateToolsRegistered(unittest.TestCase):
     def test_new_tools_in_both_lists(self):
-        all_names = [s["function"]["name"] for s in h.OPENAI_TOOLS]
-        interactive_names = [s["function"]["name"] for s in h.OPENAI_TOOLS_INTERACTIVE]
+        all_names = [s["function"]["name"] for s in h.toolspec.OPENAI_TOOLS]
+        interactive_names = [s["function"]["name"] for s in h.toolspec.OPENAI_TOOLS_INTERACTIVE]
         for name in ("todo", "memory"):
             self.assertIn(name, all_names)
             self.assertIn(name, interactive_names)
@@ -5259,7 +5269,7 @@ class TestStateToolsRegistered(unittest.TestCase):
 
     def test_gotcha_tool_removed(self):
         # pitfalls are recorded through the memory tool now, not a separate one
-        for tools in (h.OPENAI_TOOLS, h.OPENAI_TOOLS_INTERACTIVE):
+        for tools in (h.toolspec.OPENAI_TOOLS, h.toolspec.OPENAI_TOOLS_INTERACTIVE):
             self.assertNotIn("gotcha", [s["function"]["name"] for s in tools])
         self.assertNotIn("gotcha", h.DISPATCH)
         for name in ("tool_gotcha", "load_gotchas", "GOTCHAS_FILE", "GOTCHAS_LABEL"):
@@ -5274,7 +5284,7 @@ class TestStateToolsRegistered(unittest.TestCase):
         self.assertIn("gotcha:", prompt)
 
     def test_memory_schema_covers_pitfall_notes(self):
-        schema = next(s for s in h.OPENAI_TOOLS
+        schema = next(s for s in h.toolspec.OPENAI_TOOLS
                       if s["function"]["name"] == "memory")["function"]
         self.assertIn("pitfall", schema["description"])
         self.assertIn("gotcha:", schema["description"])
@@ -5316,8 +5326,8 @@ class TestAskUser(Base):
             return fn(args)
 
     def test_registered_in_both_lists(self):
-        all_names = [s["function"]["name"] for s in h.OPENAI_TOOLS]
-        interactive_names = [s["function"]["name"] for s in h.OPENAI_TOOLS_INTERACTIVE]
+        all_names = [s["function"]["name"] for s in h.toolspec.OPENAI_TOOLS]
+        interactive_names = [s["function"]["name"] for s in h.toolspec.OPENAI_TOOLS_INTERACTIVE]
         for name in ("ask_user",):
             self.assertIn(name, all_names)
             self.assertIn(name, interactive_names)
@@ -7684,7 +7694,7 @@ class TestCompaction(unittest.TestCase):
         self.assertIn("test-session", missing)  # and it names what it does have
 
     def test_the_sessions_tool_is_a_model_tool_too(self):
-        names = [s["function"]["name"] for s in h.OPENAI_TOOLS]
+        names = [s["function"]["name"] for s in h.toolspec.OPENAI_TOOLS]
         self.assertIn("sessions", names)  # the way back has to be reachable from a turn
         self.assertIn("sessions", h.DISPATCH)
 

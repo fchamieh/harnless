@@ -4,7 +4,9 @@ import os
 import shutil
 import signal
 import subprocess
+
 from harnless_core import caps, config, state
+
 
 def _resolve_shell(preferred: str = "auto") -> tuple:
     """Resolve the shell run_shell should use.
