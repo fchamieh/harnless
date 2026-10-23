@@ -91,17 +91,55 @@ STAGES = {
         "print_tool_call", "print_tool_result", "_format_tokens", "_format_elapsed",
     ]},
     "journal": {"journal": [
-        "_session_stamp", "_session_new_id", "_session_path", "_session_disable",
-        "_session_append", "_session_elide", "_session_message", "_session_messages",
-        "_session_open", "_session_continue", "start_session", "_session_note",
-        "_session_mtime_str", "_session_files", "_session_mtime_key",
-        "_session_main_files", "_session_id_of", "_session_read",
-        "_session_rebuild_pairs", "_session_rebuild", "_session_resolve",
-        "_session_injected_turn", "_session_tail", "replay_session_tail",
-        "resume_session", "_resume_target", "_session_prepend", "format_sessions",
-        "_record_text", "_session_record_line", "_seq_arg", "tool_sessions",
-        "_record_usage", "_elision_note", "_session_span", "_transcript_note",
-        "_transcript_hint",
+        "re:^_session_", "re:^log_", "start_session", "replay_session_tail",
+        "resume_session", "_resume_target", "format_sessions", "_record_text",
+        "_elision_note", "_seq_arg", "tool_sessions", "_transcript_note",
+        "_transcript_hint", "_session_span", "_md_block",
+    ]},
+    "compact": {"compact": [
+        "re:^_compact", "re:^_fit_", "re:^_prune_", "_system_prefix", "_thinking_prefix",
+        "_msg_tokens", "_turn_tokens", "_context_tokens_used", "_token_scale",
+        "_summary_request", "_transcript_note", "_compact_note", "compact_messages",
+        "_compact_if_needed", "_recover_overflow", "set_auto_compact", "format_compaction",
+        "estimate_context_chars", "estimate_context_tokens",
+    ]},
+    "search": {"search": [
+        "re:^_gitignore", "re:^_ignore", "_is_ignored", "_iter_files", "tool_grep",
+        "tool_glob", "tool_list_dir", "tool_patch_file", "tool_delete_file",
+        "tool_move_file", "tool_copy_file",
+    ]},
+    "lineedit": {"lineedit": [
+        "_windows_ctrl_held", "_windows_key_token", "_iter_keys_windows",
+        "_iter_keys_windows_poll", "_parse_csi_seq", "_set_raw_input", "_iter_keys_posix",
+        "_iter_keys_posix_poll", "_iter_keys_interrupt", "check_double_esc",
+        "_edit_cur", "_edit_rows", "_edit_phys_pos", "_edit_line", "readline_prompt",
+        "InterruptWatcher", "ContextProgress", "_UploadProgress", "_response_socket",
+    ]},
+    "mcp": {"mcp": [
+        "MCPError", "MCPClient", "re:^_mcp", "_expand_env", "load_mcp_config",
+        "re:^_load_mcp", "re:^_parse_mcp", "_register_mcp_client", "register_mcp_tools",
+        "_enable_pending_mcp", "_mcp_server_tools",
+    ]},
+    "request": {"request": [
+        "normalize_api_url", "_headers", "probe_context_window", "_progress_opener",
+        "_open_request", "chat", "_request_body", "_build_request", "parse_sse_line",
+        "stream_chat", "accumulate_delta", "stream_once", "_record_usage",
+    ]},
+    "context": {"context": [
+        "re:^_todo", "tool_todo", "re:^_memory", "tool_memory", "load_memory",
+        "_context_additions", "get_system_prompt", "load_agents_md", "re:^_read_local",
+        "_read_cwd_relative", "_fetch_remote", "_resolve_uri", "expand_file_refs",
+        "build_user_message", "re:^_history",
+    ]},
+    "agent": {"agent": [
+        "TOOLS", "OPENAI_TOOLS", "OPENAI_TOOLS_INTERACTIVE", "DISPATCH", "REPL_COMMANDS",
+        "tool_get_cwd", "tool_exit", "_prompt_line", "_print_question", "tool_ask_user",
+        "_resolve_shell", "_taskkill_cmd", "_kill_tree", "_drain_killed", "_shell_timeout",
+        "tool_run_shell", "tool_mkdir", "tool_read_file", "tool_write_file",
+        "_html_to_text", "tool_fetch_url", "_closing_summary", "tool_task", "execute_tool",
+        "_active_tools", "_all_tool_names", "format_tools", "toggle_tools", "tools_menu",
+        "format_status", "set_auto_send", "commands_menu", "format_help",
+        "run_agent", "_agent_loop",
     ]},
 }
 
@@ -112,6 +150,13 @@ DOCSTRINGS = {
     "caps": "Output caps: the ceiling on what a tool may hand back.\n\nTwo layers: a tool's `limit`-style argument is model-facing (the agent can ask for\nless), the constants in harnless_core/config.py are the ceiling it cannot exceed, and\nthese helpers apply both while keeping the truncation note the agent needs to know it\nhappened.",
     "paths": "Working-directory containment: turning a model-supplied relative path into an\nabsolute one guaranteed to stay inside CWD, and back again.\n\nCWD itself may be a symlink/junction, which is why the checks run against both forms of\nit (`_cwd_roots`).",
     "render": "Terminal rendering: the colour/icon tables and their switches, the Markdown\nrenderer, the width helpers, and the lines the agent loop prints.\n\nThe printers are shared with the journal replay on purpose (see harnless_core/journal.py\nreplay_session_tail) so a resumed session replays exactly what it showed live.",
+    "compact": "Context compaction: measuring what a request costs, cutting the oldest turns,\nand writing the handoff note the model is left with.\n\nThe tail (the turns kept verbatim) is chosen in the server's own token units when the\nserver reports usage, so a cut means what the server says it means. Everything replaced\nstays in the journal (see harnless_core/journal.py) and the `compact` record names the\nseqs it replaced.",
+    "search": "The file search tools: CWD-contained walking, .gitignore honouring, and the\ngrep/glob/list_dir/patch_file/read-side helpers they share.\n\nA model-supplied pattern never escapes the working directory, and ignored files are\nskipped unless the caller asks for them.",
+    "lineedit": "Reading the keyboard: the raw-mode key iterators (Windows and POSIX), the\ncursor-editing line editor behind `readline_prompt`, and the console-side watchers the\nagent loop uses (ESC handling, the context-usage meter, upload progress).",
+    "mcp": "The MCP client: JSON-RPC over stdio or HTTP, tool discovery, and how a server's\ntools join the harness's own tool tables.",
+    "request": "Talking to the model server: request building, non-streaming and streaming\ncompletions, SSE parsing, progress reporting and the context-window probe.",
+    "context": "What rides along with every request: the system prompt, AGENTS.md, the memory\nblock, the todo list, `file://`/`http(s)://` references in the user's message, and the\nprompt history file.",
+    "agent": "The agent itself: the tool tables and their dispatch, tool execution, sub-agent\nruns, and the conversation loop.",
     "journal": "Session journal: every conversation recorded as it happens, and the read side\nthat resumes one.\n\nEach message the harness replays to the API is appended as one JSON line, so compaction\ncan name the turns it replaced and --resume / /resume can rebuild a conversation.\n<id>.jsonl holds the top-level run; each sub-agent run gets <id>.<chain>.jsonl.",
 }
 
@@ -232,6 +277,11 @@ PRE_RENAMES = [
      '    signature = json.dumps(TODO_ITEMS, sort_keys=True)'),
     ("    if state == TODO_LAST_INJECTED:", "    if signature == TODO_LAST_INJECTED:"),
     ("    TODO_LAST_INJECTED = state", "    TODO_LAST_INJECTED = signature"),
+    # The line editor's nested repaint helper is named `render`, which would shadow the
+    # harnless_core.render module alias used by every print/width call in that function.
+    ("    def render(commit=False):", "    def redraw(commit=False):"),
+    ("        render(commit=True)", "        redraw(commit=True)"),
+    ("    render()", "    redraw()"),
 ]
 
 
@@ -244,6 +294,18 @@ def cmd_pre():
         src = src.replace(old, new)
     write_source(src)
     print(f"  {len(PRE_RENAMES)} renames applied: `state` is now free as the module alias")
+
+
+def expand(names, by_name):
+    """Resolve a manifest entry: a plain statement name, or 're:<pattern>' matching
+    every top-level name that fits (so a layer is described by its naming convention)."""
+    out = []
+    for entry in names:
+        if isinstance(entry, str) and entry.startswith("re:"):
+            out += sorted(n for n in by_name if re.fullmatch(entry[3:], n))
+        else:
+            out.append(entry)
+    return out
 
 
 def cmd_extract(stage: str):
@@ -268,6 +330,7 @@ def cmd_extract(stage: str):
             else:
                 names = [c for c in consts if c not in MUTABLE_CONSTANTS]
             names = names + STAGES_EXTRA.get(module, [])
+        names = expand(names, by_name)
         missing = [n for n in names if n not in by_name]
         if missing:
             sys.exit(f"stage {stage}: {module} names not found in harnless.py: {missing}")
@@ -324,12 +387,56 @@ def relink(path: pathlib.Path, registry: dict, extra_mods=()):
                  "harnless.py. A package module may not import the entry point: "
                  "move those names down first.")
     core_mods |= {(m, None) for m in extra_mods}
+    aliases = {m for m, _ in core_mods} | {o for o in registry.values() if o != "harnless"}
+    clashes = local_bindings(src, tree) & aliases
+    if clashes:
+        sys.exit(f"{path}: binds {sorted(clashes)} inside a function, but those are core "
+                 "module aliases — the rewrite would read the local value instead of the "
+                 "module. Rename the local (see cmd_pre / PRE_RENAMES).")
     src = apply_edits(src, edits)
     src = fix_global_lines(src, registry)
     src = write_imports(src, core_mods, ast.parse(src))
     path.write_text(collapse_blanks(src), encoding="utf-8", newline="\n")
     print(f"  {path}: {len(edits)} reference rewrites, "
           f"{len(core_mods)} core imports")
+
+
+def local_bindings(src: str, tree) -> set:
+    """Every name bound *inside* a function or class body (parameters, nested defs,
+    assignments, loop/comprehension targets, with/except bindings, import aliases).
+
+    A core module's alias may not appear in this set: `def render(...)` inside a
+    function makes `render.colorize(...)` in that function an AttributeError."""
+    out = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.add(node.name)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                a = node.args
+                out |= {x.arg for x in list(a.posonlyargs) + list(a.args) + list(a.kwonlyargs)}
+                out |= {x.arg for x in (a.vararg, a.kwarg) if x}
+        elif isinstance(node, ast.Assign):
+            out |= {x.id for x in node.targets if isinstance(x, ast.Name)}
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign, ast.NamedExpr)) and isinstance(
+                getattr(node, "target", None), ast.Name):
+            out.add(node.target.id)
+        elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)) and isinstance(
+                node.target, ast.Name):
+            out.add(node.target.id)
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            out |= {i.optional_vars.id for i in node.items if isinstance(i.optional_vars, ast.Name)}
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            out.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            out |= {(a.asname or a.name).split(".")[0] for a in node.names}
+    for node in tree.body:  # module-level bindings are not "local"
+        if isinstance(node, ast.Assign):
+            out -= {x.id for x in node.targets if isinstance(x, ast.Name)}
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.discard(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            out -= {(a.asname or a.name).split(".")[0] for a in node.names}
+    return out
 
 
 def pinned_positions(tree):
@@ -635,9 +742,17 @@ def cmd_shadow():
     print(f"shadowing functions: {bad}")
 
 
+def cmd_cycle():
+    """Everything a move needs: retarget the code, retarget the tests, audit shadows."""
+    cmd_link()
+    cmd_tests()
+    cmd_shadow()
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["pre", "extract", "link", "facade", "tests", "shadow", "audit"])
+    ap.add_argument("cmd", choices=["pre", "extract", "link", "facade", "tests", "shadow",
+                                    "cycle", "audit"])
     ap.add_argument("stage", nargs="?", default="")
     a = ap.parse_args()
     if a.cmd == "pre":
@@ -660,6 +775,8 @@ def main():
     elif a.cmd == "shadow":
         print("shadow audit:")
         cmd_shadow()
+    elif a.cmd == "cycle":
+        cmd_cycle()
     else:
         registry = refresh_registry()
         moved = {n for n, m in registry.items() if m != "harnless"}

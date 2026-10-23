@@ -22,48 +22,8 @@ import urllib.error
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-from harnless_core import caps, config, errors, paths, state
-_MODULES = (caps, config, errors, paths, state)  # facade: moved modules
-
-
-def set_color_enabled(enabled: bool):
-    state.COLORS_ENABLED = enabled
-
-
-def set_emoji_enabled(enabled: bool):
-    state.EMOJI_ENABLED = enabled
-
-
-def icon(key: str) -> str:
-    table = config.ICONS if state.EMOJI_ENABLED else config.ASCII_ICONS
-    return table.get(key, "")
-
-
-def color_enabled() -> bool:
-    if os.environ.get("NO_COLOR"):
-        return False
-    if not sys.stdout.isatty():
-        return False
-    if os.name == "nt":
-        try:
-            import ctypes
-
-            kernel32 = ctypes.windll.kernel32
-            mode = ctypes.c_uint32()
-            if not kernel32.GetConsoleMode(
-                kernel32.GetStdHandle(-11), ctypes.byref(mode)
-            ):
-                return False
-            return bool(mode.value & 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
-        except Exception:
-            return False
-    return True
-
-
-def colorize(text: str, key=None) -> str:
-    if not state.COLORS_ENABLED or key is None:
-        return text
-    return f"{config.ANSI[key]}{text}{config.ANSI['reset']}"
+from harnless_core import caps, config, errors, paths, render, state
+_MODULES = (caps, config, errors, paths, render, state)  # facade: moved modules
 
 
 # ---------------------------------------------------------------- output caps
@@ -100,7 +60,7 @@ def _session_disable(error) -> None:
     state.SESSION_LOG = False
     if not state.SESSION_WARNED:
         state.SESSION_WARNED = True
-        print(colorize(f"{icon('error')} session log disabled: {error}", "error"))
+        print(render.colorize(f"{render.icon('error')} session log disabled: {error}", "error"))
 
 
 def _session_append(key, record: dict) -> int:
@@ -457,7 +417,7 @@ def replay_session_tail(
         return 0
     if label:
         plural = "turns" if len(spoken) != 1 else "turn"
-        print(colorize(f"last {len(spoken)} {plural} from {label}:", "dim"))
+        print(render.colorize(f"last {len(spoken)} {plural} from {label}:", "dim"))
     shown = 0
     index = 0
     while index < len(tail):
@@ -465,17 +425,17 @@ def replay_session_tail(
         role = rec.get("role")
         if role == "user":
             if not _session_injected_turn(rec):
-                print_user(_record_text(rec.get("content")))
+                render.print_user(_record_text(rec.get("content")))
                 shown += 1
             index += 1
             continue
         if role == "assistant":
             shown += 1
-            print_reasoning(rec.get("reasoning_content") or "", config.RESUME_TAIL_CHARS)
+            render.print_reasoning(rec.get("reasoning_content") or "", config.RESUME_TAIL_CHARS)
             calls = [tc for tc in (rec.get("tool_calls") or []) if isinstance(tc, dict)]
             content = _record_text(rec.get("content"))
             if content or not calls:
-                print_assistant(content)
+                render.print_assistant(content)
             index += 1
             answers = []
             while index < len(tail) and tail[index].get("role") == "tool":
@@ -486,15 +446,15 @@ def replay_session_tail(
             }
             for call in calls:  # call, then its answer, then the next — as it ran
                 fn = call.get("function") or {}
-                print_tool_call(fn.get("name") or "?", fn.get("arguments") or "")
+                render.print_tool_call(fn.get("name") or "?", fn.get("arguments") or "")
                 if call.get("id") in answered:
-                    print_tool_result(answered[call.get("id")])
+                    render.print_tool_result(answered[call.get("id")])
             for answer in answers:  # answered here, but its call is outside the window
                 if answer.get("tool_call_id") not in {c.get("id") for c in calls}:
-                    print_tool_result(_record_text(answer.get("content")))
+                    render.print_tool_result(_record_text(answer.get("content")))
             continue
         if role == "tool":  # an answer whose call the window cut off
-            print_tool_result(_record_text(rec.get("content")))
+            render.print_tool_result(_record_text(rec.get("content")))
             index += 1
             continue
         index += 1  # the system prompt this run supplies itself, anything unexpected
@@ -556,7 +516,7 @@ def resume_session(spec: str, keep: int = 0, mode: str = "", echo: int = 0) -> t
         # note (which it then does not print itself) and the turns themselves, read
         # back out of the records — the transcript as it happened, orphan answers and
         # all — through the same printers the session used live.
-        print(colorize(note, "dim"))
+        print(render.colorize(note, "dim"))
         replay_session_tail(records, echo, state.SESSION_ID)
     return messages, note
 
@@ -1146,7 +1106,7 @@ def _compact_if_needed(messages: list, conv_key, model: str = "", interactive: b
         messages, conv_key, model=model, reason="proactive", interactive=interactive
     )
     if ok:
-        print(state.OUTPUT_INDENT + colorize(f"{icon('wait')} {note}", "dim"))
+        print(state.OUTPUT_INDENT + render.colorize(f"{render.icon('wait')} {note}", "dim"))
         return True
     stats = state.COMPACT_STATS.setdefault(conv_key, {"rounds": 0, "dropped": 0, "warned": False})
     if not stats.get("warned"):
@@ -1155,8 +1115,8 @@ def _compact_if_needed(messages: list, conv_key, model: str = "", interactive: b
         stats["warned"] = True
         print(
             state.OUTPUT_INDENT
-            + colorize(
-                f"{icon('wait')} context is {used}/{state.CONTEXT_WINDOW} tokens but not compacting: {note}",
+            + render.colorize(
+                f"{render.icon('wait')} context is {used}/{state.CONTEXT_WINDOW} tokens but not compacting: {note}",
                 "dim",
             )
         )
@@ -1179,20 +1139,20 @@ def _recover_overflow(messages: list, conv_key, model: str, reason: str,
     if not state.AUTO_COMPACT:
         print(
             state.OUTPUT_INDENT
-            + colorize(f"{icon('wait')} context is full ({reason}) and auto-compaction is off — /compact to make room", "dim")
+            + render.colorize(f"{render.icon('wait')} context is full ({reason}) and auto-compaction is off — /compact to make room", "dim")
         )
         return False
-    print(state.OUTPUT_INDENT + colorize(f"{icon('wait')} the server rejected the prompt: {reason}", "error"))
+    print(state.OUTPUT_INDENT + render.colorize(f"{render.icon('wait')} the server rejected the prompt: {reason}", "error"))
     ok, note = compact_messages(
         messages, conv_key, model=model, reason="overflow", interactive=interactive
     )
     if not ok:
         print(
             state.OUTPUT_INDENT
-            + colorize(f"{icon('error')} context is full and compaction cannot help: {note}", "error")
+            + render.colorize(f"{render.icon('error')} context is full and compaction cannot help: {note}", "error")
         )
         return False
-    print(state.OUTPUT_INDENT + colorize(f"{icon('wait')} {note} — retrying the request", "tool"))
+    print(state.OUTPUT_INDENT + render.colorize(f"{render.icon('wait')} {note} — retrying the request", "tool"))
     return True
 
 
@@ -1268,7 +1228,7 @@ def _prompt_line(prompt: str):
 
 
 def _print_question(text: str):
-    print(state.OUTPUT_INDENT + colorize(f"{icon('thinking')} {text}", "assistant"), flush=True)
+    print(state.OUTPUT_INDENT + render.colorize(f"{render.icon('thinking')} {text}", "assistant"), flush=True)
 
 
 def tool_ask_user(args: dict) -> str:
@@ -1282,10 +1242,10 @@ def tool_ask_user(args: dict) -> str:
     print()
     _print_question(question)
     for i, opt in enumerate(options, 1):
-        print(state.OUTPUT_INDENT + colorize(f"  {i}) {opt}", "dim"))
+        print(state.OUTPUT_INDENT + render.colorize(f"  {i}) {opt}", "dim"))
     if options:
-        print(state.OUTPUT_INDENT + colorize("  (or type your own answer)", "dim"))
-    prompt = state.OUTPUT_INDENT + colorize(f"{icon('user')} answer> ", "user")
+        print(state.OUTPUT_INDENT + render.colorize("  (or type your own answer)", "dim"))
+    prompt = state.OUTPUT_INDENT + render.colorize(f"{render.icon('user')} answer> ", "user")
     answer = _prompt_line(prompt)
     if answer is None:
         return "user cancelled (no answer)"
@@ -3271,13 +3231,13 @@ def _load_mcp_config_into(mcp_servers: dict, path: str) -> None:
     try:
         loaded = load_mcp_config(path)
     except Exception as e:
-        print(colorize(f"{icon('error')} failed to load mcp config {path}: {e}", "error"))
+        print(render.colorize(f"{render.icon('error')} failed to load mcp config {path}: {e}", "error"))
         return
     for name, cfg in loaded.items():
         if name in mcp_servers:
             print(
-                colorize(
-                    f"{icon('error')} duplicate mcp server name '{name}'; later definition wins",
+                render.colorize(
+                    f"{render.icon('error')} duplicate mcp server name '{name}'; later definition wins",
                     "error",
                 )
             )
@@ -3557,8 +3517,8 @@ def _register_mcp_client(client) -> bool:
         client.connect()
     except Exception as e:
         print(
-            colorize(
-                f"{icon('error')} mcp server '{client.name}' failed to connect: {e}",
+            render.colorize(
+                f"{render.icon('error')} mcp server '{client.name}' failed to connect: {e}",
                 "error",
             )
         )
@@ -3567,8 +3527,8 @@ def _register_mcp_client(client) -> bool:
         tools = client.list_tools()
     except Exception as e:
         print(
-            colorize(
-                f"{icon('error')} mcp server '{client.name}' tools/list failed: {e}",
+            render.colorize(
+                f"{render.icon('error')} mcp server '{client.name}' tools/list failed: {e}",
                 "error",
             )
         )
@@ -3580,8 +3540,8 @@ def _register_mcp_client(client) -> bool:
             continue
         if name in DISPATCH or name in state.MCP_DISPATCH:
             print(
-                colorize(
-                    f"{icon('error')} mcp tool '{name}' (server '{client.name}') "
+                render.colorize(
+                    f"{render.icon('error')} mcp tool '{name}' (server '{client.name}') "
                     f"collides with an existing tool; skipped",
                     "error",
                 )
@@ -3627,9 +3587,9 @@ def _enable_pending_mcp(name: str) -> tuple:
             ok = _register_mcp_client(client)
             if ok:
                 state.PENDING_MCP.pop(i)
-                return True, f"{icon('ok')} mcp server '{n}' enabled ({len(client.tool_names)} tools)"
-            return False, f"{icon('error')} mcp server '{n}' failed to connect"
-    return False, f"{icon('error')} mcp server '{name}' is not pending"
+                return True, f"{render.icon('ok')} mcp server '{n}' enabled ({len(client.tool_names)} tools)"
+            return False, f"{render.icon('error')} mcp server '{n}' failed to connect"
+    return False, f"{render.icon('error')} mcp server '{name}' is not pending"
 
 
 def _mcp_server_tools(server: str) -> list:
@@ -4260,28 +4220,11 @@ class InterruptWatcher:
             if token == "esc" and not hinted:
                 hinted = True
                 sys.stdout.write(
-                    "\n" + colorize("press esc again to interrupt", "dim") + "\n"
+                    "\n" + render.colorize("press esc again to interrupt", "dim") + "\n"
                 )
                 sys.stdout.flush()
                 if self.on_hint is not None:
                     self.on_hint()
-
-
-def _format_tokens(n: int) -> str:
-    """Compact token count: 999, 1.5k, 2.3M."""
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.1f}k"
-    return str(n)
-
-
-def _format_elapsed(seconds: float) -> str:
-    """Elapsed time: 5s, 1m05s."""
-    if seconds < 60:
-        return f"{seconds:.0f}s"
-    m, s = divmod(int(seconds), 60)
-    return f"{m}m{s:02d}s"
 
 
 class ContextProgress:
@@ -4364,22 +4307,22 @@ class ContextProgress:
                 sys.stdout.flush()
 
     def _line(self) -> str:
-        elapsed = _format_elapsed(time.monotonic() - self._t0)
+        elapsed = render._format_elapsed(time.monotonic() - self._t0)
         upload = self.upload
         if upload is None or upload.sent >= upload.total:
             text = (
-                f"{icon('wait')} waiting for first token "
-                f"({_format_tokens(self.tokens)} tokens) {elapsed}"
+                f"{render.icon('wait')} waiting for first token "
+                f"({render._format_tokens(self.tokens)} tokens) {elapsed}"
             )
         else:
             pct = upload.sent * 100 // upload.total
             sent_tokens = self.tokens * upload.sent // upload.total
             text = (
-                f"{icon('wait')} sending context… {pct}% "
-                f"({_format_tokens(sent_tokens)}/{_format_tokens(self.tokens)} tokens) "
+                f"{render.icon('wait')} sending context… {pct}% "
+                f"({render._format_tokens(sent_tokens)}/{render._format_tokens(self.tokens)} tokens) "
                 f"{elapsed}"
             )
-        return state.OUTPUT_INDENT + colorize(text, "dim")
+        return state.OUTPUT_INDENT + render.colorize(text, "dim")
 
 
 def _edit_cur(row: int, total: int, width: int) -> tuple:
@@ -4409,7 +4352,7 @@ def _edit_rows(text: str, prompt_w: int, width: int) -> int:
     """How many physical rows `prompt + text` paints once soft-wrapped."""
     rows = 0
     for i, ln in enumerate(text.split("\n")):
-        total = (prompt_w if i == 0 else 0) + display_width(ln)
+        total = (prompt_w if i == 0 else 0) + render.display_width(ln)
         rows += max(1, (total + width - 1) // width)  # an empty line is a row too
     return max(1, rows)
 
@@ -4424,10 +4367,10 @@ def _edit_phys_pos(text: str, prompt_w: int, pos: int, width: int) -> tuple:
     for i, ln in enumerate(lines):
         start = prompt_w if i == 0 else 0
         if pos <= len(ln):
-            return _edit_cur(row, start + display_width(ln[:pos]), width)
+            return _edit_cur(row, start + render.display_width(ln[:pos]), width)
         # Next logical line: the printed newline drops the cursor to column 0
         # of the row after the rows this line occupied.
-        total = start + display_width(ln)
+        total = start + render.display_width(ln)
         row += max(1, (total + width - 1) // width)
         pos -= len(ln) + 1
     return row, 0
@@ -4454,11 +4397,11 @@ def _edit_line(prompt: str, keys) -> str:
     prev_cur_row = 0     # which of those rows the cursor ended on
     prev_rendered = False
 
-    def render(commit=False):
+    def redraw(commit=False):
         nonlocal prev_rows, prev_cur_row, prev_rendered
         line = "".join(buf)
-        width = terminal_width()
-        prompt_w = display_width(config._ANSI_RE.sub("", prompt))
+        width = render.terminal_width()
+        prompt_w = render.display_width(config._ANSI_RE.sub("", prompt))
         # An explicit CR: the render must land rows correctly whatever the
         # terminal's output translation is doing (input-only raw mode keeps
         # ONLCR on, but the editor does not depend on it — an extra CR at
@@ -4523,9 +4466,9 @@ def _edit_line(prompt: str, keys) -> str:
         onto a fresh row below it. Needed because the cursor can be parked in
         the middle of a wrapped/multi-line block: without the redraw the tail
         rows stay painted and the next output prints over them."""
-        render(commit=True)
+        redraw(commit=True)
 
-    render()
+    redraw()
     while True:
         token = next(keys)
         if token == "enter":
@@ -4627,7 +4570,7 @@ def _edit_line(prompt: str, keys) -> str:
             else:
                 buf.insert(pos, ch)
                 pos += 1
-        render()
+        redraw()
     commit()
     return "".join(buf)
 
@@ -4998,356 +4941,6 @@ def accumulate_delta(message: dict, delta: dict) -> dict:
     return message
 
 
-def display_width(text: str) -> int:
-    """Approximate terminal display width (East Asian wide/fullwidth chars count as 2)."""
-    width = 0
-    for ch in text:
-        if unicodedata.category(ch) in ("Mn", "Me", "Cf"):
-            continue
-        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
-    return width
-
-
-def terminal_width() -> int:
-    """Current terminal column count (falls back to 80)."""
-    return shutil.get_terminal_size((80, 24)).columns
-
-
-def _is_table_sep(line: str) -> bool:
-    """True if line is a table delimiter row (must contain a pipe)."""
-    return "|" in line and bool(config._MD_TABLE_SEP.match(line))
-
-
-def _split_table_row(line: str) -> list:
-    """Split a pipe-table row into stripped cell strings.
-
-    Leading/trailing pipes are removed; \\| stays inside its cell.
-    """
-    s = line.strip()
-    if s.startswith("|"):
-        s = s[1:]
-    if s.endswith("|") and not s.endswith("\\|"):
-        s = s[:-1]
-    return [c.strip().replace("\\|", "|") for c in config._MD_PIPE_SPLIT.split(s)]
-
-
-def _table_alignments(sep: str, ncols: int) -> list:
-    """Per-column alignment ('left'/'center'/'right') from a delimiter row."""
-    aligns = []
-    for cell in _split_table_row(sep)[:ncols]:
-        left = cell.startswith(":")
-        right = cell.endswith(":")
-        if left and right:
-            aligns.append("center")
-        elif right:
-            aligns.append("right")
-        else:
-            aligns.append("left")
-    return aligns + ["left"] * (ncols - len(aligns))
-
-
-def _truncate_visible(text: str, width: int) -> str:
-    """Truncate plain text to a display width, appending an ellipsis if cut."""
-    if display_width(text) <= width:
-        return text
-    if width <= 0:
-        return ""
-    if width == 1:
-        return "…"
-    out = ""
-    used = 0
-    for ch in text:
-        w = display_width(ch)
-        if used + w > width - 1:
-            break
-        out += ch
-        used += w
-    return out + "…"
-
-
-class MarkdownRenderer:
-    """Incremental Markdown-to-ANSI renderer for streaming assistant output.
-
-    Feed arbitrary chunks via write(); complete lines are styled as they
-    arrive, so markers split across chunks are handled. flush() emits any
-    trailing partial line and clears open code-fence state. With colors
-    disabled, output is the raw input unchanged (safe for pipes).
-
-    Pipe tables are buffered whole (a line containing '|' is held for one
-    line to see whether a delimiter row follows) so columns can be aligned
-    to the widest cell before anything is printed. When a box cannot fit,
-    cells are rendered as wrapped, plain-text header/value records.
-    This is a lightweight Markdown subset, not a full CommonMark parser.
-    """
-
-    def __init__(self, out=None, indent: int = 0):
-        self._out = out if out is not None else sys.stdout
-        self._indent = " " * max(indent, 0)
-        self._buf = ""
-        self._in_code = False
-        self._fence = ""
-        self._first = True
-        self._pending = None  # possible table row awaiting a delimiter row
-        self._table = None  # rows of the table currently being buffered
-
-    def write(self, chunk: str):
-        if not state.COLORS_ENABLED:
-            self._out.write(chunk)
-            self._out.flush()
-            return
-        self._buf += chunk
-        while "\n" in self._buf:
-            line, self._buf = self._buf.split("\n", 1)
-            self._emit(line)
-
-    def flush(self):
-        if not state.COLORS_ENABLED:
-            return
-        if self._buf:
-            self._emit(self._buf)
-            self._buf = ""
-        # Drain any deferred table state (force-emit so nothing re-defers).
-        while self._pending is not None or self._table is not None:
-            if self._pending is not None:
-                pending, self._pending = self._pending, None
-                self._emit(pending, defer=False)
-            if self._table is not None:
-                table, self._table = self._table, None
-                self._render_table(table)
-        self._in_code = False
-        self._fence = ""
-
-    def _emit(self, line: str, defer: bool = True):
-        # write() splits on LF; normalize CRLF only in styled output.
-        line = line.removesuffix("\r")
-        if self._in_code:
-            prefix = "" if self._first else self._indent
-            self._first = False
-            fence = config._MD_FENCE.match(line)
-            if (fence and fence.group(1)[0] == self._fence[0]
-                    and len(fence.group(1)) >= len(self._fence)
-                    and not fence.group(2).strip()):
-                self._in_code = False
-                self._line(prefix + colorize(fence.group(1), "codeblock"))
-            else:
-                self._line(prefix + "  " + colorize(line, "codeblock"))
-            return
-        if self._pending is not None:
-            pending, self._pending = self._pending, None
-            if (_is_table_sep(line)
-                    and len(_split_table_row(pending)) == len(_split_table_row(line))):
-                self._table = [pending, line]
-                return
-            self._emit(pending, defer=False)
-        fence = config._MD_FENCE.match(line)
-        if fence and fence.group(1)[0] == "`" and "`" in fence.group(2):
-            fence = None
-        if self._table is not None:
-            if (line.strip() and "|" in line and not fence
-                    and not config._MD_HEADING.match(line) and not config._MD_QUOTE.match(line)
-                    and not config._MD_LIST.match(line)):
-                self._table.append(line)
-                return
-            table, self._table = self._table, None
-            self._render_table(table)
-        if fence:
-            prefix = "" if self._first else self._indent
-            self._first = False
-            self._in_code = True
-            self._fence = fence.group(1)
-            lang = fence.group(2).strip()
-            self._line(prefix + colorize(self._fence + lang, "codeblock"))
-            return
-        if defer and line.strip() and "|" in line and not _is_table_sep(line):
-            # Might be a table header; wait for the next line to decide.
-            self._pending = line
-            return
-        prefix = "" if self._first else self._indent
-        self._first = False
-        m = config._MD_HEADING.match(line)
-        if m:
-            self._line(prefix + colorize(self._inline(m.group(2).strip()), "heading"))
-            return
-        if config._MD_HR.match(line):
-            self._line(prefix + colorize("─" * 20, "dim"))
-            return
-        m = config._MD_LIST.match(line)
-        if m:
-            pad, marker, rest = m.groups()
-            bullet = "• " if marker in ("-", "*", "+") else f"{marker} "
-            self._line(prefix + pad + colorize(bullet, "bullet") + self._inline(rest))
-            return
-        m = config._MD_QUOTE.match(line)
-        if m:
-            self._line(prefix + colorize("> " + self._inline(m.group(1)), "quote"))
-            return
-        self._line(prefix + self._inline(line))
-
-    def _render_table(self, rows: list):
-        """Render buffered table rows as an aligned box-drawing table."""
-        header = _split_table_row(rows[0])
-        aligns = _table_alignments(rows[1], len(header))
-        body = [_split_table_row(r) for r in rows[2:]]
-        ncols = len(header)
-        if not ncols:
-            return
-        body = [(r + [""] * ncols)[:ncols] for r in body]
-        plain = [header] + body
-
-        widths = []
-        for i in range(ncols):
-            w = max(
-                display_width(config._ANSI_RE.sub("", self._inline(row[i])))
-                for row in plain
-            )
-            widths.append(max(w, config._TABLE_MIN_COL))
-
-        columns = max(1, terminal_width())
-        # Reserve the label width even when the first line has no prefix.
-        # On exceptionally narrow terminals, start below the label and reduce
-        # indentation to leave room for at least one wide character.
-        indent = self._indent[:max(0, columns - 2)]
-        if self._first and indent != self._indent:
-            self._line("")
-            self._first = False
-        available = columns - len(indent)
-
-        def table_line(text):
-            prefix = "" if self._first else indent
-            self._line(prefix + text)
-            self._first = False
-
-        budget = available - (3 * ncols + 1)
-        if budget < ncols * config._TABLE_MIN_COL:
-            # A box cannot fit: preserve cells as wrapped header/value records.
-            # Plain text avoids splitting ANSI escapes when wrapping.
-            def wrapped(text):
-                chunk, used = "", 0
-                for ch in text:
-                    w = display_width(ch)
-                    if w > available:
-                        ch, w = "�", 1
-                    if used + w > available:
-                        table_line(chunk)
-                        chunk, used = "", 0
-                    chunk += ch
-                    used += w
-                table_line(chunk)
-
-            labels = [config._ANSI_RE.sub("", self._inline(c)) for c in header]
-            for index, record in enumerate(body or [None]):
-                if index:
-                    table_line("")
-                for i, label in enumerate(labels):
-                    value = (config._ANSI_RE.sub("", self._inline(record[i]))
-                             if record is not None else None)
-                    wrapped(label if value is None else f"{label}: {value}")
-            return
-        while sum(widths) > budget and max(widths) > config._TABLE_MIN_COL:
-            i = widths.index(max(widths))
-            widths[i] -= 1
-
-        def rule(left, mid, right):
-            return left + mid.join("─" * (w + 2) for w in widths) + right
-
-        def cell(text, i, align):
-            width = widths[i]
-            w = display_width(config._ANSI_RE.sub("", text))
-            pad = max(width - w, 0)
-            if align == "right":
-                left, right = pad, 0
-            elif align == "center":
-                left, right = pad // 2, pad - pad // 2
-            else:
-                left, right = 0, pad
-            return " " * left + text + " " * right
-
-        def row(cells):
-            parts = [colorize(c, k) for c, k in cells]
-            inner = colorize("│", "dim").join(
-                " " + cell(parts[i], i, aligns[i]) + " " for i in range(ncols)
-            )
-            return colorize("│", "dim") + inner + colorize("│", "dim")
-
-        def styled(r):
-            # Style first so code markers do not affect widths. Truncated
-            # cells use plain visible text to avoid cutting an ANSI escape.
-            out = []
-            for i in range(ncols):
-                visible = self._inline(r[i])
-                if display_width(config._ANSI_RE.sub("", visible)) > widths[i]:
-                    visible = _truncate_visible(config._ANSI_RE.sub("", visible), widths[i])
-                out.append(visible)
-            return out
-
-        table_line(colorize(rule("┌", "┬", "┐"), "dim"))
-        table_line(row([(t, "heading") for t in styled(header)]))
-        table_line(colorize(rule("├", "┼", "┤"), "dim"))
-        for r in body:
-            table_line(row([(t, None) for t in styled(r)]))
-        table_line(colorize(rule("└", "┴", "┘"), "dim"))
-
-    def _line(self, text: str):
-        self._out.write(text + "\n")
-        self._out.flush()
-
-    def _inline(self, text: str) -> str:
-        # Tokenize literal spans before emphasis, so neither escape sequences,
-        # code contents nor link destinations can become formatting markers.
-        marker = "\x00"
-        while marker in text:
-            marker += "\x00"
-        protected = []
-        parts = []
-
-        def protect(value):
-            parts.append(f"{marker}{len(protected)}{marker}")
-            protected.append(value)
-
-        i = 0
-        while i < len(text):
-            if (text[i] == "\\" and i + 1 < len(text)
-                    and text[i + 1] in config._MD_ESCAPABLE):
-                protect(text[i + 1])
-                i += 2
-                continue
-            if text[i] == "`":
-                end = i + 1
-                while end < len(text) and text[end] == "`":
-                    end += 1
-                ticks = text[i:end]
-                closing = re.search(r"(?<!`)" + ticks + r"(?!`)", text[end:])
-                if closing:
-                    stop = end + closing.start()
-                    code = text[end:stop]
-                    if code.startswith(" ") and code.endswith(" ") and code.strip():
-                        code = code[1:-1]
-                    protect(colorize(code, "code"))
-                    i = stop + len(ticks)
-                    continue
-                parts.append(ticks)
-                i = end
-                continue
-            if text[i] == "[":
-                link = config._MD_LINK.match(text, i)
-                if link:
-                    protect(colorize(self._inline(link.group(1)), "underline")
-                            + colorize(f" ({link.group(2)})", "dim"))
-                    i = link.end()
-                    continue
-            parts.append(text[i])
-            i += 1
-        rendered = self._emphasis("".join(parts))
-        # A single substitution avoids interpreting placeholders in restored text.
-        return re.sub(re.escape(marker) + r"(\d+)" + re.escape(marker),
-                      lambda m: protected[int(m.group(1))], rendered)
-
-    @staticmethod
-    def _emphasis(text: str) -> str:
-        text = config._MD_BOLD.sub(lambda m: colorize(m.group(1), "bold"), text)
-        return config._MD_ITALIC.sub(lambda m: colorize(m.group(1), "italic"), text)
-
-
 def stream_once(
     messages: list,
     model: str,
@@ -5392,7 +4985,7 @@ def stream_once(
                 if not started_reasoning:
                     print(
                         state.OUTPUT_INDENT
-                        + colorize(f"{icon('thinking')} thinking: ", "thinking"),
+                        + render.colorize(f"{render.icon('thinking')} thinking: ", "thinking"),
                         end="",
                         flush=True,
                     )
@@ -5403,14 +4996,14 @@ def stream_once(
                 if renderer is None:
                     if started_reasoning:
                         print()
-                    label = f"{icon('assistant')} assistant> "
+                    label = f"{render.icon('assistant')} assistant> "
                     print(
-                        state.OUTPUT_INDENT + colorize(label, "assistant"),
+                        state.OUTPUT_INDENT + render.colorize(label, "assistant"),
                         end="",
                         flush=True,
                     )
-                    renderer = MarkdownRenderer(
-                        indent=display_width(state.OUTPUT_INDENT + label)
+                    renderer = render.MarkdownRenderer(
+                        indent=render.display_width(state.OUTPUT_INDENT + label)
                     )
                 renderer.write(content)
             accumulate_delta(message, delta)
@@ -5424,7 +5017,7 @@ def stream_once(
         if renderer is not None:
             renderer.flush()
             print()
-        print(state.OUTPUT_INDENT + colorize("(interrupted)", "dim"))
+        print(state.OUTPUT_INDENT + render.colorize("(interrupted)", "dim"))
         raise StreamInterrupted(message)
     if started_reasoning:
         print()
@@ -5432,57 +5025,6 @@ def stream_once(
         renderer.flush()
         print()
     return message, streamed
-
-
-def print_assistant(content: str):
-    """Print a complete (non-streamed) assistant message with Markdown styling."""
-    label = f"{icon('assistant')} assistant> "
-    print()
-    print(state.OUTPUT_INDENT + colorize(label, "assistant"), end="", flush=True)
-    renderer = MarkdownRenderer(indent=display_width(state.OUTPUT_INDENT + label))
-    renderer.write(content or "")
-    renderer.flush()
-    print()
-
-
-def print_user(text: str):
-    """Print a user turn the way the prompt echoed it: the label, then their text
-    untouched (what a resumed session replays — see replay_session_tail)."""
-    print(colorize(f"{icon('user')} you> ", "user") + (text or ""))
-
-
-def print_reasoning(reasoning: str, limit: int = 0):
-    """The `thinking:` line a non-streamed turn gets (the streaming path paints it
-    live instead). `limit` caps a replayed one: thinking is the part of a session
-    worth summarising, not reading again."""
-    text = (reasoning or "").strip()
-    if not text:
-        return
-    if limit and len(text) > limit:
-        text = text[:limit] + f"... [+{len(text) - limit} chars in the session log]"
-    print(state.OUTPUT_INDENT + colorize(f"{icon('thinking')} thinking: {text}", "thinking"))
-
-
-def print_tool_call(name: str, raw_args: str):
-    """How the loop shows a call before running it: the name and its arguments, previewed."""
-    args = raw_args or ""
-    print(
-        state.OUTPUT_INDENT
-        + colorize(f"{icon('tool')} {name}({args[:config.TOOL_ARG_ECHO]})", "tool")
-    )
-
-
-def print_tool_result(result: str):
-    """How the loop shows what a call returned: its first TOOL_RESULT_ECHO characters."""
-    text = result or ""
-    print(
-        state.OUTPUT_INDENT
-        + colorize(
-            f"{icon('result')} {text[:config.TOOL_RESULT_ECHO]}"
-            f"{'...' if len(text) > config.TOOL_RESULT_ECHO else ''}",
-            "result",
-        )
-    )
 
 
 def execute_tool(name: str, raw_args: str) -> str:
@@ -5674,7 +5216,7 @@ def tools_menu(keys=None) -> bool:
 
     def build_lines():
         lines = [
-            colorize(
+            render.colorize(
                 "tools — space: toggle, +/-: expand/collapse, enter: apply, esc: cancel",
                 "dim",
             )
@@ -5683,9 +5225,9 @@ def tools_menu(keys=None) -> bool:
             if kind == "mcp_tool" and tool_server[name] in collapsed:
                 continue
             if i == n_builtin and server_order:
-                lines.append(colorize("  mcp servers:", "dim"))
+                lines.append(render.colorize("  mcp servers:", "dim"))
             if i == n_builtin + n_server_rows and pending_names:
-                lines.append(colorize("  mcp servers (disabled in config):", "dim"))
+                lines.append(render.colorize("  mcp servers (disabled in config):", "dim"))
             if kind == "server":
                 mark = server_mark(name)
             elif kind == "pending":
@@ -5694,13 +5236,13 @@ def tools_menu(keys=None) -> bool:
                 mark = " " if name in disabled else "x"
             indent = "    " if kind == "mcp_tool" else "  "
             if i == cursor:
-                lines.append(colorize(f">{indent[1:]}[{mark}] {name}", "tool"))
+                lines.append(render.colorize(f">{indent[1:]}[{mark}] {name}", "tool"))
             else:
                 lines.append(f"{indent}[{mark}] {name}")
         desc = row_desc(*rows[cursor])
         if len(desc) > width - 1:
             desc = desc[: width - 4] + "..."
-        lines.append(colorize(desc, "dim"))
+        lines.append(render.colorize(desc, "dim"))
         return lines
 
     drawn = 0
@@ -5888,16 +5430,16 @@ def commands_menu(keys=None) -> str | None:
     width = shutil.get_terminal_size((80, 24)).columns
 
     def build_lines():
-        lines = [colorize("commands — up/down: move, enter: select, esc: cancel", "dim")]
+        lines = [render.colorize("commands — up/down: move, enter: select, esc: cancel", "dim")]
         for i, name in enumerate(names):
             if i == cursor:
-                lines.append(colorize(f"> {name}", "tool"))
+                lines.append(render.colorize(f"> {name}", "tool"))
             else:
                 lines.append(f"  {name}")
         desc = descs[cursor]
         if len(desc) > width - 1:
             desc = desc[: width - 4] + "..."
-        lines.append(colorize(desc, "dim"))
+        lines.append(render.colorize(desc, "dim"))
         return lines
 
     drawn = 0
@@ -6023,8 +5565,8 @@ def _agent_loop(
     def _step_limited() -> None:
         print(
             state.OUTPUT_INDENT
-            + colorize(
-                f"{icon('exit')} sub-agent stopped: step limit "
+            + render.colorize(
+                f"{render.icon('exit')} sub-agent stopped: step limit "
                 f"({state.SUBAGENT_STEP_LIMIT}) reached",
                 "error",
             )
@@ -6038,8 +5580,8 @@ def _agent_loop(
             closing_turn = True
             print(
                 state.OUTPUT_INDENT
-                + colorize(
-                    f"{icon('exit')} sub-agent reached its step limit "
+                + render.colorize(
+                    f"{render.icon('exit')} sub-agent reached its step limit "
                     f"({state.SUBAGENT_STEP_LIMIT}) — one closing turn to summarise",
                     "error",
                 )
@@ -6071,9 +5613,9 @@ def _agent_loop(
                 if not _recover_overflow(messages, conv_key, model, str(e), attempts, interactive):
                     print(
                         state.OUTPUT_INDENT
-                        + colorize(f"{icon('error')} out of context ({e}) — this run stops here", "error")
+                        + render.colorize(f"{render.icon('error')} out of context ({e}) — this run stops here", "error")
                     )
-                    print(state.OUTPUT_INDENT + colorize(_transcript_hint(conv_key), "dim"))
+                    print(state.OUTPUT_INDENT + render.colorize(_transcript_hint(conv_key), "dim"))
                     return config.CONTEXT_OVERFLOW_CODE
                 attempts += 1
                 continue
@@ -6098,8 +5640,8 @@ def _agent_loop(
             except (urllib.error.URLError, ConnectionError, OSError) as e:
                 print(
                     state.OUTPUT_INDENT
-                    + colorize(
-                        f"{icon('error')} streaming failed ({e}); retrying non-streaming",
+                    + render.colorize(
+                        f"{render.icon('error')} streaming failed ({e}); retrying non-streaming",
                         "error",
                     )
                 )
@@ -6116,16 +5658,16 @@ def _agent_loop(
                     if not _recover_overflow(messages, conv_key, model, str(e), attempts, interactive):
                         print(
                             state.OUTPUT_INDENT
-                            + colorize(f"{icon('error')} out of context ({e}) — this run stops here", "error")
+                            + render.colorize(f"{render.icon('error')} out of context ({e}) — this run stops here", "error")
                         )
-                        print(state.OUTPUT_INDENT + colorize(_transcript_hint(conv_key), "dim"))
+                        print(state.OUTPUT_INDENT + render.colorize(_transcript_hint(conv_key), "dim"))
                         return config.CONTEXT_OVERFLOW_CODE
                     attempts += 1
                     continue
                 except urllib.error.URLError as e:
                     print(
                         state.OUTPUT_INDENT
-                        + colorize(f"{icon('error')} connection error: {e}", "error")
+                        + render.colorize(f"{render.icon('error')} connection error: {e}", "error")
                     )
                     return 1
                 message = data["choices"][0]["message"]
@@ -6135,12 +5677,12 @@ def _agent_loop(
 
         reasoning = message.get("reasoning_content")
         if reasoning and not streamed:
-            print_reasoning(reasoning)
+            render.print_reasoning(reasoning)
 
         tool_calls = message.get("tool_calls") or []
         if not tool_calls:
             if not streamed:
-                print_assistant(message.get("content", ""))
+                render.print_assistant(message.get("content", ""))
             if closing_turn:
                 # The closing turn replied: still report the run as capped, so
                 # the parent knows the summary may be partial.
@@ -6148,17 +5690,17 @@ def _agent_loop(
             return 0
 
         if message.get("content") and not streamed:
-            print_assistant(message["content"])
+            render.print_assistant(message["content"])
         for index, tc in enumerate(tool_calls):
             name = tc["function"]["name"]
             raw_args = tc["function"].get("arguments", "")
-            print_tool_call(name, raw_args)
+            render.print_tool_call(name, raw_args)
             try:
                 result = execute_tool(name, raw_args)
             except errors.ExitSignal as e:
                 if e.message:
                     print(
-                        state.OUTPUT_INDENT + colorize(f"{icon('exit')} {e.message}", "tool")
+                        state.OUTPUT_INDENT + render.colorize(f"{render.icon('exit')} {e.message}", "tool")
                     )
                 if is_subagent and conv_id is not None and e.message:
                     # A closing statement the parent would otherwise never see:
@@ -6207,7 +5749,7 @@ def _agent_loop(
                 if is_subagent:
                     raise
                 return 0
-            print_tool_result(result)
+            render.print_tool_result(result)
             tool_result = {
                 "role": "tool",
                 "tool_call_id": tc["id"],
@@ -6409,8 +5951,8 @@ def main():
     # no proactive compaction — the reactive one still fires if the server complains.
     state.CONTEXT_WINDOW = max(0, int(context_window or 0))
 
-    set_color_enabled(not args.no_color and color_enabled())
-    set_emoji_enabled(not args.no_emoji and state._stdout_can_encode_emoji())
+    render.set_color_enabled(not args.no_color and render.color_enabled())
+    render.set_emoji_enabled(not args.no_emoji and state._stdout_can_encode_emoji())
 
     mcp_servers = {}
     if os.path.exists(config.MCP_HOME_CONFIG):
@@ -6421,14 +5963,14 @@ def main():
         try:
             name, cfg = _parse_mcp_stdio(spec)
         except MCPError as e:
-            print(colorize(f"{icon('error')} {e}", "error"))
+            print(render.colorize(f"{render.icon('error')} {e}", "error"))
             continue
         mcp_servers[name] = cfg
     for spec in args.mcp_http or []:
         try:
             name, cfg = _parse_mcp_http(spec)
         except MCPError as e:
-            print(colorize(f"{icon('error')} {e}", "error"))
+            print(render.colorize(f"{render.icon('error')} {e}", "error"))
             continue
         mcp_servers[name] = cfg
 
@@ -6490,15 +6032,15 @@ def main():
         )
         if restored is None:
             if not resume_implied:
-                print(colorize(f"{icon('error')} {note}", "error"))
+                print(render.colorize(f"{render.icon('error')} {note}", "error"))
                 sys.exit(1)
             # --resume-last on its own asks for whoever was here last; when nobody
             # was, that is not an error — say so and open a new session instead.
-            print(colorize(f"{icon('wait')} {note} — starting a new session", "dim"))
+            print(render.colorize(f"{render.icon('wait')} {note} — starting a new session", "dim"))
         else:
             resumed = restored
             if not resume_echo:  # with echo on, resume_session already said it
-                print(colorize(note, "dim"))
+                print(render.colorize(note, "dim"))
     if resumed is None:
         start_session(state.SESSION_MODE)
         messages = [{"role": "system", "content": system_prompt}]
@@ -6512,8 +6054,8 @@ def main():
     _session_prepend(messages[0], state.MAIN_CONV_ID)
 
     if args.prompt is not None:
-        print(colorize(f"harnless {config.VERSION} one-shot in {state.CWD} (api: {state.API_URL})", "dim"))
-        print(colorize(_session_note(), "dim"))
+        print(render.colorize(f"harnless {config.VERSION} one-shot in {state.CWD} (api: {state.API_URL})", "dim"))
+        print(render.colorize(_session_note(), "dim"))
         messages.append(build_user_message(args.prompt))
         _session_message(messages[-1], state.MAIN_CONV_ID)
         sys.exit(
@@ -6525,7 +6067,7 @@ def main():
 
     state.INTERRUPT_ENABLED = sys.stdin.isatty()
 
-    print(colorize(f"harnless {config.VERSION} ready in {state.CWD} (api: {state.API_URL})", "dim"))
+    print(render.colorize(f"harnless {config.VERSION} ready in {state.CWD} (api: {state.API_URL})", "dim"))
     banner = (
         "type / for a command menu, /help for all commands, /exit to quit\n"
         "attach files with @[cwd://rel/path], @[file:///abs/path] or @[http(s)://host/file]\n"
@@ -6535,11 +6077,11 @@ def main():
     if state.INTERRUPT_ENABLED:
         banner += "press esc twice (within 2 s) to interrupt generation\n"
     banner += _session_note() + "\n"
-    print(colorize(banner, "dim"))
+    print(render.colorize(banner, "dim"))
 
     while True:
         try:
-            user_input = readline_prompt(colorize(f"{icon('user')} you> ", "user")).strip()
+            user_input = readline_prompt(render.colorize(f"{render.icon('user')} you> ", "user")).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
@@ -6554,31 +6096,31 @@ def main():
             start_session()
             messages = [{"role": "system", "content": system_prompt}]
             _session_message(messages[0], state.MAIN_CONV_ID)
-            print(colorize(f"session cleared — starting over ({_session_note()})\n", "dim"))
+            print(render.colorize(f"session cleared — starting over ({_session_note()})\n", "dim"))
             continue
         if user_input == "/sessions":
-            print(colorize(format_sessions(), "dim"))
+            print(render.colorize(format_sessions(), "dim"))
             continue
         if user_input == "/resume" or user_input.startswith("/resume "):
             spec = user_input[len("/resume"):].strip()
             if not spec:
-                print(colorize(format_sessions(), "dim"))
+                print(render.colorize(format_sessions(), "dim"))
                 continue
             resumed, note = resume_session(spec, echo=config.RESUME_TAIL_ITEMS)
             if resumed is None:
-                print(colorize(f"{icon('error')} {note}", "error"))
+                print(render.colorize(f"{render.icon('error')} {note}", "error"))
                 continue
             messages = [{"role": "system", "content": system_prompt}] + resumed
             _session_prepend(messages[0], state.MAIN_CONV_ID)
             if not config.RESUME_TAIL_ITEMS:  # echo off: the note is the only word on it
-                print(colorize(note, "dim"))
+                print(render.colorize(note, "dim"))
             continue
         if user_input == "/clear-screen":
             os.system("cls" if os.name == "nt" else "clear")
             continue
         if user_input == "/status":
             print(
-                colorize(
+                render.colorize(
                     format_status(messages, context_window, conv_id=state.MAIN_CONV_ID),
                     "dim",
                 )
@@ -6589,40 +6131,40 @@ def main():
             if not rest:
                 if sys.stdin.isatty():
                     if tools_menu():
-                        print(colorize("tools updated", "dim"))
+                        print(render.colorize("tools updated", "dim"))
                     else:
-                        print(colorize("tools unchanged", "dim"))
+                        print(render.colorize("tools unchanged", "dim"))
                 else:
-                    print(colorize(format_tools(), "dim"))
+                    print(render.colorize(format_tools(), "dim"))
             else:
                 for name, toggled in toggle_tools(rest.split()):
                     if toggled == "unknown":
-                        print(colorize(f"{icon('error')} unknown tool: {name}", "error"))
+                        print(render.colorize(f"{render.icon('error')} unknown tool: {name}", "error"))
                     else:
-                        print(colorize(f"{name}: {toggled}", "dim"))
+                        print(render.colorize(f"{name}: {toggled}", "dim"))
             continue
         if user_input == "/auto-compact" or user_input.startswith("/auto-compact "):
             msg = set_auto_compact(user_input[len("/auto-compact"):])
             if msg:
-                print(colorize(msg, "dim"))
+                print(render.colorize(msg, "dim"))
             else:
-                print(colorize("usage: /auto-compact on|off|threshold N", "error"))
+                print(render.colorize("usage: /auto-compact on|off|threshold N", "error"))
             continue
         if user_input == "/compact":
             ok, note = compact_messages(
                 messages, state.MAIN_CONV_ID, model=args.model, reason="manual", interactive=True
             )
-            print(colorize(note, "dim" if ok else "error"))
+            print(render.colorize(note, "dim" if ok else "error"))
             continue
         if user_input == "/auto-send" or user_input.startswith("/auto-send "):
             msg = set_auto_send(user_input[len("/auto-send"):])
             if msg:
-                print(colorize(msg, "dim"))
+                print(render.colorize(msg, "dim"))
             else:
-                print(colorize("usage: /auto-send on|off", "error"))
+                print(render.colorize("usage: /auto-send on|off", "error"))
             continue
         if user_input == "/help":
-            print(colorize(format_help(), "dim"))
+            print(render.colorize(format_help(), "dim"))
             continue
         messages.append(build_user_message(user_input))
         _session_message(messages[-1], state.MAIN_CONV_ID)

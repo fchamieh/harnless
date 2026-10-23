@@ -58,18 +58,18 @@ class Base(unittest.TestCase):
 class TestSafeResolve(Base):
     def test_normal_resolution(self):
         root_p = os.path.realpath(os.path.join(os.getcwd(), "a", "b.txt"))
-        self.assertEqual(h.safe_resolve("./a/b.txt"), root_p)
-        self.assertEqual(h.safe_resolve("a/b.txt"), root_p)
+        self.assertEqual(h.paths.safe_resolve("./a/b.txt"), root_p)
+        self.assertEqual(h.paths.safe_resolve("a/b.txt"), root_p)
 
     def test_absolute_rejected(self):
         with self.assertRaises(ValueError):
-            h.safe_resolve(os.sep + "abs")
+            h.paths.safe_resolve(os.sep + "abs")
 
     def test_dotdot_escape_rejected(self):
         with self.assertRaises(ValueError):
-            h.safe_resolve("../evil.txt")
+            h.paths.safe_resolve("../evil.txt")
         with self.assertRaises(ValueError):
-            h.safe_resolve("..\\evil.txt")
+            h.paths.safe_resolve("..\\evil.txt")
 
 
 def _make_dir_link(target: str, link: str) -> bool:
@@ -125,19 +125,19 @@ class TestSymlinkedCwd(Base):
         self.assertEqual(h.tool_get_cwd({}), self.link)
 
     def test_safe_resolve_stays_inside_the_linked_cwd(self):
-        self.assertEqual(h.safe_resolve("./src/main.py"), self.p("realdir/src/main.py"))
-        self.assertEqual(h.safe_resolve("./"), self.p("realdir"))
+        self.assertEqual(h.paths.safe_resolve("./src/main.py"), self.p("realdir/src/main.py"))
+        self.assertEqual(h.paths.safe_resolve("./"), self.p("realdir"))
 
     def test_safe_resolve_rejects_escape(self):
         with self.assertRaises(ValueError):
-            h.safe_resolve("../evil.txt")
+            h.paths.safe_resolve("../evil.txt")
 
     def test_link_inside_cwd_pointing_outside_is_rejected(self):
         escape = os.path.join(self.real, "escape")
         self.assertTrue(_make_dir_link(self.p(""), escape))
         try:
             with self.assertRaises(ValueError):
-                h.safe_resolve("./escape/st.txt")
+                h.paths.safe_resolve("./escape/st.txt")
         finally:
             _remove_dir_link(escape)
 
@@ -164,43 +164,43 @@ class TestSymlinkedCwd(Base):
 class TestCwdPathHelpers(unittest.TestCase):
     def test_rel_to_cwd_uses_resolved_cwd(self):
         real = os.path.realpath(h.state.CWD)
-        self.assertEqual(h._rel_to_cwd(os.path.join(real, "src", "main.py")), "src/main.py")
-        self.assertEqual(h._rel_to_cwd(real), ".")
+        self.assertEqual(h.paths._rel_to_cwd(os.path.join(real, "src", "main.py")), "src/main.py")
+        self.assertEqual(h.paths._rel_to_cwd(real), ".")
 
     def test_rel_to_cwd_outside_cwd(self):
         outside = os.path.realpath(os.path.join(os.path.realpath(h.state.CWD), "..", "outside.txt"))
-        self.assertTrue(h._rel_to_cwd(outside).startswith(".."))
+        self.assertTrue(h.paths._rel_to_cwd(outside).startswith(".."))
 
     def test_inside_cwd(self):
-        roots = h._cwd_roots()
-        self.assertTrue(h._inside_cwd(os.path.realpath(h.state.CWD), roots))
-        self.assertTrue(h._inside_cwd(os.path.realpath(os.path.join(h.state.CWD, "a", "b.txt")), roots))
-        self.assertFalse(h._inside_cwd(os.path.realpath(os.path.join(h.state.CWD, "..", "evil.txt")), roots))
+        roots = h.paths._cwd_roots()
+        self.assertTrue(h.paths._inside_cwd(os.path.realpath(h.state.CWD), roots))
+        self.assertTrue(h.paths._inside_cwd(os.path.realpath(os.path.join(h.state.CWD, "a", "b.txt")), roots))
+        self.assertFalse(h.paths._inside_cwd(os.path.realpath(os.path.join(h.state.CWD, "..", "evil.txt")), roots))
 
     def test_glob_to_regex_double_star_matches_root_files(self):
-        regex = h._glob_to_regex("**/*.py")
+        regex = h.paths._glob_to_regex("**/*.py")
         self.assertTrue(regex.match("main.py"))
         self.assertTrue(regex.match("src/deep/main.py"))
         self.assertFalse(regex.match("main.md"))
 
     def test_glob_to_regex_single_star(self):
-        regex = h._glob_to_regex("*.txt")
+        regex = h.paths._glob_to_regex("*.txt")
         self.assertTrue(regex.match("dir/a.txt"))
         self.assertFalse(regex.match("dir/a.md"))
 
     def test_glob_to_regex_regex_passthrough(self):
-        regex = h._glob_to_regex(r"src/(main|util)\.py")
+        regex = h.paths._glob_to_regex(r"src/(main|util)\.py")
         self.assertTrue(regex.match("src/main.py"))
         self.assertFalse(regex.match("src/other.py"))
 
     def test_glob_to_regex_is_case_sensitive_by_default(self):
-        self.assertIsNone(h._glob_to_regex("**/*.PY").match("src/main.py"))
-        self.assertIsNone(h._glob_to_regex(r"src/(main|util)\.PY").match("src/main.py"))
+        self.assertIsNone(h.paths._glob_to_regex("**/*.PY").match("src/main.py"))
+        self.assertIsNone(h.paths._glob_to_regex(r"src/(main|util)\.PY").match("src/main.py"))
 
     def test_glob_to_regex_case_insensitive(self):
-        self.assertTrue(h._glob_to_regex("**/*.py", case_sensitive=False).match("src/MAIN.PY"))
+        self.assertTrue(h.paths._glob_to_regex("**/*.py", case_sensitive=False).match("src/MAIN.PY"))
         self.assertTrue(
-            h._glob_to_regex(r"src/(main|util)\.py", case_sensitive=False).match("src/MAIN.py")
+            h.paths._glob_to_regex(r"src/(main|util)\.py", case_sensitive=False).match("src/MAIN.py")
         )
 
 
@@ -1393,49 +1393,49 @@ class TestOutputCaps(unittest.TestCase):
     """Two layers: model-facing limit args, and harness-side ceilings that clamp them."""
 
     def test_limit_arg_default_clamp_and_fallback(self):
-        self.assertEqual(h._limit_arg({}, "limit", 200, 5000), 200)
-        self.assertEqual(h._limit_arg({"limit": 5}, "limit", 200, 5000), 5)
-        self.assertEqual(h._limit_arg({"limit": 99999}, "limit", 200, 5000), 5000)
-        self.assertEqual(h._limit_arg({"limit": 0}, "limit", 200, 5000), 1)
-        self.assertEqual(h._limit_arg({"limit": -3}, "limit", 200, 5000), 1)
-        self.assertEqual(h._limit_arg({"limit": "42"}, "limit", 200, 5000), 42)
-        self.assertEqual(h._limit_arg({"limit": "abc"}, "limit", 200, 5000), 200)
-        self.assertEqual(h._limit_arg({"limit": None}, "limit", 200, 5000), 200)
+        self.assertEqual(h.caps._limit_arg({}, "limit", 200, 5000), 200)
+        self.assertEqual(h.caps._limit_arg({"limit": 5}, "limit", 200, 5000), 5)
+        self.assertEqual(h.caps._limit_arg({"limit": 99999}, "limit", 200, 5000), 5000)
+        self.assertEqual(h.caps._limit_arg({"limit": 0}, "limit", 200, 5000), 1)
+        self.assertEqual(h.caps._limit_arg({"limit": -3}, "limit", 200, 5000), 1)
+        self.assertEqual(h.caps._limit_arg({"limit": "42"}, "limit", 200, 5000), 42)
+        self.assertEqual(h.caps._limit_arg({"limit": "abc"}, "limit", 200, 5000), 200)
+        self.assertEqual(h.caps._limit_arg({"limit": None}, "limit", 200, 5000), 200)
 
     def test_bool_arg_default_and_strings(self):
-        self.assertEqual(h._bool_arg({}, "case_sensitive", True), True)
-        self.assertEqual(h._bool_arg({"case_sensitive": False}, "case_sensitive", True), False)
-        self.assertEqual(h._bool_arg({"case_sensitive": True}, "case_sensitive", False), True)
+        self.assertEqual(h.caps._bool_arg({}, "case_sensitive", True), True)
+        self.assertEqual(h.caps._bool_arg({"case_sensitive": False}, "case_sensitive", True), False)
+        self.assertEqual(h.caps._bool_arg({"case_sensitive": True}, "case_sensitive", False), True)
         for truthy in ("true", "True", "yes", "Y", "on", "1", " t "):
-            self.assertEqual(h._bool_arg({"case_sensitive": truthy}, "case_sensitive", False),
+            self.assertEqual(h.caps._bool_arg({"case_sensitive": truthy}, "case_sensitive", False),
                              True, truthy)
         for falsy in ("false", "NO", "n", "off", "0", "", " f"):
-            self.assertEqual(h._bool_arg({"case_sensitive": falsy}, "case_sensitive", True),
+            self.assertEqual(h.caps._bool_arg({"case_sensitive": falsy}, "case_sensitive", True),
                              False, falsy)
         # a value that means nothing falls back to the default
-        self.assertEqual(h._bool_arg({"case_sensitive": "sort of"}, "case_sensitive", True), True)
-        self.assertEqual(h._bool_arg({"case_sensitive": None}, "case_sensitive", True), True)
+        self.assertEqual(h.caps._bool_arg({"case_sensitive": "sort of"}, "case_sensitive", True), True)
+        self.assertEqual(h.caps._bool_arg({"case_sensitive": None}, "case_sensitive", True), True)
 
     def test_truncate_helper(self):
-        out = h._truncate("z" * 100, 50, hint="narrow it")
+        out = h.caps._truncate("z" * 100, 50, hint="narrow it")
         self.assertTrue(out.startswith("z" * 50))
         self.assertEqual(
             out[50:], "\n... [truncated: 100 chars total, showing first 50; narrow it]"
         )
 
     def test_truncate_noop_when_under_limit(self):
-        self.assertEqual(h._truncate("short", 50, hint="x"), "short")
+        self.assertEqual(h.caps._truncate("short", 50, hint="x"), "short")
 
     def test_cap_count_helper(self):
-        out = h._cap_count([str(i) for i in range(10)], 3, unit="files", hint="narrow")
+        out = h.caps._cap_count([str(i) for i in range(10)], 3, unit="files", hint="narrow")
         self.assertEqual(out, "0\n1\n2\n... [truncated: 10 files, showing first 3; narrow]")
 
     def test_cap_count_noop_when_under_limit(self):
-        self.assertEqual(h._cap_count(["a", "b"], 5, unit="files"), "a\nb")
+        self.assertEqual(h.caps._cap_count(["a", "b"], 5, unit="files"), "a\nb")
 
     def test_clip_line_helper(self):
-        self.assertEqual(h._clip_line("q" * 500, 100), "q" * 100 + " …[+400 chars on this line]")
-        self.assertEqual(h._clip_line("short", 100), "short")
+        self.assertEqual(h.caps._clip_line("q" * 500, 100), "q" * 100 + " …[+400 chars on this line]")
+        self.assertEqual(h.caps._clip_line("short", 100), "short")
 
     def test_execute_tool_backstop_caps_any_result(self):
         h.DISPATCH["_huge"] = lambda args: "h" * (h.config.TOOL_RESULT_LIMIT + 5_000)
@@ -1499,22 +1499,22 @@ class TestOutputCaps(unittest.TestCase):
 
 class TestColorize(unittest.TestCase):
     def test_disabled_returns_plain(self):
-        h.set_color_enabled(False)
-        self.addCleanup(h.set_color_enabled, True)
-        self.assertEqual(h.colorize("hello", "tool"), "hello")
-        self.assertEqual(h.colorize("hello", None), "hello")
+        h.render.set_color_enabled(False)
+        self.addCleanup(h.render.set_color_enabled, True)
+        self.assertEqual(h.render.colorize("hello", "tool"), "hello")
+        self.assertEqual(h.render.colorize("hello", None), "hello")
 
     def test_enabled_wraps_ansi(self):
-        h.set_color_enabled(True)
-        self.addCleanup(h.set_color_enabled, True)
-        self.assertEqual(h.colorize("hello", "tool"), f"{h.config.ANSI['tool']}hello{h.config.ANSI['reset']}")
-        self.assertEqual(h.colorize("hello"), "hello")
+        h.render.set_color_enabled(True)
+        self.addCleanup(h.render.set_color_enabled, True)
+        self.assertEqual(h.render.colorize("hello", "tool"), f"{h.config.ANSI['tool']}hello{h.config.ANSI['reset']}")
+        self.assertEqual(h.render.colorize("hello"), "hello")
 
     def test_no_color_env_disables(self):
         old = os.environ.get("NO_COLOR")
         os.environ["NO_COLOR"] = "1"
         try:
-            self.assertFalse(h.color_enabled())
+            self.assertFalse(h.render.color_enabled())
         finally:
             if old is None:
                 os.environ.pop("NO_COLOR", None)
@@ -1525,23 +1525,23 @@ class TestColorize(unittest.TestCase):
 class TestIcon(unittest.TestCase):
     def test_emoji_default(self):
         old = h.state.EMOJI_ENABLED
-        h.set_emoji_enabled(True)
-        self.addCleanup(h.set_emoji_enabled, old)
-        self.assertEqual(h.icon("thinking"), h.config.ICONS["thinking"])
-        self.assertEqual(h.icon("tool"), h.config.ICONS["tool"])
+        h.render.set_emoji_enabled(True)
+        self.addCleanup(h.render.set_emoji_enabled, old)
+        self.assertEqual(h.render.icon("thinking"), h.config.ICONS["thinking"])
+        self.assertEqual(h.render.icon("tool"), h.config.ICONS["tool"])
 
     def test_ascii_fallback(self):
         old = h.state.EMOJI_ENABLED
-        h.set_emoji_enabled(False)
-        self.addCleanup(h.set_emoji_enabled, old)
-        self.assertEqual(h.icon("thinking"), h.config.ASCII_ICONS["thinking"])
-        self.assertEqual(h.icon("assistant"), h.config.ASCII_ICONS["assistant"])
+        h.render.set_emoji_enabled(False)
+        self.addCleanup(h.render.set_emoji_enabled, old)
+        self.assertEqual(h.render.icon("thinking"), h.config.ASCII_ICONS["thinking"])
+        self.assertEqual(h.render.icon("assistant"), h.config.ASCII_ICONS["assistant"])
 
     def test_unknown_key(self):
         old = h.state.EMOJI_ENABLED
-        h.set_emoji_enabled(True)
-        self.addCleanup(h.set_emoji_enabled, old)
-        self.assertEqual(h.icon("nope"), "")
+        h.render.set_emoji_enabled(True)
+        self.addCleanup(h.render.set_emoji_enabled, old)
+        self.assertEqual(h.render.icon("nope"), "")
 
 
 class TestEmojiAutoDisable(unittest.TestCase):
@@ -1574,10 +1574,10 @@ class TestEmojiAutoDisable(unittest.TestCase):
 class TestMarkdownRenderer(unittest.TestCase):
     def _render(self, text, chunks=None, colors=True, indent=0):
         old = h.state.COLORS_ENABLED
-        h.set_color_enabled(colors)
-        self.addCleanup(h.set_color_enabled, old)
+        h.render.set_color_enabled(colors)
+        self.addCleanup(h.render.set_color_enabled, old)
         out = io.StringIO()
-        r = h.MarkdownRenderer(out=out, indent=indent)
+        r = h.render.MarkdownRenderer(out=out, indent=indent)
         if chunks is None:
             r.write(text)
         else:
@@ -1689,11 +1689,11 @@ class TestMarkdownRenderer(unittest.TestCase):
         self.assertIn("└", out)
 
     def test_combining_character_width(self):
-        self.assertEqual(h.display_width("e\u0301"), 1)
-        self.assertEqual(h.display_width("\u200d\ufe0f"), 0)
+        self.assertEqual(h.render.display_width("e\u0301"), 1)
+        self.assertEqual(h.render.display_width("\u200d\ufe0f"), 0)
         out = self._plain("| H |\n|---|\n| e\u0301 |\n| abc |\n")
-        self.assertEqual(len({h.display_width(line) for line in out.splitlines()}), 1)
-        self.assertEqual(h._truncate_visible("e\u0301abcd", 3), "e\u0301a…")
+        self.assertEqual(len({h.render.display_width(line) for line in out.splitlines()}), 1)
+        self.assertEqual(h.render._truncate_visible("e\u0301abcd", 3), "e\u0301a…")
 
     def test_colors_disabled_passthrough(self):
         doc = "# T\n**b** `c` *i*\n- x\n> q\n---\n```py\ncode\n```\n[l](http://u)\n"
@@ -1728,7 +1728,7 @@ class TestMarkdownRenderer(unittest.TestCase):
         out = self._plain("| A | Longer |\n|---|---|\n| 1 | 2 |\n")
         lines = [l for l in out.splitlines() if l.strip()]
         # every line of the table must be the same display width
-        widths = {h.display_width(l) for l in lines}
+        widths = {h.render.display_width(l) for l in lines}
         self.assertEqual(len(widths), 1, out)
 
     def test_table_alignment_markers(self):
@@ -1756,7 +1756,7 @@ class TestMarkdownRenderer(unittest.TestCase):
     def test_table_wide_cells(self):
         out = self._plain("| H |\n|---|\n| 🤖 |\n")
         lines = [l for l in out.splitlines() if l.strip()]
-        widths = {h.display_width(l) for l in lines}
+        widths = {h.render.display_width(l) for l in lines}
         self.assertEqual(len(widths), 1, out)
 
     def test_table_ragged_rows(self):
@@ -1806,22 +1806,22 @@ class TestMarkdownRenderer(unittest.TestCase):
             self.assertEqual(out, full, f"split at {i}")
 
     def test_table_width_clamp(self):
-        real = h.terminal_width
-        h.terminal_width = lambda: 30
-        self.addCleanup(setattr, h, "terminal_width", real)
+        real = h.render.terminal_width
+        h.render.terminal_width = lambda: 30
+        self.addCleanup(setattr, h.render, "terminal_width", real)
         out = self._plain(
             "| Column one | Column two | Column three |\n|---|---|---|\n"
             "| aaaaaaaaaa | bbbbbbbbbb | cccccccccc |\n"
         )
         for line in out.splitlines():
             if line.strip():
-                self.assertLessEqual(h.display_width(line), 30, line)
+                self.assertLessEqual(h.render.display_width(line), 30, line)
         self.assertIn("…", out)  # truncated
 
     def test_table_narrow_terminal_preserves_all_cells(self):
-        real = h.terminal_width
-        h.terminal_width = lambda: 20
-        self.addCleanup(setattr, h, "terminal_width", real)
+        real = h.render.terminal_width
+        h.render.terminal_width = lambda: 20
+        self.addCleanup(setattr, h.render, "terminal_width", real)
         labels = list("ABCDEFG")
         values = [f"value{i}" for i in range(7)]
         doc = ("|" + "|".join(labels) + "|\n"
@@ -1831,28 +1831,28 @@ class TestMarkdownRenderer(unittest.TestCase):
         for label, value in zip(labels, values):
             self.assertIn(f"{label}: {value}", out)
         for line in out.splitlines():
-            self.assertLessEqual(h.display_width(line), 20)
+            self.assertLessEqual(h.render.display_width(line), 20)
         self.assertEqual(self._plain(doc, chunks=list(doc)), out)
 
     def test_table_first_line_reserves_label_width(self):
-        real = h.terminal_width
-        h.terminal_width = lambda: 24
-        self.addCleanup(setattr, h, "terminal_width", real)
+        real = h.render.terminal_width
+        h.render.terminal_width = lambda: 24
+        self.addCleanup(setattr, h.render, "terminal_width", real)
         out = self._plain("| Long heading |\n|---|\n| long value |\n", indent=8)
         lines = out.splitlines()
-        self.assertLessEqual(h.display_width(lines[0]) + 8, 24)
+        self.assertLessEqual(h.render.display_width(lines[0]) + 8, 24)
         for line in lines[1:]:
             self.assertTrue(line.startswith(" " * 8))
-            self.assertLessEqual(h.display_width(line), 24)
+            self.assertLessEqual(h.render.display_width(line), 24)
 
     def test_table_extremely_narrow_terminal(self):
-        real = h.terminal_width
-        self.addCleanup(setattr, h, "terminal_width", real)
+        real = h.render.terminal_width
+        self.addCleanup(setattr, h.render, "terminal_width", real)
         for width in (1, 2, 5):
-            h.terminal_width = lambda: width
+            h.render.terminal_width = lambda: width
             out = self._plain("| H |\n|---|\n| 界e\u0301long |\n", indent=10)
             for line in out.splitlines():
-                self.assertLessEqual(h.display_width(line), width)
+                self.assertLessEqual(h.render.display_width(line), width)
 
     def test_chunking_invariance(self):
         doc = (
@@ -1865,16 +1865,16 @@ class TestMarkdownRenderer(unittest.TestCase):
             self.assertEqual(out, full, f"split at {i}")
 
     def test_display_width(self):
-        self.assertEqual(h.display_width("abc"), 3)
-        self.assertEqual(h.display_width("🤖"), 2)
-        self.assertEqual(h.display_width("🤖 ab"), 5)
+        self.assertEqual(h.render.display_width("abc"), 3)
+        self.assertEqual(h.render.display_width("🤖"), 2)
+        self.assertEqual(h.render.display_width("🤖 ab"), 5)
 
     def test_print_assistant(self):
-        h.set_color_enabled(False)
-        self.addCleanup(h.set_color_enabled, True)
+        h.render.set_color_enabled(False)
+        self.addCleanup(h.render.set_color_enabled, True)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            h.print_assistant("# Hi\n")
+            h.render.print_assistant("# Hi\n")
         out = buf.getvalue()
         self.assertIn("assistant> ", out)
         self.assertIn("# Hi", out)
@@ -1927,7 +1927,7 @@ class TestDispatch(Base):
         self.assertEqual(h.execute_tool("nope", "{}"), "error: unknown tool: nope")
 
     def test_exit_signal_propagates(self):
-        with self.assertRaises(h.ExitSignal) as ctx:
+        with self.assertRaises(h.errors.ExitSignal) as ctx:
             h.execute_tool("exit", '{"code": 5, "message": "done"}')
         self.assertEqual(ctx.exception.code, 5)
         self.assertEqual(ctx.exception.message, "done")
@@ -2593,10 +2593,10 @@ class TestSubagents(unittest.TestCase):
         self.assertEqual(h.state.EXIT_NOTE_BY_CONV, {})
 
     def test_clamp_int_bounds_cli_values(self):
-        self.assertEqual(h._clamp_int(2, 0, h.config.SUBAGENT_DEPTH_CEILING), 2)
-        self.assertEqual(h._clamp_int(-1, 0, h.config.SUBAGENT_DEPTH_CEILING), 0)
-        self.assertEqual(h._clamp_int(999, 0, h.config.SUBAGENT_DEPTH_CEILING), h.config.SUBAGENT_DEPTH_CEILING)
-        self.assertEqual(h._clamp_int(-5, 0, h.config.SUBAGENT_STEPS_CEILING), 0)
+        self.assertEqual(h.caps._clamp_int(2, 0, h.config.SUBAGENT_DEPTH_CEILING), 2)
+        self.assertEqual(h.caps._clamp_int(-1, 0, h.config.SUBAGENT_DEPTH_CEILING), 0)
+        self.assertEqual(h.caps._clamp_int(999, 0, h.config.SUBAGENT_DEPTH_CEILING), h.config.SUBAGENT_DEPTH_CEILING)
+        self.assertEqual(h.caps._clamp_int(-5, 0, h.config.SUBAGENT_STEPS_CEILING), 0)
 
     def test_run_agent_exit_returns_code(self):
         def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
@@ -3046,9 +3046,9 @@ class TestLineEditor(Base):
         self.assertNotIn("you> a\r\nb\ryou> a", out)
 
     def _narrow_edit(self, keys, width=10):
-        real = h.terminal_width
-        h.terminal_width = lambda: width
-        self.addCleanup(setattr, h, "terminal_width", real)
+        real = h.render.terminal_width
+        h.render.terminal_width = lambda: width
+        self.addCleanup(setattr, h.render, "terminal_width", real)
         return self.edit(keys)
 
     def _drive(self, keys, width=10, start=4, prompt="you> "):
@@ -3060,8 +3060,8 @@ class TestLineEditor(Base):
         buffer/pos pair is mirrored *here*, with the editing rules restated
         independently of the code under test, so a test can compare each render
         with the wrapped text that should have been painted."""
-        old_width, old_auto = h.terminal_width, h.state.AUTO_SEND
-        h.terminal_width = lambda: width
+        old_width, old_auto = h.render.terminal_width, h.state.AUTO_SEND
+        h.render.terminal_width = lambda: width
         h.state.AUTO_SEND = True
         buf, pos = [], 0
 
@@ -3123,7 +3123,7 @@ class TestLineEditor(Base):
             with redirect_stdout(rec):
                 line = h._edit_line(prompt, feed())
         finally:
-            h.terminal_width, h.state.AUTO_SEND = old_width, old_auto
+            h.render.terminal_width, h.state.AUTO_SEND = old_width, old_auto
 
         committed = bool(keys) and keys[-1] in ("enter", "ctrl_enter", "ctrl_d")
         if committed:
@@ -5480,23 +5480,23 @@ class TestFileRefs(Base):
 
 class TestContentChars(unittest.TestCase):
     def test_string(self):
-        self.assertEqual(h._content_chars("hello"), 5)
+        self.assertEqual(h.caps._content_chars("hello"), 5)
 
     def test_none(self):
-        self.assertEqual(h._content_chars(None), 0)
+        self.assertEqual(h.caps._content_chars(None), 0)
 
     def test_list_text(self):
-        self.assertEqual(h._content_chars([{"type": "text", "text": "abc"}]), 3)
+        self.assertEqual(h.caps._content_chars([{"type": "text", "text": "abc"}]), 3)
 
     def test_list_image(self):
         url = "data:image/png;base64,AAAA"
         self.assertEqual(
-            h._content_chars([{"type": "image_url", "image_url": {"url": url}}]), len(url)
+            h.caps._content_chars([{"type": "image_url", "image_url": {"url": url}}]), len(url)
         )
 
     def test_list_mixed(self):
         self.assertEqual(
-            h._content_chars(
+            h.caps._content_chars(
                 [
                     {"type": "text", "text": "ab"},
                     {"type": "image_url", "image_url": {"url": "cccc"}},
@@ -6055,15 +6055,15 @@ class TestContextProgress(unittest.TestCase):
         self.assertEqual(h.estimate_context_tokens(messages, interactive=True), total // 4)
 
     def test_format_tokens(self):
-        self.assertEqual(h._format_tokens(999), "999")
-        self.assertEqual(h._format_tokens(1500), "1.5k")
-        self.assertEqual(h._format_tokens(32400), "32.4k")
-        self.assertEqual(h._format_tokens(1_500_000), "1.5M")
+        self.assertEqual(h.render._format_tokens(999), "999")
+        self.assertEqual(h.render._format_tokens(1500), "1.5k")
+        self.assertEqual(h.render._format_tokens(32400), "32.4k")
+        self.assertEqual(h.render._format_tokens(1_500_000), "1.5M")
 
     def test_format_elapsed(self):
-        self.assertEqual(h._format_elapsed(5.4), "5s")
-        self.assertEqual(h._format_elapsed(59.4), "59s")
-        self.assertEqual(h._format_elapsed(75), "1m15s")
+        self.assertEqual(h.render._format_elapsed(5.4), "5s")
+        self.assertEqual(h.render._format_elapsed(59.4), "59s")
+        self.assertEqual(h.render._format_elapsed(75), "1m15s")
 
     def test_noop_below_threshold(self):
         spinner = h.ContextProgress([{"role": "user", "content": "hi"}], interactive=True)
@@ -6690,13 +6690,13 @@ class TestSessionLog(unittest.TestCase):
     def _echo(self, *args, **kwargs):
         """resume_session(...) with colour off, returning (messages, note, what it printed)."""
         saved = h.state.COLORS_ENABLED
-        h.set_color_enabled(False)
+        h.render.set_color_enabled(False)
         buf = io.StringIO()
         try:
             with contextlib.redirect_stdout(buf):
                 messages, note = h.resume_session(*args, **kwargs)
         finally:
-            h.set_color_enabled(saved)
+            h.render.set_color_enabled(saved)
         return messages, note, buf.getvalue()
 
     def _write_chat(self, name="echo"):
@@ -6723,12 +6723,12 @@ class TestSessionLog(unittest.TestCase):
                          ["user", "assistant", "assistant", "tool", "user", "assistant"])
         # The note is said once, by resume_session itself, before the replay
         self.assertIn("resumed session echo", out)
-        self.assertLess(out.index("resumed session echo"), out.index(h.icon("user")))
+        self.assertLess(out.index("resumed session echo"), out.index(h.render.icon("user")))
         self.assertIn("4 turns from echo", out)  # what the window reached back over
         # ... and the turns themselves, in the REPL's own look
-        self.assertIn(f"{h.icon('user')} you> second ask", out)
-        self.assertIn(f"{h.icon('assistant')} assistant> second answer", out)
-        self.assertIn(f"{h.icon('assistant')} assistant> first answer", out)
+        self.assertIn(f"{h.render.icon('user')} you> second ask", out)
+        self.assertIn(f"{h.render.icon('assistant')} assistant> second answer", out)
+        self.assertIn(f"{h.render.icon('assistant')} assistant> first answer", out)
         # Four speaking turns back is where the window closed
         self.assertNotIn("first ask", out)
         # The system prompt was never a turn the user saw, so it is not one now
@@ -6738,20 +6738,20 @@ class TestSessionLog(unittest.TestCase):
         self._write_chat()
         _, _, out = self._echo("echo", echo=4)
         self.assertIn(
-            f"{h.icon('tool')} run_shell({json.dumps({'command': 'echo hi'})})", out
+            f"{h.render.icon('tool')} run_shell({json.dumps({'command': 'echo hi'})})", out
         )
         # the same TOOL_RESULT_ECHO preview the agent loop printed while it ran
-        self.assertIn(f"{h.icon('result')} " + "y" * h.config.TOOL_RESULT_ECHO + "...", out)
+        self.assertIn(f"{h.render.icon('result')} " + "y" * h.config.TOOL_RESULT_ECHO + "...", out)
         self.assertNotIn("y" * (h.config.TOOL_RESULT_ECHO + 1), out)
         # call, then its answer — the order they happened in, not calls then answers
-        self.assertLess(out.index("run_shell("), out.index(h.icon("result")))
+        self.assertLess(out.index("run_shell("), out.index(h.render.icon("result")))
 
     def test_resume_echo_caps_replayed_thinking_but_not_the_replies(self):
         self._write_chat()
         _, _, out = self._echo("echo", echo=4)
         kept = h.config.RESUME_TAIL_CHARS - len("thinking hard ")
         self.assertIn(
-            f"{h.icon('thinking')} thinking: thinking hard " + "x" * kept
+            f"{h.render.icon('thinking')} thinking: thinking hard " + "x" * kept
             + f"... [+{1314 - h.config.RESUME_TAIL_CHARS} chars in the session log]",
             out,
         )
@@ -6783,10 +6783,10 @@ class TestSessionLog(unittest.TestCase):
         self.assertNotIn("cwd output 0", out)
         self.assertNotIn("cwd output 4", out)  # the window cuts mid-batch, not mid-turn
         pairs = max(1, (h.config.RESUME_TAIL_RECORDS - 2) // 2)  # the calls that made the cut
-        self.assertEqual(out.count(f"{h.icon('tool')} get_cwd("), pairs)
-        self.assertEqual(out.count(f"{h.icon('result')} cwd output "), pairs)
+        self.assertEqual(out.count(f"{h.render.icon('tool')} get_cwd("), pairs)
+        self.assertEqual(out.count(f"{h.render.icon('result')} cwd output "), pairs)
         # a tool-call turn is not a reply: nothing claims an answer it never gave
-        self.assertEqual(out.count(f"{h.icon('assistant')} assistant>"), 1)
+        self.assertEqual(out.count(f"{h.render.icon('assistant')} assistant>"), 1)
 
     def test_resume_echo_leaves_out_the_turns_the_harness_injected(self):
         self._write_log("inj.jsonl", [
@@ -6805,7 +6805,7 @@ class TestSessionLog(unittest.TestCase):
         self.assertIn("assistant> later answer", out)
         self.assertNotIn("Current todo list", out)  # shown to the model, never to the user
         self.assertNotIn("the handoff note", out)
-        self.assertEqual(out.count(f"{h.icon('user')} you> "), 2)
+        self.assertEqual(out.count(f"{h.render.icon('user')} you> "), 2)
 
     def test_resume_without_echo_prints_nothing(self):
         """echo=0 — what a one-shot run asks for — keeps resume as quiet as it was."""
@@ -6831,8 +6831,8 @@ class TestSessionLog(unittest.TestCase):
         self._write_log("batch.jsonl", records)
         _, _, out = self._echo("batch", echo=2)
         self.assertNotIn("dig deeper", out)  # the oldest turn is what got cut
-        self.assertEqual(out.count(f"{h.icon('tool')} get_cwd("), len(calls))
-        self.assertEqual(out.count(f"{h.icon('result')} cwd "), len(calls))
+        self.assertEqual(out.count(f"{h.render.icon('tool')} get_cwd("), len(calls))
+        self.assertEqual(out.count(f"{h.render.icon('result')} cwd "), len(calls))
         self.assertIn("1 turn from batch", out)  # singular, and only the closing exchange
 
     def test_resume_echo_shows_the_journal_as_it_happened(self):
@@ -6852,8 +6852,8 @@ class TestSessionLog(unittest.TestCase):
                          ["the cwd", h.config.SESSION_UNANSWERED_NOTE])
         # replayed: both calls, the one recorded answer, and no placeholder
         self.assertIn("you> keep going", out)
-        self.assertEqual(out.count(f"{h.icon('tool')} get_cwd("), 2)
-        self.assertEqual(out.count(f"{h.icon('result')} "), 1)
+        self.assertEqual(out.count(f"{h.render.icon('tool')} get_cwd("), 2)
+        self.assertEqual(out.count(f"{h.render.icon('result')} "), 1)
         self.assertNotIn(h.config.SESSION_UNANSWERED_NOTE, out)
 
     def test_resume_target_reads_both_resume_flags(self):
@@ -7574,7 +7574,7 @@ class TestCompaction(unittest.TestCase):
                     conv_id=None, send_tools=True):
             self.notes.append({"messages": messages, "send_tools": send_tools, "conv_id": conv_id})
             if len(self.notes) == 1:
-                raise h.ContextOverflow("HTTP 400: prompt is too long")
+                raise h.errors.ContextOverflow("HTTP 400: prompt is too long")
             return {"choices": [{"message": {"role": "assistant", "content": "SMALLER NOTE"}}]}
 
         h.chat = too_big
@@ -7781,7 +7781,7 @@ class TestCompaction(unittest.TestCase):
         """A stream_once that reports the context full the first time, then behaves."""
         def decide(messages, depth, turn):
             if turn == 0:
-                raise h.ContextOverflow(
+                raise h.errors.ContextOverflow(
                     "HTTP 400: This is over n_ctx, consider trimming your prompt"
                 )
             if turn == 1:
@@ -7806,7 +7806,7 @@ class TestCompaction(unittest.TestCase):
         seed = [{"role": "user", "content": f"u{i} " + "x" * 1200} for i in range(8)]
         self._scripted(
             lambda m, d, t: (_ for _ in ()).throw(
-                h.ContextOverflow("HTTP 400: maximum context length exceeded")
+                h.errors.ContextOverflow("HTTP 400: maximum context length exceeded")
             )
         )
         code, _, out = self._run(seed=seed)
@@ -7819,7 +7819,7 @@ class TestCompaction(unittest.TestCase):
         seed += [{"role": "assistant", "content": f"a{i}"} for i in range(8)]
         self._scripted(
             lambda m, d, t: (_ for _ in ()).throw(
-                h.ContextOverflow("HTTP 400: This is over n_ctx")
+                h.errors.ContextOverflow("HTTP 400: This is over n_ctx")
             )
         )
         code, _, out = self._run(seed=seed)
@@ -7853,7 +7853,7 @@ class TestCompaction(unittest.TestCase):
                 self.notes.append({"messages": messages, "send_tools": send_tools,
                                    "conv_id": conv_id})
                 return {"choices": [{"message": {"role": "assistant", "content": "HANDOFF"}}]}
-            raise h.ContextOverflow("HTTP 400: maximum context length exceeded")
+            raise h.errors.ContextOverflow("HTTP 400: maximum context length exceeded")
 
         h.chat = chat
         code, _, out = self._run(seed=seed)
@@ -7882,7 +7882,7 @@ class TestCompaction(unittest.TestCase):
             (500, "n_ctx assertion failed", False),  # a crash is not a size rejection
         ]
         for code, body, is_overflow in cases:
-            reason = h._context_overflow_reason(rejected(code, body))
+            reason = h.errors._context_overflow_reason(rejected(code, body))
             if is_overflow:
                 self.assertIn(f"HTTP {code}", reason)
             else:
@@ -7898,7 +7898,7 @@ class TestCompaction(unittest.TestCase):
             )
 
         h._open_request = refuse
-        with self.assertRaises(h.ContextOverflow) as caught:
+        with self.assertRaises(h.errors.ContextOverflow) as caught:
             h.chat([{"role": "user", "content": "x"}], "test-model")
         self.assertIn("n_ctx", str(caught.exception))
 
