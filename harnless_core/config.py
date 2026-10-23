@@ -7,7 +7,7 @@ change lives in state.py instead — see harnless_core/state.py."""
 import os
 import re
 
-VERSION = "1.8.2"
+VERSION = "1.8.3"
 SUBAGENT_DEPTH_CEILING = 10  # sanity clamp for --max-subagents
 SUBAGENT_STEPS_CEILING = 10_000  # sanity clamp for --max-subagent-steps
 SUBAGENT_STEP_LIMIT_CODE = 4  # exit code reported to the parent when the guard fires
