@@ -83,6 +83,11 @@ STAGES = {
         "_cwd_roots", "_inside_cwd", "_rel_to_cwd", "safe_resolve", "_case_flags",
         "_glob_to_regex", "_read_lines",
     ]},
+    "measure": {"measure": [
+        # How big the next request is. Leaf layer on purpose: the progress line, /status
+        # and compaction all read it, and it reads nothing above it but caps.
+        "estimate_context_chars", "estimate_context_tokens",
+    ]},
     "render": {"render": [
         "set_color_enabled", "set_emoji_enabled", "icon", "color_enabled",
         "colorize", "display_width", "terminal_width", "_is_table_sep",
@@ -113,7 +118,7 @@ STAGES = {
         "_iter_keys_windows_poll", "_parse_csi_seq", "_set_raw_input", "_iter_keys_posix",
         "_iter_keys_posix_poll", "_iter_keys_interrupt", "check_double_esc",
         "_edit_cur", "_edit_rows", "_edit_phys_pos", "_edit_line", "readline_prompt",
-        "InterruptWatcher", "ContextProgress", "_UploadProgress", "_response_socket",
+        "InterruptWatcher", "check_double_esc",
     ]},
     "mcp": {"mcp": [
         "MCPError", "MCPClient", "re:^_mcp", "_expand_env", "load_mcp_config",
@@ -123,7 +128,9 @@ STAGES = {
     "request": {"request": [
         "normalize_api_url", "_headers", "probe_context_window", "_progress_opener",
         "_open_request", "chat", "_request_body", "_build_request", "parse_sse_line",
-        "stream_chat", "accumulate_delta", "stream_once", "_record_usage",
+        "stream_chat", "accumulate_delta", "stream_once",
+        # the console side of sending a request: the upload meter and the progress line
+        "ContextProgress", "_UploadProgress", "_response_socket",
     ]},
     "context": {"context": [
         "re:^_todo", "tool_todo", "re:^_memory", "tool_memory", "load_memory",
@@ -282,6 +289,11 @@ PRE_RENAMES = [
     ("    def render(commit=False):", "    def redraw(commit=False):"),
     ("        render(commit=True)", "        redraw(commit=True)"),
     ("    render()", "    redraw()"),
+    # tool_grep() had a local `context` (the grep context window), which would shadow the
+    # context module alias.
+    ('    context = max(0, int(args.get("context", 0)))', '    around = max(0, int(args.get("context", 0)))'),
+    ('        if context > 0:', '        if around > 0:'),
+    ('                    max(0, i - context), min(len(lines), i + context + 1)', '                    max(0, i - around), min(len(lines), i + around + 1)'),
     # _session_files() built its own list named `paths`, shadowing the paths module.
     ("    paths = []", "    logs = []"),
     ("            paths.append(path)", "            logs.append(path)"),
@@ -369,6 +381,26 @@ def cmd_extract(stage: str):
 
 
 # ---------------------------------------------------------------- link
+def imported_names(src: str) -> dict:
+    """What a file's import statements bind: name -> (kind, module, attr).
+
+    Used to carry an import along with the code that needs it: a function moved into a
+    core module takes its `url2pathname` with it instead of relying on the entry point's
+    import block.
+    """
+    out = {}
+    for node in ast.parse(src).body:
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                out[a.asname or a.name.split(".")[0]] = ("import", a.name, None)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:  # relative import: not something to carry
+                continue
+            for a in node.names:
+                out[a.asname or a.name] = ("from", node.module, a.name)
+    return out
+
+
 def cmd_link():
     registry = refresh_registry()
     # harnless.py imports every core module statically: it is the facade, and a
@@ -400,7 +432,15 @@ def relink(path: pathlib.Path, registry: dict, extra_mods=()):
                  "module. Rename the local (see cmd_pre / PRE_RENAMES).")
     src = apply_edits(src, edits)
     src = fix_global_lines(src, registry)
-    src = write_imports(src, core_mods, ast.parse(src))
+    carry = {}
+    if path.parent == PKG_DIR:
+        # what the entry point imports by name, minus what this file defines or imports
+        tree2 = ast.parse(src)
+        bare = {n.id for n in ast.walk(tree2) if isinstance(n, ast.Name)}
+        bound = defined_names(src) | local_bindings(src, tree2)
+        carry = {n: spec for n, spec in imported_names(read_source()).items()
+                 if n in bare and n not in bound}
+    src = write_imports(src, core_mods, ast.parse(src), carry)
     path.write_text(collapse_blanks(src), encoding="utf-8", newline="\n")
     print(f"  {path}: {len(edits)} reference rewrites, "
           f"{len(core_mods)} core imports")
@@ -539,7 +579,7 @@ def fix_global_lines(src: str, registry: dict) -> str:
     return "\n".join(out)
 
 
-def write_imports(src: str, core_mods, tree) -> str:
+def write_imports(src: str, core_mods, tree, carry=None) -> str:
     """Replace the # __IMPORTS__ marker with the imports this file actually needs.
 
     harnless_core names are always imported as modules (`config.X`, `journal.fn()`),
@@ -560,6 +600,13 @@ def write_imports(src: str, core_mods, tree) -> str:
             local_imports |= {(a.asname or a.name) for a in node.names}
     mods = sorted((used & core_names) | {m for m, n in core_mods if n is None})
     stdlib = sorted((used & STDLIB_ROOTS) - local_imports)
+    # Imports the entry point bound by name (e.g. `from urllib.request import
+    # url2pathname`) that code moved into this file still uses bare: they travel with it.
+    carried = {}
+    for name, (kind, mod, attr) in (carry or {}).items():
+        if name in local_imports or name in mods or name in stdlib:
+            continue
+        carried[(kind, mod, attr)] = name
     named = {}
     for m, n in core_mods:
         if n:
@@ -567,6 +614,8 @@ def write_imports(src: str, core_mods, tree) -> str:
     lines = []
     if stdlib:
         lines.append("import " + "\nimport ".join(stdlib))
+    for (kind, mod, attr), name in sorted(carried.items()):
+        lines.append(f"from {mod} import {attr}" if kind == "from" else f"import {mod}")
     if mods:
         lines.append("from harnless_core import " + ", ".join(mods))
     for m, ns in sorted(named.items()):
@@ -747,6 +796,42 @@ def cmd_shadow():
     print(f"shadowing functions: {bad}")
 
 
+def cmd_move(module: str, names):
+    """Move named statements from harnless.py into an existing core module.
+
+    `extract` creates a module from a stage manifest; this one adds to a module that is
+    already there — the ordinary case once a layer has been cut and something later turns
+    out to belong to it.
+    """
+    path = PKG_DIR / f"{module}.py"
+    if not path.exists():
+        sys.exit(f"move {module}: {path} does not exist")
+    src = read_source()
+    lines, blocks = top_level_blocks(src)
+    by_name = {}
+    for names_in_block, start, end in blocks:
+        for n in names_in_block:
+            by_name.setdefault(n, (start, end))
+    missing = [n for n in names if n not in by_name]
+    if missing:
+        sys.exit(f"move {module}: not found in harnless.py: {missing}")
+    picked, last_end = [], -1
+    for n in sorted(names, key=lambda x: by_name[x][0]):
+        start, end = by_name[n]
+        if start >= last_end:
+            picked.append((start, end))
+            last_end = end
+    body = "\n\n".join("\n".join(lines[s:e]).rstrip() for s, e in picked)
+    text = path.read_text(encoding="utf-8").rstrip("\n") + "\n\n" + body + "\n"
+    path.write_text(collapse_blanks(text), encoding="utf-8", newline="\n")
+    out = lines[:]
+    for start, end in sorted(picked, reverse=True):
+        del out[start:end]
+    write_source("\n".join(out))
+    print(f"move {module}: {len(picked)} statements -> {path}")
+    cmd_cycle()
+
+
 def cmd_cycle():
     """Everything a move needs: retarget the code, retarget the tests, audit shadows."""
     cmd_link()
@@ -756,9 +841,10 @@ def cmd_cycle():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["pre", "extract", "link", "facade", "tests", "shadow",
-                                    "cycle", "audit"])
+    ap.add_argument("cmd", choices=["pre", "extract", "move", "link", "facade", "tests",
+                                    "shadow", "cycle", "audit"])
     ap.add_argument("stage", nargs="?", default="")
+    ap.add_argument("names", nargs="*")
     a = ap.parse_args()
     if a.cmd == "pre":
         print("pre: freeing the `state` name")
@@ -768,6 +854,10 @@ def main():
             sys.exit(f"unknown stage {a.stage!r}; known: {', '.join(STAGES)}")
         print(f"extract {a.stage}:")
         cmd_extract(a.stage)
+    elif a.cmd == "move":
+        if not a.names:
+            sys.exit("move <module> <name> ...")
+        cmd_move(a.stage, a.names)
     elif a.cmd == "link":
         print("link:")
         cmd_link()

@@ -8,7 +8,9 @@ can name the turns it replaced and --resume / /resume can rebuild a conversation
 import json
 import os
 import time
+
 from harnless_core import caps, config, render, state
+
 
 def _session_stamp() -> str:
     """Timestamp for a journal record (local time, whole seconds — `seq` is what

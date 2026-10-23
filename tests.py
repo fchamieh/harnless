@@ -1891,22 +1891,22 @@ class TestLoadAgentsMd(Base):
         super().tearDown()
 
     def test_absent(self):
-        self.assertEqual(h.load_agents_md(), "")
+        self.assertEqual(h.context.load_agents_md(), "")
 
     def test_case_insensitive(self):
         with open(os.path.join(self.p(""), "agents.md"), "w", encoding="utf-8") as f:
             f.write("rules here")
-        self.assertEqual(h.load_agents_md(), "rules here")
+        self.assertEqual(h.context.load_agents_md(), "rules here")
 
     def test_exact_name(self):
         with open(os.path.join(self.p(""), "AGENTS.md"), "w", encoding="utf-8") as f:
             f.write("rules")
-        self.assertEqual(h.load_agents_md(), "rules")
+        self.assertEqual(h.context.load_agents_md(), "rules")
 
     def test_truncation(self):
         with open(os.path.join(self.p(""), "AGENTS.md"), "w", encoding="utf-8") as f:
             f.write("a" * 25_000)
-        out = h.load_agents_md()
+        out = h.context.load_agents_md()
         self.assertTrue(out.startswith("a" * 20_000))
         self.assertTrue(
             out.endswith(
@@ -3013,12 +3013,12 @@ class TestLineEditor(Base):
         h.state.HISTORY_FILE = os.path.join(self.tmp, "history.txt")
         self.addCleanup(setattr, h.state, "HISTORY_FILE", self._old_history_file)
 
-    def edit(self, keys):
+    def edit(self, keys, menu=None):
         import io
         from contextlib import redirect_stdout
         buf = io.StringIO()
         with redirect_stdout(buf):
-            line = h._edit_line("you> ", iter(keys))
+            line = h.lineedit._edit_line("you> ", iter(keys), menu)
         return line, buf.getvalue()
 
     def test_typing_and_enter(self):
@@ -3121,7 +3121,7 @@ class TestLineEditor(Base):
         try:
             from contextlib import redirect_stdout
             with redirect_stdout(rec):
-                line = h._edit_line(prompt, feed())
+                line = h.lineedit._edit_line(prompt, feed())
         finally:
             h.render.terminal_width, h.state.AUTO_SEND = old_width, old_auto
 
@@ -3296,33 +3296,33 @@ class TestLineEditor(Base):
         # Rows the prompt + text paints: ceiling division per logical line (a
         # line that soft-wraps without ending on a boundary still takes the next
         # row), an empty line still counts as one row.
-        self.assertEqual(h._edit_rows("", 5, 10), 1)
-        self.assertEqual(h._edit_rows("01234", 5, 10), 1)         # fills row 0 exactly
-        self.assertEqual(h._edit_rows("012345", 5, 10), 2)
-        self.assertEqual(h._edit_rows("0123456789ab", 5, 10), 2)  # 17 cols
-        self.assertEqual(h._edit_rows("0123456789ab", 5, 10), 2)
-        self.assertEqual(h._edit_rows("0123456789ab\nx", 5, 10), 3)
-        self.assertEqual(h._edit_rows("abc\n", 5, 10), 2)
+        self.assertEqual(h.lineedit._edit_rows("", 5, 10), 1)
+        self.assertEqual(h.lineedit._edit_rows("01234", 5, 10), 1)         # fills row 0 exactly
+        self.assertEqual(h.lineedit._edit_rows("012345", 5, 10), 2)
+        self.assertEqual(h.lineedit._edit_rows("0123456789ab", 5, 10), 2)  # 17 cols
+        self.assertEqual(h.lineedit._edit_rows("0123456789ab", 5, 10), 2)
+        self.assertEqual(h.lineedit._edit_rows("0123456789ab\nx", 5, 10), 3)
+        self.assertEqual(h.lineedit._edit_rows("abc\n", 5, 10), 2)
 
     def test_edit_cur_pending_boundary(self):
-        self.assertEqual(h._edit_cur(0, 0, 10), (0, 0))
-        self.assertEqual(h._edit_cur(0, 9, 10), (0, 9))
-        self.assertEqual(h._edit_cur(0, 10, 10), (0, 9))   # filled: caret still on row 0
-        self.assertEqual(h._edit_cur(0, 11, 10), (1, 1))
-        self.assertEqual(h._edit_cur(0, 20, 10), (1, 9))   # two filled rows
-        self.assertEqual(h._edit_cur(0, 21, 10), (2, 1))
-        self.assertEqual(h._edit_cur(3, 7, 10), (3, 7))
+        self.assertEqual(h.lineedit._edit_cur(0, 0, 10), (0, 0))
+        self.assertEqual(h.lineedit._edit_cur(0, 9, 10), (0, 9))
+        self.assertEqual(h.lineedit._edit_cur(0, 10, 10), (0, 9))   # filled: caret still on row 0
+        self.assertEqual(h.lineedit._edit_cur(0, 11, 10), (1, 1))
+        self.assertEqual(h.lineedit._edit_cur(0, 20, 10), (1, 9))   # two filled rows
+        self.assertEqual(h.lineedit._edit_cur(0, 21, 10), (2, 1))
+        self.assertEqual(h.lineedit._edit_cur(3, 7, 10), (3, 7))
 
     def test_edit_phys_pos_pending_wrap(self):
-        self.assertEqual(h._edit_phys_pos("0123456789ab", 5, 12, 10), (1, 7))
-        self.assertEqual(h._edit_phys_pos("01234", 5, 5, 10), (0, 9))
-        self.assertEqual(h._edit_phys_pos("012345", 5, 5, 10), (0, 9))    # on the boundary
-        self.assertEqual(h._edit_phys_pos("012345", 5, 6, 10), (1, 1))
-        self.assertEqual(h._edit_phys_pos("0123456789", 5, 10, 10), (1, 5))
+        self.assertEqual(h.lineedit._edit_phys_pos("0123456789ab", 5, 12, 10), (1, 7))
+        self.assertEqual(h.lineedit._edit_phys_pos("01234", 5, 5, 10), (0, 9))
+        self.assertEqual(h.lineedit._edit_phys_pos("012345", 5, 5, 10), (0, 9))    # on the boundary
+        self.assertEqual(h.lineedit._edit_phys_pos("012345", 5, 6, 10), (1, 1))
+        self.assertEqual(h.lineedit._edit_phys_pos("0123456789", 5, 10, 10), (1, 5))
         # After a newline the column base is 0 again, on the row after the rows
         # the wrapped line occupied.
-        self.assertEqual(h._edit_phys_pos("01234567\nxy", 5, 9, 10), (2, 0))
-        self.assertEqual(h._edit_phys_pos("01234567\nxy", 5, 11, 10), (2, 2))
+        self.assertEqual(h.lineedit._edit_phys_pos("01234567\nxy", 5, 9, 10), (2, 0))
+        self.assertEqual(h.lineedit._edit_phys_pos("01234567\nxy", 5, 11, 10), (2, 2))
 
     def test_newline_in_middle_of_line(self):
         keys = [("char", "a"), ("char", "b"), "left", "newline", "enter"]
@@ -3464,24 +3464,24 @@ class TestLineEditor(Base):
         self.assertEqual(self.edit(keys)[0], "ab")
 
     def test_history_add_dedup_and_cap(self):
-        h._history_add("a")
-        h._history_add("a")
-        h._history_add("b")
+        h.context._history_add("a")
+        h.context._history_add("a")
+        h.context._history_add("b")
         self.assertEqual(h.state.HISTORY, ["a", "b"])
-        h._history_add("")
-        h._history_add("   ")
+        h.context._history_add("")
+        h.context._history_add("   ")
         self.assertEqual(h.state.HISTORY, ["a", "b"])
         old_max = h.state.HISTORY_MAX
         h.state.HISTORY_MAX = 3
         self.addCleanup(setattr, h.state, "HISTORY_MAX", old_max)
         for i in range(10):
-            h._history_add(f"e{i}")
+            h.context._history_add(f"e{i}")
         self.assertEqual(len(h.state.HISTORY), 3)
         self.assertEqual(h.state.HISTORY, ["e7", "e8", "e9"])
 
     def test_history_persisted_to_file(self):
-        h._history_add("one")
-        h._history_add("two")
+        h.context._history_add("one")
+        h.context._history_add("two")
         with open(h.state.HISTORY_FILE, "r", encoding="utf-8") as f:
             self.assertEqual(f.read(), "one\ntwo\n")
 
@@ -3489,12 +3489,12 @@ class TestLineEditor(Base):
         with open(h.state.HISTORY_FILE, "w", encoding="utf-8") as f:
             f.write("old1\nold2\n\n")
         h.state.HISTORY = []
-        h._history_load()
+        h.context._history_load()
         self.assertEqual(h.state.HISTORY, ["old1", "old2"])
 
     def test_history_load_missing_file(self):
         h.state.HISTORY = []
-        h._history_load()
+        h.context._history_load()
         self.assertEqual(h.state.HISTORY, [])
 
     def test_history_load_caps_at_max(self):
@@ -3504,7 +3504,7 @@ class TestLineEditor(Base):
         with open(h.state.HISTORY_FILE, "w", encoding="utf-8") as f:
             f.write("a\nb\nc\n")
         h.state.HISTORY = []
-        h._history_load()
+        h.context._history_load()
         self.assertEqual(h.state.HISTORY, ["b", "c"])
 
     def test_readline_prompt_falls_back_without_tty(self):
@@ -3512,39 +3512,43 @@ class TestLineEditor(Base):
         old = sys.stdin
         sys.stdin = io.StringIO("piped line\n")
         try:
-            self.assertEqual(h.readline_prompt("you> "), "piped line")
+            self.assertEqual(h.lineedit.readline_prompt("you> "), "piped line")
         finally:
             sys.stdin = old
 
     def _patch_menu(self, result):
-        real = h.commands_menu
         calls = []
-        h.commands_menu = lambda: (calls.append(1), result)[1]
-        self.addCleanup(setattr, h, "commands_menu", real)
-        return calls
+
+        def menu():
+            calls.append(1)
+            return result
+
+        menu.calls = calls  # the test asks what the editor did with the menu
+        return menu
 
     def test_slash_on_empty_line_opens_menu(self):
-        calls = self._patch_menu("/new")
-        line, out = self.edit([("char", "/"), "enter"])
-        self.assertEqual(calls, [1])
+        menu = self._patch_menu("/new")
+        line, out = self.edit([("char", "/"), "enter"], menu=menu)
+        self.assertEqual(menu.calls, [1])
         self.assertEqual(line, "/new")
         self.assertTrue(out.endswith("you> /new\r\n"))
 
     def test_slash_menu_selection_is_extensible(self):
-        self._patch_menu("/tools")
-        line, _ = self.edit([("char", "/"), ("char", " "), ("char", "r"), "enter"])
+        menu = self._patch_menu("/tools")
+        line, _ = self.edit([("char", "/"), ("char", " "), ("char", "r"), "enter"], menu=menu)
         self.assertEqual(line, "/tools r")
 
     def test_slash_menu_cancel_keeps_slash(self):
-        self._patch_menu(None)
-        line, _ = self.edit([("char", "/"), ("char", "n"), ("char", "e"), ("char", "w"), "enter"])
+        menu = self._patch_menu(None)
+        line, _ = self.edit([("char", "/"), ("char", "n"), ("char", "e"), ("char", "w"), "enter"],
+                            menu=menu)
         self.assertEqual(line, "/new")
 
     def test_slash_nonempty_line_no_menu(self):
-        calls = self._patch_menu("/new")
-        line, _ = self.edit([("char", "a"), ("char", "/"), "enter"])
+        menu = self._patch_menu("/new")
+        line, _ = self.edit([("char", "a"), ("char", "/"), "enter"], menu=menu)
         self.assertEqual(line, "a/")
-        self.assertEqual(calls, [])
+        self.assertEqual(menu.calls, [])
 
 
 class TestAutoSend(Base):
@@ -3557,12 +3561,12 @@ class TestAutoSend(Base):
         h.state.HISTORY = []
         self.addCleanup(setattr, h.state, "HISTORY", self._old_history)
 
-    def edit(self, keys):
+    def edit(self, keys, menu=None):
         import io
         from contextlib import redirect_stdout
         buf = io.StringIO()
         with redirect_stdout(buf):
-            line = h._edit_line("you> ", iter(keys))
+            line = h.lineedit._edit_line("you> ", iter(keys), menu)
         return line, buf.getvalue()
 
     def test_default_is_on(self):
@@ -3624,7 +3628,7 @@ class TestWindowsKeyMap(unittest.TestCase):
                 return next(self._it)
 
         with mock.patch.dict(sys.modules, {"msvcrt": FakeMsvcrt(list(chars))}):
-            return next(h._iter_keys_windows())
+            return next(h.lineedit._iter_keys_windows())
 
     def test_extended_keys(self):
         for code, token in (
@@ -3645,18 +3649,18 @@ class TestWindowsKeyMap(unittest.TestCase):
         self.assertEqual(self.first(["\x1b"]), "esc")
 
     def test_cr_is_enter_when_ctrl_not_held(self):
-        with mock.patch.object(h, "_windows_ctrl_held", return_value=False):
+        with mock.patch.object(h.lineedit, "_windows_ctrl_held", return_value=False):
             self.assertEqual(self.first(["\r"]), "enter")
 
     def test_cr_is_ctrl_enter_when_ctrl_held(self):
-        with mock.patch.object(h, "_windows_ctrl_held", return_value=True):
+        with mock.patch.object(h.lineedit, "_windows_ctrl_held", return_value=True):
             self.assertEqual(self.first(["\r"]), "ctrl_enter")
 
 
 class TestCsiSequences(unittest.TestCase):
     def feed(self, seq):
         it = iter(list(seq))
-        return h._parse_csi_seq(lambda: next(it, None))
+        return h.lineedit._parse_csi_seq(lambda: next(it, None))
 
     def test_delete(self):
         self.assertEqual(self.feed("3~"), "delete")
@@ -3695,7 +3699,7 @@ class TestCsiSequences(unittest.TestCase):
             tokens = []
 
             def consume():
-                for tok in h._iter_keys_posix():
+                for tok in h.lineedit._iter_keys_posix():
                     tokens.append(tok)
                     if tok == "enter":
                         break
@@ -3732,7 +3736,7 @@ class TestCsiSequences(unittest.TestCase):
             tokens = []
 
             def consume():
-                for tok in h._iter_keys_posix():
+                for tok in h.lineedit._iter_keys_posix():
                     tokens.append(tok)
                     if tok == "enter":
                         break
@@ -3766,7 +3770,7 @@ class TestCsiSequences(unittest.TestCase):
             tokens = []
 
             def consume():
-                gen = h._iter_keys_posix()
+                gen = h.lineedit._iter_keys_posix()
                 try:
                     for tok in gen:
                         tokens.append(tok)
@@ -3824,7 +3828,7 @@ class TestRawInputMode(unittest.TestCase):
 
         master, slave = pty.openpty()  # type: ignore[reportAttributeAccessIssue]
         try:
-            h._set_raw_input(slave)
+            h.lineedit._set_raw_input(slave)
             mode = termios.tcgetattr(slave)  # type: ignore[reportAttributeAccessIssue]
             self.assertTrue(mode[1] & termios.OPOST, "OPOST must stay on")
             self.assertTrue(mode[1] & termios.ONLCR, "ONLCR must stay on")
@@ -3859,7 +3863,7 @@ class TestRawInputMode(unittest.TestCase):
 
         master, slave = pty.openpty()  # type: ignore[reportAttributeAccessIssue]
         try:
-            h._set_raw_input(slave)
+            h.lineedit._set_raw_input(slave)
             mode = termios.tcgetattr(slave)  # type: ignore[reportAttributeAccessIssue]
             self.assertEqual(
                 mode[0] & (termios.ICRNL | termios.IXON | termios.ISTRIP), 0
@@ -3894,7 +3898,7 @@ class TestRawInputMode(unittest.TestCase):
             tokens = []
 
             def consume():
-                for tok in h._iter_keys_posix():
+                for tok in h.lineedit._iter_keys_posix():
                     tokens.append(tok)
                     if tok == "enter":
                         break
@@ -4969,7 +4973,7 @@ class TestTodo(Base):
         self.addCleanup(setattr, h.state, "TODO_FILE", self._old_file)
 
     def todo(self, **kw):
-        return h.tool_todo(kw)
+        return h.context.tool_todo(kw)
 
     def test_add_and_list(self):
         self.assertEqual(self.todo(action="add", text="step one"), "todo list:\n- [ ] 1. step one")
@@ -5065,7 +5069,7 @@ class TestTodo(Base):
         os.makedirs(os.path.dirname(h.state.TODO_FILE), exist_ok=True)
         with open(h.state.TODO_FILE, "w", encoding="utf-8") as f:
             f.write("- [ ] 1. a\n- [~] 2. b\n- [x] 3. c\n")
-        h._todo_load()
+        h.context._todo_load()
         self.assertEqual(h.state.TODO_ITEMS, [
             {"id": 1, "text": "a", "status": "pending"},
             {"id": 2, "text": "b", "status": "in_progress"},
@@ -5074,34 +5078,34 @@ class TestTodo(Base):
         self.assertEqual(h.state.TODO_NEXT_ID, 4)
 
     def test_load_missing_file(self):
-        h._todo_load()
+        h.context._todo_load()
         self.assertEqual(h.state.TODO_ITEMS, [])
 
     def test_reminder_injected_on_change(self):
         messages = []
-        h._todo_reminder(messages)
+        h.context._todo_reminder(messages)
         self.assertEqual(messages, [])  # empty list: nothing injected
         self.todo(action="add", text="a")
-        h._todo_reminder(messages)
+        h.context._todo_reminder(messages)
         self.assertEqual(len(messages), 1)
         self.assertEqual(messages[0]["role"], "user")
         self.assertIn("1. a", messages[0]["content"])
-        h._todo_reminder(messages)  # unchanged list: no duplicate reminder
+        h.context._todo_reminder(messages)  # unchanged list: no duplicate reminder
         self.assertEqual(len(messages), 1)
         self.todo(action="update", id=1, status="done")
-        h._todo_reminder(messages)
+        h.context._todo_reminder(messages)
         self.assertEqual(len(messages), 2)
         self.assertIn("[x]", messages[1]["content"])
 
     def test_reminder_reset_after_clear(self):
         self.todo(action="add", text="a")
         messages = []
-        h._todo_reminder(messages)
+        h.context._todo_reminder(messages)
         self.todo(action="clear")
-        h._todo_reminder(messages)
+        h.context._todo_reminder(messages)
         self.assertEqual(len(messages), 1)  # clearing does not inject
         self.todo(action="add", text="b")
-        h._todo_reminder(messages)
+        h.context._todo_reminder(messages)
         self.assertEqual(len(messages), 2)  # re-added list injects again
 
     def test_run_agent_injects_reminder(self):
@@ -5126,8 +5130,8 @@ class TestTodo(Base):
 
     def test_output_capped(self):
         for i in range(300):
-            h.tool_todo({"action": "add", "text": ("item %d " % i) * 40})
-        out = h.tool_todo({"action": "list"})
+            h.context.tool_todo({"action": "add", "text": ("item %d " % i) * 40})
+        out = h.context.tool_todo({"action": "list"})
         self.assertIn(f"showing first {h.config.TODO_BLOCK_LIMIT};", out)
         # the file on disk keeps the full list; only what enters the chat is trimmed
         with open(h.state.TODO_FILE, "r", encoding="utf-8") as f:
@@ -5135,9 +5139,9 @@ class TestTodo(Base):
 
     def test_reminder_capped(self):
         for i in range(300):
-            h.tool_todo({"action": "add", "text": ("x " * 60) + str(i)})
+            h.context.tool_todo({"action": "add", "text": ("x " * 60) + str(i)})
         messages = []
-        h._todo_reminder(messages)
+        h.context._todo_reminder(messages)
         reminders = [m for m in messages if m.get("role") == "user"]
         self.assertEqual(len(reminders), 1)
         self.assertLess(len(reminders[0]["content"]), h.config.TODO_BLOCK_LIMIT + 200)
@@ -5154,7 +5158,7 @@ class TestMemory(Base):
         self.addCleanup(setattr, h.state, "MEMORY_GLOBAL_FILE", self._old_glob)
 
     def mem(self, **kw):
-        return h.tool_memory(kw)
+        return h.context.tool_memory(kw)
 
     def test_add_and_list(self):
         self.assertEqual(self.mem(action="add", text="user prefers tabs"), "added to project memory (1 notes)")
@@ -5205,10 +5209,10 @@ class TestMemory(Base):
     def test_load_memory(self):
         self.mem(action="add", text="p1")
         self.mem(action="add", text="g1", scope="global")
-        self.assertEqual(h.load_memory(), "project:\n- p1\n\nglobal:\n- g1")
+        self.assertEqual(h.context.load_memory(), "project:\n- p1\n\nglobal:\n- g1")
 
     def test_load_memory_empty(self):
-        self.assertEqual(h.load_memory(), "")
+        self.assertEqual(h.context.load_memory(), "")
 
     def test_list_output_capped(self):
         for i in range(200):
@@ -5221,7 +5225,7 @@ class TestMemory(Base):
         # would silently eat context.
         for i in range(200):
             self.mem(action="add", text=("long note %d " % i) * 30)
-        block = h.load_memory()
+        block = h.context.load_memory()
         self.assertLess(len(block), h.config.MEMORY_BLOCK_LIMIT + 200)
         self.assertIn("[truncated:", block)
 
@@ -5244,7 +5248,7 @@ class TestStateToolsRegistered(unittest.TestCase):
             self.assertFalse(hasattr(h, name))
 
     def test_system_prompt_mentions_state_tools(self):
-        prompt = h.get_system_prompt("/x", "")
+        prompt = h.context.get_system_prompt("/x", "")
         for name in ("todo", "memory"):
             self.assertIn(name, prompt)
         # the pitfall-recording habit survives, routed through memory
@@ -5263,31 +5267,31 @@ class TestStateToolsRegistered(unittest.TestCase):
         h.state.MEMORY_GLOBAL_FILE = "/nonexistent/glob.md"
         self.addCleanup(setattr, h.state, "MEMORY_PROJECT_FILE", old_proj)
         self.addCleanup(setattr, h.state, "MEMORY_GLOBAL_FILE", old_glob)
-        self.assertEqual(h._context_additions(), "")
+        self.assertEqual(h.context._context_additions(), "")
 
 
 class TestAskUser(Base):
     def _respond(self, *answers):
         it = iter(answers)
-        old = h.readline_prompt
+        old = h.lineedit.readline_prompt
 
-        def fake(prompt):
+        def fake(prompt, menu=None):
             try:
                 return next(it)
             except StopIteration:
                 raise EOFError
 
-        h.readline_prompt = fake
-        self.addCleanup(setattr, h, "readline_prompt", old)
+        h.lineedit.readline_prompt = fake
+        self.addCleanup(setattr, h.lineedit, "readline_prompt", old)
 
     def _raise(self, exc):
-        old = h.readline_prompt
+        old = h.lineedit.readline_prompt
 
-        def fake(prompt):
+        def fake(prompt, menu=None):
             raise exc
 
-        h.readline_prompt = fake
-        self.addCleanup(setattr, h, "readline_prompt", old)
+        h.lineedit.readline_prompt = fake
+        self.addCleanup(setattr, h.lineedit, "readline_prompt", old)
 
     def _call(self, fn, args):
         with contextlib.redirect_stdout(io.StringIO()):
@@ -5302,7 +5306,7 @@ class TestAskUser(Base):
             self.assertIn(name, h.DISPATCH)
 
     def test_system_prompt_mentions_interaction_tools(self):
-        prompt = h.get_system_prompt("/x", "")
+        prompt = h.context.get_system_prompt("/x", "")
         self.assertIn("ask_user", prompt)
 
     def test_empty_question(self):
@@ -5371,14 +5375,14 @@ class TestFileRefs(Base):
         return path
 
     def test_no_refs_returns_string(self):
-        self.assertEqual(h.expand_file_refs("hello world"), "hello world")
+        self.assertEqual(h.context.expand_file_refs("hello world"), "hello world")
 
     def test_non_uri_ref_stays_literal(self):
-        self.assertEqual(h.expand_file_refs("see @[not-a-uri] here"), "see @[not-a-uri] here")
+        self.assertEqual(h.context.expand_file_refs("see @[not-a-uri] here"), "see @[not-a-uri] here")
 
     def test_cwd_text_ref(self):
         self._write("notes.txt", "line one\nline two\n")
-        out = h.expand_file_refs("read @[cwd://notes.txt] now")
+        out = h.context.expand_file_refs("read @[cwd://notes.txt] now")
         self.assertIsInstance(out, list)
         texts = [p["text"] for p in out if p.get("type") == "text"]
         joined = "\n".join(texts)
@@ -5391,7 +5395,7 @@ class TestFileRefs(Base):
     def test_cwd_image_ref(self):
         with open(os.path.join(self.tmp, "dot.png"), "wb") as f:
             f.write(self.PNG)
-        out = h.expand_file_refs("@[cwd://dot.png]")
+        out = h.context.expand_file_refs("@[cwd://dot.png]")
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0]["type"], "image_url")
         url = out[0]["image_url"]["url"]
@@ -5399,11 +5403,11 @@ class TestFileRefs(Base):
         self.assertEqual(base64.b64decode(url.split(",", 1)[1]), self.PNG)
 
     def test_cwd_missing_file(self):
-        out = h.expand_file_refs("@[cwd://nope.txt]")
+        out = h.context.expand_file_refs("@[cwd://nope.txt]")
         self.assertEqual(out, [{"type": "text", "text": "[error: file not found: nope.txt]"}])
 
     def test_cwd_escape_rejected(self):
-        out = h.expand_file_refs("@[cwd://../evil.txt]")
+        out = h.context.expand_file_refs("@[cwd://../evil.txt]")
         self.assertEqual(
             out,
             [{"type": "text", "text": "[error: Path escapes working directory: ../evil.txt]"}],
@@ -5416,13 +5420,13 @@ class TestFileRefs(Base):
         uri = pathname2url(abs_path)
         if not uri.startswith("file://"):
             uri = "file://" + uri
-        out = h.expand_file_refs(f"@[{uri}]")
+        out = h.context.expand_file_refs(f"@[{uri}]")
         self.assertIsInstance(out, list)
         joined = "\n".join(p["text"] for p in out if p.get("type") == "text")
         self.assertIn("absolute content", joined)
 
     def test_file_uri_missing(self):
-        out = h.expand_file_refs("@[file:///nonexistent/xyz.txt]")
+        out = h.context.expand_file_refs("@[file:///nonexistent/xyz.txt]")
         self.assertEqual(
             out,
             [{"type": "text", "text": "[error: file not found: file:///nonexistent/xyz.txt]"}],
@@ -5432,7 +5436,7 @@ class TestFileRefs(Base):
         h.state.VISION_ENABLED = False
         with open(os.path.join(self.tmp, "dot.png"), "wb") as f:
             f.write(self.PNG)
-        out = h.expand_file_refs("@[cwd://dot.png]")
+        out = h.context.expand_file_refs("@[cwd://dot.png]")
         self.assertEqual(
             out,
             [{"type": "text", "text": "[image: dot.png (not sent; vision disabled)]"}],
@@ -5440,7 +5444,7 @@ class TestFileRefs(Base):
 
     def test_truncation(self):
         self._write("big.txt", "a" * 60_000)
-        out = h.expand_file_refs("@[cwd://big.txt]")
+        out = h.context.expand_file_refs("@[cwd://big.txt]")
         self.assertEqual(len(out), 1)
         self.assertTrue(
             out[0]["text"].endswith(
@@ -5452,7 +5456,7 @@ class TestFileRefs(Base):
     def test_multiple_refs_ordering(self):
         self._write("a.txt", "AAA")
         self._write("b.txt", "BBB")
-        out = h.expand_file_refs("@[cwd://a.txt] mid @[cwd://b.txt]")
+        out = h.context.expand_file_refs("@[cwd://a.txt] mid @[cwd://b.txt]")
         self.assertEqual(len(out), 3)
         self.assertEqual(out[0]["text"], "[file: a.txt]\nAAA")
         self.assertEqual(out[1]["text"], " mid ")
@@ -5460,7 +5464,7 @@ class TestFileRefs(Base):
 
     def test_build_user_message(self):
         self._write("n.txt", "X")
-        msg = h.build_user_message("@[cwd://n.txt]")
+        msg = h.context.build_user_message("@[cwd://n.txt]")
         self.assertEqual(msg["role"], "user")
         self.assertIsInstance(msg["content"], list)
 
@@ -5714,21 +5718,21 @@ class TestInterrupt(Base):
 
     def test_check_double_esc_within_window(self):
         state = {"last_esc": 0.0}
-        self.assertFalse(h.check_double_esc(state, "esc", 10.0))
-        self.assertTrue(h.check_double_esc(state, "esc", 11.5))
+        self.assertFalse(h.lineedit.check_double_esc(state, "esc", 10.0))
+        self.assertTrue(h.lineedit.check_double_esc(state, "esc", 11.5))
 
     def test_check_double_esc_outside_window(self):
         state = {"last_esc": 0.0}
-        self.assertFalse(h.check_double_esc(state, "esc", 10.0))
-        self.assertFalse(h.check_double_esc(state, "esc", 12.1))
-        self.assertTrue(h.check_double_esc(state, "esc", 13.0))
+        self.assertFalse(h.lineedit.check_double_esc(state, "esc", 10.0))
+        self.assertFalse(h.lineedit.check_double_esc(state, "esc", 12.1))
+        self.assertTrue(h.lineedit.check_double_esc(state, "esc", 13.0))
 
     def test_check_double_esc_other_key_resets(self):
         state = {"last_esc": 0.0}
-        self.assertFalse(h.check_double_esc(state, "esc", 10.0))
-        self.assertFalse(h.check_double_esc(state, ("char", "a"), 10.5))
-        self.assertFalse(h.check_double_esc(state, "esc", 11.0))
-        self.assertTrue(h.check_double_esc(state, "esc", 11.5))
+        self.assertFalse(h.lineedit.check_double_esc(state, "esc", 10.0))
+        self.assertFalse(h.lineedit.check_double_esc(state, ("char", "a"), 10.5))
+        self.assertFalse(h.lineedit.check_double_esc(state, "esc", 11.0))
+        self.assertTrue(h.lineedit.check_double_esc(state, "esc", 11.5))
 
     def test_stream_chat_breaks_when_triggered(self):
         lines = [
@@ -5761,7 +5765,7 @@ class TestInterrupt(Base):
                     self._watcher.triggered = True
                 return line
 
-        watcher = h.InterruptWatcher()
+        watcher = h.lineedit.InterruptWatcher()
         with mock.patch.object(
             h, "_open_request", return_value=FakeResp(lines, watcher)
         ):
@@ -5787,7 +5791,7 @@ class TestInterrupt(Base):
                 self._watcher.triggered = True
                 raise ConnectionResetError("socket shut down")
 
-        watcher = h.InterruptWatcher()
+        watcher = h.lineedit.InterruptWatcher()
         with mock.patch.object(
             h, "_open_request", return_value=RespInterruptedMidRead(lines, watcher)
         ):
@@ -5810,7 +5814,7 @@ class TestInterrupt(Base):
         import socket
 
         a, b = socket.socketpair()
-        watcher = h.InterruptWatcher()
+        watcher = h.lineedit.InterruptWatcher()
 
         def fake_open(req, progress=None, on_socket=None):
             # the opener reports the connection socket, then the interrupt
@@ -5835,7 +5839,7 @@ class TestInterrupt(Base):
         ):
             msgs = [{"role": "user", "content": "hi"}]
             with self.assertRaises(ConnectionResetError):
-                list(h.stream_chat(msgs, "m", watcher=h.InterruptWatcher()))
+                list(h.stream_chat(msgs, "m", watcher=h.lineedit.InterruptWatcher()))
 
     def test_stream_once_interrupt_raises_with_partial(self):
         class FakeWatcher:
@@ -5855,13 +5859,13 @@ class TestInterrupt(Base):
             yield {"content": "partial"}
 
         old_enabled = h.state.INTERRUPT_ENABLED
-        old_watcher = h.InterruptWatcher
+        old_watcher = h.lineedit.InterruptWatcher
         old_chat = h.stream_chat
         h.state.INTERRUPT_ENABLED = True
-        h.InterruptWatcher = FakeWatcher
+        h.lineedit.InterruptWatcher = FakeWatcher
         h.stream_chat = fake_stream_chat
         self.addCleanup(setattr, h.state, "INTERRUPT_ENABLED", old_enabled)
-        self.addCleanup(setattr, h, "InterruptWatcher", old_watcher)
+        self.addCleanup(setattr, h.lineedit, "InterruptWatcher", old_watcher)
         self.addCleanup(setattr, h, "stream_chat", old_chat)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -5891,13 +5895,13 @@ class TestInterrupt(Base):
             yield from ()
 
         old_enabled = h.state.INTERRUPT_ENABLED
-        old_watcher = h.InterruptWatcher
+        old_watcher = h.lineedit.InterruptWatcher
         old_chat = h.stream_chat
         h.state.INTERRUPT_ENABLED = True
-        h.InterruptWatcher = FakeWatcher
+        h.lineedit.InterruptWatcher = FakeWatcher
         h.stream_chat = fake_stream_chat
         self.addCleanup(setattr, h.state, "INTERRUPT_ENABLED", old_enabled)
-        self.addCleanup(setattr, h, "InterruptWatcher", old_watcher)
+        self.addCleanup(setattr, h.lineedit, "InterruptWatcher", old_watcher)
         self.addCleanup(setattr, h, "stream_chat", old_chat)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -6022,7 +6026,7 @@ class TestInterrupt(Base):
     def test_watcher_start_noop_without_tty(self):
         if sys.stdin.isatty():
             self.skipTest("stdin is a tty")
-        watcher = h.InterruptWatcher()
+        watcher = h.lineedit.InterruptWatcher()
         watcher.start()
         self.assertIsNone(watcher._thread)
         watcher.stop()
@@ -6528,9 +6532,9 @@ class TestSessionLog(unittest.TestCase):
 
     def test_todo_reminder_is_journaled(self):
         h.journal.start_session()
-        h.tool_todo({"action": "add", "text": "write the log"})
+        h.context.tool_todo({"action": "add", "text": "write the log"})
         messages = [{"role": "system", "content": "s"}]
-        h._todo_reminder(messages, h.state.MAIN_CONV_ID)
+        h.context._todo_reminder(messages, h.state.MAIN_CONV_ID)
         self.assertEqual(self._jmessages()[-1]["role"], "user")
         self.assertIn("write the log", self._jmessages()[-1]["content"])
 
