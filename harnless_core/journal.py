@@ -9,7 +9,7 @@ import json
 import os
 import time
 
-from harnless_core import caps, config, render, state
+from harnless_core import caps, config, journal, render, state
 
 
 def _session_stamp() -> str:
@@ -696,3 +696,25 @@ def _transcript_hint(conv_key) -> str:
         f"the transcript is in {path}: read the turns that were dropped with the sessions "
         f"tool, or continue this session with --resume {_session_id_of(path)}"
     )
+
+def _record_usage(messages: list, usage, conv_id: int = None) -> None:
+    """Remember the server-reported token usage for a conversation.
+
+    Keyed by an explicit conversation id when given (MAIN_CONV_ID for the
+    top-level conversation, a unique counter per sub-agent run), else by
+    id(messages). Explicit ids matter: id() is a memory address, and a
+    freed sub-agent messages list can be reallocated at the same address,
+    which would make /status resurrect stale sub-agent usage. Sub-agent
+    entries are deleted when the sub-agent finishes (tool_task).
+
+    The same key journals the call: a `usage` record is the log's record of
+    how full the context was at that point — what a compaction trigger, and a
+    post-mortem, both need.
+    """
+    if isinstance(usage, dict) and usage.get("prompt_tokens"):
+        key = conv_id if conv_id is not None else id(messages)
+        state.USAGE_BY_CONV[key] = usage
+        journal._session_append(
+            key,
+            {"messages": len(messages), "usage": usage, "type": "usage"},
+        )

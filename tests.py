@@ -1955,7 +1955,7 @@ class TestSubagents(unittest.TestCase):
         self._old_exit_notes = dict(h.state.EXIT_NOTE_BY_CONV)
         self._old_next_conv = h.state._NEXT_CONV_ID
         self._old_steps = h.state.SUBAGENT_STEP_LIMIT
-        self._old_chat = h.chat
+        self._old_chat = h.request.chat
         h.state._AGENT_DEPTH = 0
         h.state.MAX_SUBAGENT_DEPTH = 3
         h.state.OUTPUT_INDENT = ""
@@ -1968,14 +1968,14 @@ class TestSubagents(unittest.TestCase):
         def no_live_api(*args, **kwargs):
             raise AssertionError("tests must not reach a live LLM server")
 
-        h.chat = no_live_api  # a non-streaming fallback would hit the real API
+        h.request.chat = no_live_api  # a non-streaming fallback would hit the real API
         self.addCleanup(setattr, h.state, "_AGENT_DEPTH", self._old_depth)
         self.addCleanup(setattr, h.state, "MAX_SUBAGENT_DEPTH", self._old_max)
         self.addCleanup(setattr, h.state, "OUTPUT_INDENT", self._old_indent)
         self.addCleanup(setattr, h.state, "MODEL", self._old_model)
         self.addCleanup(setattr, h.state, "TEMPERATURE", self._old_temp)
         self.addCleanup(setattr, h.state, "SUBAGENT_STEP_LIMIT", self._old_steps)
-        self.addCleanup(setattr, h, "chat", self._old_chat)
+        self.addCleanup(setattr, h.request, "chat", self._old_chat)
         self.addCleanup(h.state.USAGE_BY_CONV.clear)
         self.addCleanup(h.state.USAGE_BY_CONV.update, self._old_usage)
         self.addCleanup(h.state.EXIT_NOTE_BY_CONV.clear)
@@ -2015,9 +2015,9 @@ class TestSubagents(unittest.TestCase):
             seen[depth] = turn + 1
             return decide(messages, depth, turn)
 
-        old = h.stream_once
-        h.stream_once = fake_stream_once
-        self.addCleanup(setattr, h, "stream_once", old)
+        old = h.request.stream_once
+        h.request.stream_once = fake_stream_once
+        self.addCleanup(setattr, h.request, "stream_once", old)
         messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "go"}]
         return messages, calls
 
@@ -2239,7 +2239,7 @@ class TestSubagents(unittest.TestCase):
         def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None):
             # Simulate the sub-agent's API call recording usage under its
             # own conversation id.
-            h._record_usage(messages, {"prompt_tokens": 999999}, conv_id)
+            h.journal._record_usage(messages, {"prompt_tokens": 999999}, conv_id)
             messages.append({"role": "assistant", "content": "done"})
             return 0
 
@@ -2254,7 +2254,7 @@ class TestSubagents(unittest.TestCase):
 
     def test_task_usage_cleaned_up_on_error(self):
         def boom(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None):
-            h._record_usage(messages, {"prompt_tokens": 424242}, conv_id)
+            h.journal._record_usage(messages, {"prompt_tokens": 424242}, conv_id)
             raise RuntimeError("nope")
 
         old = h.run_agent
@@ -2333,9 +2333,9 @@ class TestSubagents(unittest.TestCase):
                 True,
             )
 
-        old = h.stream_once
-        h.stream_once = fake_stream_once
-        self.addCleanup(setattr, h, "stream_once", old)
+        old = h.request.stream_once
+        h.request.stream_once = fake_stream_once
+        self.addCleanup(setattr, h.request, "stream_once", old)
         with contextlib.redirect_stdout(io.StringIO()):
             code = h.run_agent([{"role": "user", "content": "go"}], "m", depth=2)
         self.assertEqual(code, 7)
@@ -2346,9 +2346,9 @@ class TestSubagents(unittest.TestCase):
         def fake_stream_once(messages, model, tools=None, temperature=0.2, conv_id=None):
             raise RuntimeError("sub-agent exploded")
 
-        old = h.stream_once
-        h.stream_once = fake_stream_once
-        self.addCleanup(setattr, h, "stream_once", old)
+        old = h.request.stream_once
+        h.request.stream_once = fake_stream_once
+        self.addCleanup(setattr, h.request, "stream_once", old)
         with self.assertRaises(RuntimeError):
             with contextlib.redirect_stdout(io.StringIO()):
                 h.run_agent([{"role": "user", "content": "go"}], "m", depth=1)
@@ -2377,7 +2377,7 @@ class TestSubagents(unittest.TestCase):
 
     def test_task_bubbles_up_subagent_interrupt(self):
         def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None):
-            raise h.StreamInterrupted(
+            raise h.errors.StreamInterrupted(
                 {
                     "role": "assistant",
                     "content": "half an answer",
@@ -2386,7 +2386,7 @@ class TestSubagents(unittest.TestCase):
             )
 
         self._fake_run_agent(fake_run_agent)
-        with self.assertRaises(h.SubagentInterrupted) as cm:
+        with self.assertRaises(h.errors.SubagentInterrupted) as cm:
             h.tool_task({"task": "do X"})
         content = cm.exception.message["content"]
         self.assertIn(h.config.SUBAGENT_INTERRUPT_PREFIX, content)
@@ -2397,10 +2397,10 @@ class TestSubagents(unittest.TestCase):
 
     def test_execute_tool_does_not_swallow_subagent_interrupt(self):
         def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None):
-            raise h.StreamInterrupted({"role": "assistant", "content": "partial"})
+            raise h.errors.StreamInterrupted({"role": "assistant", "content": "partial"})
 
         self._fake_run_agent(fake_run_agent)
-        with self.assertRaises(h.SubagentInterrupted):
+        with self.assertRaises(h.errors.SubagentInterrupted):
             h.execute_tool("task", json.dumps({"task": "do X"}))
 
     def test_interrupt_stops_the_whole_turn(self):
@@ -2419,7 +2419,7 @@ class TestSubagents(unittest.TestCase):
                     },
                     True,
                 )
-            raise h.StreamInterrupted({"role": "assistant", "content": "half the work"})
+            raise h.errors.StreamInterrupted({"role": "assistant", "content": "half the work"})
 
         messages, calls = self._scripted(decide)
         buf = io.StringIO()
@@ -2442,7 +2442,7 @@ class TestSubagents(unittest.TestCase):
         def decide(messages, depth, turn):
             if depth < 2:
                 return (self._tool_turn("task", {"task": "deeper"}), True)
-            raise h.StreamInterrupted({"role": "assistant", "content": "deepest partial work"})
+            raise h.errors.StreamInterrupted({"role": "assistant", "content": "deepest partial work"})
 
         messages, calls = self._scripted(decide)
         with contextlib.redirect_stdout(io.StringIO()):
@@ -2460,11 +2460,11 @@ class TestSubagents(unittest.TestCase):
         long-standing behaviour (keep the partial, return 0)."""
 
         def fake_stream_once(messages, model, tools=None, temperature=0.2, conv_id=None):
-            raise h.StreamInterrupted({"role": "assistant", "content": "partial answer"})
+            raise h.errors.StreamInterrupted({"role": "assistant", "content": "partial answer"})
 
-        old = h.stream_once
-        h.stream_once = fake_stream_once
-        self.addCleanup(setattr, h, "stream_once", old)
+        old = h.request.stream_once
+        h.request.stream_once = fake_stream_once
+        self.addCleanup(setattr, h.request, "stream_once", old)
         messages = [{"role": "user", "content": "go"}]
         with contextlib.redirect_stdout(io.StringIO()):
             code = h.run_agent(messages, "m")
@@ -2483,9 +2483,9 @@ class TestSubagents(unittest.TestCase):
             depths.append(h.state._AGENT_DEPTH)
             return (self._tool_turn("todo", {"action": "list"}), True)
 
-        old = h.stream_once
-        h.stream_once = fake_stream_once
-        self.addCleanup(setattr, h, "stream_once", old)
+        old = h.request.stream_once
+        h.request.stream_once = fake_stream_once
+        self.addCleanup(setattr, h.request, "stream_once", old)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             out = h.tool_task({"task": "never ends"})
@@ -2604,9 +2604,9 @@ class TestSubagents(unittest.TestCase):
                 {"id": "c1", "type": "function",
                  "function": {"name": "exit", "arguments": '{"code": 7, "message": "done"}'}}]}, True)
 
-        old = h.stream_once
-        h.stream_once = fake_stream_once
-        self.addCleanup(setattr, h, "stream_once", old)
+        old = h.request.stream_once
+        h.request.stream_once = fake_stream_once
+        self.addCleanup(setattr, h.request, "stream_once", old)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             code = h.run_agent([{"role": "user", "content": "go"}], "m")
@@ -2692,7 +2692,7 @@ class TestProbeContextWindow(unittest.TestCase):
         with mock.patch(
             "urllib.request.urlopen", return_value=self._fake_response(payload)
         ) as m:
-            self.assertEqual(h.probe_context_window(), 8192)
+            self.assertEqual(h.request.probe_context_window(), 8192)
         req = m.call_args[0][0]
         self.assertEqual(req.full_url, "http://127.0.0.1:11434/v1/models")
 
@@ -2701,14 +2701,14 @@ class TestProbeContextWindow(unittest.TestCase):
         with mock.patch(
             "urllib.request.urlopen", return_value=self._fake_response(payload)
         ):
-            self.assertEqual(h.probe_context_window(), 222208)
+            self.assertEqual(h.request.probe_context_window(), 222208)
 
     def test_context_length_wins_over_n_ctx(self):
         payload = {"data": [{"id": "m1", "context_length": 4096, "meta": {"n_ctx": 8192}}]}
         with mock.patch(
             "urllib.request.urlopen", return_value=self._fake_response(payload)
         ):
-            self.assertEqual(h.probe_context_window(), 4096)
+            self.assertEqual(h.request.probe_context_window(), 4096)
 
     def test_multi_model_matches_by_id(self):
         payload = {
@@ -2720,7 +2720,7 @@ class TestProbeContextWindow(unittest.TestCase):
         with mock.patch(
             "urllib.request.urlopen", return_value=self._fake_response(payload)
         ):
-            self.assertEqual(h.probe_context_window(), 4096)
+            self.assertEqual(h.request.probe_context_window(), 4096)
 
     def test_multi_model_no_match_uses_first(self):
         payload = {
@@ -2732,30 +2732,30 @@ class TestProbeContextWindow(unittest.TestCase):
         with mock.patch(
             "urllib.request.urlopen", return_value=self._fake_response(payload)
         ):
-            self.assertEqual(h.probe_context_window(), 1000)
+            self.assertEqual(h.request.probe_context_window(), 1000)
 
     def test_network_error_returns_zero(self):
         with mock.patch(
             "urllib.request.urlopen", side_effect=urllib.error.URLError("down")
         ):
-            self.assertEqual(h.probe_context_window(), 0)
+            self.assertEqual(h.request.probe_context_window(), 0)
 
     def test_malformed_json_returns_zero(self):
         with mock.patch("urllib.request.urlopen", return_value=io.BytesIO(b"not json")):
-            self.assertEqual(h.probe_context_window(), 0)
+            self.assertEqual(h.request.probe_context_window(), 0)
 
     def test_missing_field_returns_zero(self):
         payload = {"data": [{"id": "m1"}]}
         with mock.patch(
             "urllib.request.urlopen", return_value=self._fake_response(payload)
         ):
-            self.assertEqual(h.probe_context_window(), 0)
+            self.assertEqual(h.request.probe_context_window(), 0)
 
     def test_empty_data_returns_zero(self):
         with mock.patch(
             "urllib.request.urlopen", return_value=self._fake_response({"data": []})
         ):
-            self.assertEqual(h.probe_context_window(), 0)
+            self.assertEqual(h.request.probe_context_window(), 0)
 
     def test_api_url_line(self):
         old = h.state.API_URL
@@ -2774,35 +2774,35 @@ class TestProbeContextWindow(unittest.TestCase):
 class TestNormalizeApiUrl(unittest.TestCase):
     def test_full_endpoint_unchanged(self):
         url = "https://openrouter.ai/api/v1/chat/completions"
-        self.assertEqual(h.normalize_api_url(url), url)
+        self.assertEqual(h.request.normalize_api_url(url), url)
 
     def test_full_endpoint_trailing_slash(self):
         self.assertEqual(
-            h.normalize_api_url("https://openrouter.ai/api/v1/chat/completions/"),
+            h.request.normalize_api_url("https://openrouter.ai/api/v1/chat/completions/"),
             "https://openrouter.ai/api/v1/chat/completions",
         )
 
     def test_base_url_gets_endpoint(self):
         self.assertEqual(
-            h.normalize_api_url("https://openrouter.ai/api/v1"),
+            h.request.normalize_api_url("https://openrouter.ai/api/v1"),
             "https://openrouter.ai/api/v1/chat/completions",
         )
 
     def test_local_default_base_url(self):
         self.assertEqual(
-            h.normalize_api_url("http://127.0.0.1:11434/v1"),
+            h.request.normalize_api_url("http://127.0.0.1:11434/v1"),
             "http://127.0.0.1:11434/v1/chat/completions",
         )
 
     def test_strips_whitespace_and_slashes(self):
         self.assertEqual(
-            h.normalize_api_url("  http://127.0.0.1:11434/v1/  "),
+            h.request.normalize_api_url("  http://127.0.0.1:11434/v1/  "),
             "http://127.0.0.1:11434/v1/chat/completions",
         )
 
     def test_empty_stays_empty(self):
-        self.assertEqual(h.normalize_api_url(""), "")
-        self.assertEqual(h.normalize_api_url(None), "")
+        self.assertEqual(h.request.normalize_api_url(""), "")
+        self.assertEqual(h.request.normalize_api_url(None), "")
 
 
 class TestHelp(unittest.TestCase):
@@ -2820,35 +2820,35 @@ class TestParseSseLine(unittest.TestCase):
         return "data: " + json.dumps({"choices": [{"delta": delta}]})
 
     def test_valid_delta(self):
-        self.assertEqual(h.parse_sse_line(self._line({"content": "hi"})), {"content": "hi"})
+        self.assertEqual(h.request.parse_sse_line(self._line({"content": "hi"})), {"content": "hi"})
 
     def test_done_terminator(self):
-        self.assertEqual(h.parse_sse_line("data: [DONE]"), "[DONE]")
+        self.assertEqual(h.request.parse_sse_line("data: [DONE]"), "[DONE]")
 
     def test_comment_ignored(self):
-        self.assertIsNone(h.parse_sse_line(": keepalive"))
+        self.assertIsNone(h.request.parse_sse_line(": keepalive"))
 
     def test_blank_ignored(self):
-        self.assertIsNone(h.parse_sse_line(""))
+        self.assertIsNone(h.request.parse_sse_line(""))
 
     def test_non_data_line_ignored(self):
-        self.assertIsNone(h.parse_sse_line("event: message"))
+        self.assertIsNone(h.request.parse_sse_line("event: message"))
 
     def test_malformed_json_ignored(self):
-        self.assertIsNone(h.parse_sse_line("data: {not json"))
+        self.assertIsNone(h.request.parse_sse_line("data: {not json"))
 
     def test_missing_delta(self):
-        self.assertEqual(h.parse_sse_line("data: " + json.dumps({"choices": [{"index": 0}]})), {})
+        self.assertEqual(h.request.parse_sse_line("data: " + json.dumps({"choices": [{"index": 0}]})), {})
 
     def test_whitespace_tolerance(self):
-        self.assertEqual(h.parse_sse_line("  data:   [DONE]  "), "[DONE]")
+        self.assertEqual(h.request.parse_sse_line("  data:   [DONE]  "), "[DONE]")
 
 
 class TestStreamAccumulation(unittest.TestCase):
     def accumulate(self, chunks):
         msg = {}
         for c in chunks:
-            h.accumulate_delta(msg, c)
+            h.request.accumulate_delta(msg, c)
         return msg
 
     def test_content_only(self):
@@ -2899,7 +2899,7 @@ class TestStreamAccumulation(unittest.TestCase):
 
     def test_mutation_is_in_place(self):
         msg = {"role": "assistant"}
-        result = h.accumulate_delta(msg, {"content": "x"})
+        result = h.request.accumulate_delta(msg, {"content": "x"})
         self.assertIs(result, msg)
 
 
@@ -5116,9 +5116,9 @@ class TestTodo(Base):
                      "function": {"name": "todo", "arguments": '{"action": "add", "text": "step"}'}}]}, True)
             return ({"role": "assistant", "content": "done"}, True)
 
-        old = h.stream_once
-        h.stream_once = fake_stream_once
-        self.addCleanup(setattr, h, "stream_once", old)
+        old = h.request.stream_once
+        h.request.stream_once = fake_stream_once
+        self.addCleanup(setattr, h.request, "stream_once", old)
         messages = [{"role": "user", "content": "go"}]
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -5521,25 +5521,25 @@ class TestUsageTracking(unittest.TestCase):
 
     def test_record_usage_stores_by_messages_id(self):
         msgs = [{"role": "user", "content": "hi"}]
-        h._record_usage(msgs, {"prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105})
+        h.journal._record_usage(msgs, {"prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105})
         self.assertEqual(h.state.USAGE_BY_CONV[id(msgs)]["prompt_tokens"], 100)
 
     def test_record_usage_ignores_bad(self):
         msgs = [{"role": "user", "content": "hi"}]
-        h._record_usage(msgs, None)
-        h._record_usage(msgs, {})
-        h._record_usage(msgs, {"prompt_tokens": 0})
+        h.journal._record_usage(msgs, None)
+        h.journal._record_usage(msgs, {})
+        h.journal._record_usage(msgs, {"prompt_tokens": 0})
         self.assertNotIn(id(msgs), h.state.USAGE_BY_CONV)
 
     def test_record_usage_stores_by_conv_id(self):
         msgs = [{"role": "user", "content": "hi"}]
-        h._record_usage(msgs, {"prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105}, conv_id=7)
+        h.journal._record_usage(msgs, {"prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105}, conv_id=7)
         self.assertEqual(h.state.USAGE_BY_CONV[7]["prompt_tokens"], 100)
         self.assertNotIn(id(msgs), h.state.USAGE_BY_CONV)
 
     def test_format_status_by_conv_id(self):
         msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]
-        h._record_usage(msgs, {"prompt_tokens": 170000, "completion_tokens": 10, "total_tokens": 170010}, conv_id=5)
+        h.journal._record_usage(msgs, {"prompt_tokens": 170000, "completion_tokens": 10, "total_tokens": 170010}, conv_id=5)
         out = h.format_status(msgs, context_window=200000, conv_id=5)
         self.assertIn("context: 170000 tokens (server-reported) in 2 messages", out)
         # An address-keyed lookup must not find the conv-id entry.
@@ -5564,7 +5564,7 @@ class TestUsageTracking(unittest.TestCase):
 
         with mock.patch.object(h.urllib.request, "urlopen", return_value=FakeResp()):
             msgs = [{"role": "user", "content": "hi"}]
-            h.chat(msgs, "m", conv_id=3)
+            h.request.chat(msgs, "m", conv_id=3)
         self.assertEqual(h.state.USAGE_BY_CONV[3]["prompt_tokens"], 55)
         self.assertNotIn(id(msgs), h.state.USAGE_BY_CONV)
 
@@ -5584,33 +5584,33 @@ class TestUsageTracking(unittest.TestCase):
 
         with mock.patch.object(h.urllib.request, "urlopen", return_value=FakeResp()):
             msgs = [{"role": "user", "content": "hi"}]
-            list(h.stream_chat(msgs, "m", conv_id=4))
+            list(h.request.stream_chat(msgs, "m", conv_id=4))
         self.assertEqual(h.state.USAGE_BY_CONV[4]["prompt_tokens"], 170000)
         self.assertNotIn(id(msgs), h.state.USAGE_BY_CONV)
 
     def test_parse_sse_line_usage_chunk_empty_choices(self):
         line = 'data: {"id":"x","choices":[],"usage":{"prompt_tokens":170000,"completion_tokens":10,"total_tokens":170010}}'
         self.assertEqual(
-            h.parse_sse_line(line),
+            h.request.parse_sse_line(line),
             {"usage": {"prompt_tokens": 170000, "completion_tokens": 10, "total_tokens": 170010}},
         )
 
     def test_parse_sse_line_usage_chunk_no_choices(self):
-        self.assertEqual(h.parse_sse_line('data: {"usage":{"prompt_tokens":42}}'), {"usage": {"prompt_tokens": 42}})
+        self.assertEqual(h.request.parse_sse_line('data: {"usage":{"prompt_tokens":42}}'), {"usage": {"prompt_tokens": 42}})
 
     def test_parse_sse_line_empty_choices_no_usage(self):
-        self.assertIsNone(h.parse_sse_line('data: {"id":"x","choices":[]}'))
+        self.assertIsNone(h.request.parse_sse_line('data: {"id":"x","choices":[]}'))
 
     def test_parse_sse_line_delta_still_works(self):
         self.assertEqual(
-            h.parse_sse_line('data: {"choices":[{"delta":{"content":"hi"}}]}'), {"content": "hi"}
+            h.request.parse_sse_line('data: {"choices":[{"delta":{"content":"hi"}}]}'), {"content": "hi"}
         )
 
     def test_build_request_stream_options(self):
-        req = h._build_request([{"role": "user", "content": "hi"}], "m", stream=True)
+        req = h.request._build_request([{"role": "user", "content": "hi"}], "m", stream=True)
         body = json.loads(req.data.decode("utf-8"))
         self.assertEqual(body["stream_options"], {"include_usage": True})
-        req2 = h._build_request([{"role": "user", "content": "hi"}], "m", stream=False)
+        req2 = h.request._build_request([{"role": "user", "content": "hi"}], "m", stream=False)
         body2 = json.loads(req2.data.decode("utf-8"))
         self.assertNotIn("stream_options", body2)
 
@@ -5632,7 +5632,7 @@ class TestUsageTracking(unittest.TestCase):
 
         with mock.patch.object(h.urllib.request, "urlopen", return_value=FakeResp()):
             msgs = [{"role": "user", "content": "hi"}]
-            out = h.chat(msgs, "m")
+            out = h.request.chat(msgs, "m")
         self.assertEqual(out["choices"][0]["message"]["content"], "ok")
         self.assertEqual(h.state.USAGE_BY_CONV[id(msgs)]["prompt_tokens"], 55)
 
@@ -5652,13 +5652,13 @@ class TestUsageTracking(unittest.TestCase):
 
         with mock.patch.object(h.urllib.request, "urlopen", return_value=FakeResp()):
             msgs = [{"role": "user", "content": "hi"}]
-            deltas = list(h.stream_chat(msgs, "m"))
+            deltas = list(h.request.stream_chat(msgs, "m"))
         self.assertEqual(deltas, [{"content": "hi"}])
         self.assertEqual(h.state.USAGE_BY_CONV[id(msgs)]["prompt_tokens"], 170000)
 
     def test_format_status_server_reported(self):
         msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]
-        h._record_usage(msgs, {"prompt_tokens": 170000, "completion_tokens": 10, "total_tokens": 170010})
+        h.journal._record_usage(msgs, {"prompt_tokens": 170000, "completion_tokens": 10, "total_tokens": 170010})
         out = h.format_status(msgs, context_window=200000)
         self.assertIn("context: 170000 tokens (server-reported) in 2 messages", out)
         self.assertIn("~85% of 200000 window", out)
@@ -5767,10 +5767,10 @@ class TestInterrupt(Base):
 
         watcher = h.lineedit.InterruptWatcher()
         with mock.patch.object(
-            h, "_open_request", return_value=FakeResp(lines, watcher)
+            h.request, "_open_request", return_value=FakeResp(lines, watcher)
         ):
             msgs = [{"role": "user", "content": "hi"}]
-            deltas = list(h.stream_chat(msgs, "m", watcher=watcher))
+            deltas = list(h.request.stream_chat(msgs, "m", watcher=watcher))
         self.assertEqual(deltas, [{"content": "hi"}])
 
     def test_stream_chat_swallows_read_error_when_triggered(self):
@@ -5793,10 +5793,10 @@ class TestInterrupt(Base):
 
         watcher = h.lineedit.InterruptWatcher()
         with mock.patch.object(
-            h, "_open_request", return_value=RespInterruptedMidRead(lines, watcher)
+            h.request, "_open_request", return_value=RespInterruptedMidRead(lines, watcher)
         ):
             msgs = [{"role": "user", "content": "hi"}]
-            deltas = list(h.stream_chat(msgs, "m", watcher=watcher))
+            deltas = list(h.request.stream_chat(msgs, "m", watcher=watcher))
         self.assertEqual(deltas, [{"content": "hi"}])
 
     def test_stream_chat_raises_read_error_without_watcher(self):
@@ -5806,7 +5806,7 @@ class TestInterrupt(Base):
         ):
             msgs = [{"role": "user", "content": "hi"}]
             with self.assertRaises(ConnectionResetError):
-                list(h.stream_chat(msgs, "m"))
+                list(h.request.stream_chat(msgs, "m"))
 
     def test_stream_chat_swallows_send_error_when_triggered(self):
         """A double ESC during the context send aborts the upload; the
@@ -5825,9 +5825,9 @@ class TestInterrupt(Base):
             raise ConnectionResetError("socket closed during send")
 
         try:
-            with mock.patch.object(h, "_open_request", side_effect=fake_open):
+            with mock.patch.object(h.request, "_open_request", side_effect=fake_open):
                 msgs = [{"role": "user", "content": "hi"}]
-                deltas = list(h.stream_chat(msgs, "m", watcher=watcher))
+                deltas = list(h.request.stream_chat(msgs, "m", watcher=watcher))
             self.assertEqual(deltas, [])
             self.assertTrue(watcher.triggered)
         finally:
@@ -5835,11 +5835,11 @@ class TestInterrupt(Base):
 
     def test_stream_chat_raises_send_error_without_trigger(self):
         with mock.patch.object(
-            h, "_open_request", side_effect=ConnectionResetError("socket closed")
+            h.request, "_open_request", side_effect=ConnectionResetError("socket closed")
         ):
             msgs = [{"role": "user", "content": "hi"}]
             with self.assertRaises(ConnectionResetError):
-                list(h.stream_chat(msgs, "m", watcher=h.lineedit.InterruptWatcher()))
+                list(h.request.stream_chat(msgs, "m", watcher=h.lineedit.InterruptWatcher()))
 
     def test_stream_once_interrupt_raises_with_partial(self):
         class FakeWatcher:
@@ -5860,17 +5860,17 @@ class TestInterrupt(Base):
 
         old_enabled = h.state.INTERRUPT_ENABLED
         old_watcher = h.lineedit.InterruptWatcher
-        old_chat = h.stream_chat
+        old_chat = h.request.stream_chat
         h.state.INTERRUPT_ENABLED = True
         h.lineedit.InterruptWatcher = FakeWatcher
-        h.stream_chat = fake_stream_chat
+        h.request.stream_chat = fake_stream_chat
         self.addCleanup(setattr, h.state, "INTERRUPT_ENABLED", old_enabled)
         self.addCleanup(setattr, h.lineedit, "InterruptWatcher", old_watcher)
-        self.addCleanup(setattr, h, "stream_chat", old_chat)
+        self.addCleanup(setattr, h.request, "stream_chat", old_chat)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            with self.assertRaises(h.StreamInterrupted) as cm:
-                h.stream_once([{"role": "user", "content": "go"}], "m")
+            with self.assertRaises(h.errors.StreamInterrupted) as cm:
+                h.request.stream_once([{"role": "user", "content": "go"}], "m")
         self.assertEqual(cm.exception.message.get("content"), "partial")
         self.assertIn("(interrupted)", buf.getvalue())
 
@@ -5896,23 +5896,23 @@ class TestInterrupt(Base):
 
         old_enabled = h.state.INTERRUPT_ENABLED
         old_watcher = h.lineedit.InterruptWatcher
-        old_chat = h.stream_chat
+        old_chat = h.request.stream_chat
         h.state.INTERRUPT_ENABLED = True
         h.lineedit.InterruptWatcher = FakeWatcher
-        h.stream_chat = fake_stream_chat
+        h.request.stream_chat = fake_stream_chat
         self.addCleanup(setattr, h.state, "INTERRUPT_ENABLED", old_enabled)
         self.addCleanup(setattr, h.lineedit, "InterruptWatcher", old_watcher)
-        self.addCleanup(setattr, h, "stream_chat", old_chat)
+        self.addCleanup(setattr, h.request, "stream_chat", old_chat)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            with self.assertRaises(h.StreamInterrupted) as cm:
-                h.stream_once([{"role": "user", "content": "go"}], "m")
+            with self.assertRaises(h.errors.StreamInterrupted) as cm:
+                h.request.stream_once([{"role": "user", "content": "go"}], "m")
         self.assertNotIn("content", cm.exception.message)
         self.assertIn("(interrupted)", buf.getvalue())
 
     def test_run_agent_interrupt_keeps_partial_strips_tool_calls(self):
         def fake_stream_once(messages, model, tools=None, temperature=0.2, conv_id=None):
-            raise h.StreamInterrupted(
+            raise h.errors.StreamInterrupted(
                 {
                     "role": "assistant",
                     "content": "partial answer",
@@ -5926,9 +5926,9 @@ class TestInterrupt(Base):
                 }
             )
 
-        old = h.stream_once
-        h.stream_once = fake_stream_once
-        self.addCleanup(setattr, h, "stream_once", old)
+        old = h.request.stream_once
+        h.request.stream_once = fake_stream_once
+        self.addCleanup(setattr, h.request, "stream_once", old)
         messages = [{"role": "user", "content": "go"}]
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -5938,11 +5938,11 @@ class TestInterrupt(Base):
 
     def test_run_agent_interrupt_empty_appends_nothing(self):
         def fake_stream_once(messages, model, tools=None, temperature=0.2, conv_id=None):
-            raise h.StreamInterrupted({"role": "assistant"})
+            raise h.errors.StreamInterrupted({"role": "assistant"})
 
-        old = h.stream_once
-        h.stream_once = fake_stream_once
-        self.addCleanup(setattr, h, "stream_once", old)
+        old = h.request.stream_once
+        h.request.stream_once = fake_stream_once
+        self.addCleanup(setattr, h.request, "stream_once", old)
         messages = [{"role": "user", "content": "go"}]
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -5956,13 +5956,13 @@ class TestInterrupt(Base):
         break every later request in the conversation."""
 
         def fake_stream_once(messages, model, tools=None, temperature=0.2, conv_id=None):
-            raise h.StreamInterrupted(
+            raise h.errors.StreamInterrupted(
                 {"role": "assistant", "reasoning_content": "still thinking"}
             )
 
-        old = h.stream_once
-        h.stream_once = fake_stream_once
-        self.addCleanup(setattr, h, "stream_once", old)
+        old = h.request.stream_once
+        h.request.stream_once = fake_stream_once
+        self.addCleanup(setattr, h.request, "stream_once", old)
         messages = [{"role": "user", "content": "go"}]
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -5975,7 +5975,7 @@ class TestInterrupt(Base):
         partial (reasoning only), which is dropped too."""
 
         def fake_stream_once(messages, model, tools=None, temperature=0.2, conv_id=None):
-            raise h.StreamInterrupted(
+            raise h.errors.StreamInterrupted(
                 {
                     "role": "assistant",
                     "reasoning_content": "still thinking",
@@ -5989,9 +5989,9 @@ class TestInterrupt(Base):
                 }
             )
 
-        old = h.stream_once
-        h.stream_once = fake_stream_once
-        self.addCleanup(setattr, h, "stream_once", old)
+        old = h.request.stream_once
+        h.request.stream_once = fake_stream_once
+        self.addCleanup(setattr, h.request, "stream_once", old)
         messages = [{"role": "user", "content": "go"}]
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -6001,7 +6001,7 @@ class TestInterrupt(Base):
 
     def test_run_agent_interrupt_content_and_reasoning_kept(self):
         def fake_stream_once(messages, model, tools=None, temperature=0.2, conv_id=None):
-            raise h.StreamInterrupted(
+            raise h.errors.StreamInterrupted(
                 {
                     "role": "assistant",
                     "content": "partial answer",
@@ -6009,9 +6009,9 @@ class TestInterrupt(Base):
                 }
             )
 
-        old = h.stream_once
-        h.stream_once = fake_stream_once
-        self.addCleanup(setattr, h, "stream_once", old)
+        old = h.request.stream_once
+        h.request.stream_once = fake_stream_once
+        self.addCleanup(setattr, h.request, "stream_once", old)
         messages = [{"role": "user", "content": "go"}]
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -6044,11 +6044,11 @@ class TestToolsArePassedDown(unittest.TestCase):
     def setUp(self):
         self._saved = (h.state.API_URL, h.state.MCP_TOOLS, h.state.DISABLED_TOOLS)
         h.state.API_URL = "http://127.0.0.1:1/v1/chat/completions"
-        self._stream_once = h.stream_once
+        self._stream_once = h.request.stream_once
 
     def tearDown(self):
         h.state.API_URL, h.state.MCP_TOOLS, h.state.DISABLED_TOOLS = self._saved
-        h.stream_once = self._stream_once
+        h.request.stream_once = self._stream_once
 
     def _sent(self, fn, *args, **kw):
         """Run a request function with the transport stubbed, returning its JSON payload."""
@@ -6072,9 +6072,9 @@ class TestToolsArePassedDown(unittest.TestCase):
             seen["payload"] = json.loads(req.data.decode("utf-8"))
             return Resp(b"")
 
-        old = h._open_request
-        h._open_request = open_request
-        self.addCleanup(setattr, h, "_open_request", old)
+        old = h.request._open_request
+        h.request._open_request = open_request
+        self.addCleanup(setattr, h.request, "_open_request", old)
         fn(*args, **kw)
         return seen["payload"]
 
@@ -6086,33 +6086,33 @@ class TestToolsArePassedDown(unittest.TestCase):
             calls.append({s["function"]["name"] for s in (tools or [])})
             return {"role": "assistant", "content": "done"}, True
 
-        h.stream_once = fake_stream_once
+        h.request.stream_once = fake_stream_once
         fn(*args, **kw)
         return calls
 
     def test_request_body_sends_what_it_is_handed(self):
         spec = {"type": "function", "function": {"name": "grep", "parameters": {}}}
-        body = h._request_body([{"role": "user", "content": "x"}], "m", tools=[spec])
+        body = h.request._request_body([{"role": "user", "content": "x"}], "m", tools=[spec])
         self.assertEqual(body["tools"], [spec])
         self.assertEqual(body["tool_choice"], "auto")
 
     def test_request_body_without_tools_sends_neither_key(self):
         for tools in (None, []):
-            body = h._request_body([{"role": "user", "content": "x"}], "m", tools=tools)
+            body = h.request._request_body([{"role": "user", "content": "x"}], "m", tools=tools)
             self.assertNotIn("tools", body)
             self.assertNotIn("tool_choice", body)
 
     def test_chat_sends_the_tools_it_was_given(self):
         msgs = [{"role": "user", "content": "x"}]
         spec = {"type": "function", "function": {"name": "grep", "parameters": {}}}
-        payload = self._sent(h.chat, msgs, "m", tools=[spec])
+        payload = self._sent(h.request.chat, msgs, "m", tools=[spec])
         self.assertEqual(payload["tools"], [spec])
-        self.assertNotIn("tools", self._sent(h.chat, msgs, "m"))
+        self.assertNotIn("tools", self._sent(h.request.chat, msgs, "m"))
 
     def test_stream_chat_sends_the_tools_it_was_given(self):
         msgs = [{"role": "user", "content": "x"}]
         spec = {"type": "function", "function": {"name": "grep", "parameters": {}}}
-        stream = lambda *a, **k: list(h.stream_chat(*a, **k))
+        stream = lambda *a, **k: list(h.request.stream_chat(*a, **k))
         self.assertEqual(self._sent(stream, msgs, "m", tools=[spec])["tools"], [spec])
         self.assertNotIn("tools", self._sent(stream, msgs, "m"))
 
@@ -6172,8 +6172,8 @@ class TestContextProgress(unittest.TestCase):
             {"role": "tool", "tool_call_id": "1", "content": "e" * 20},
         ]
         total = 220 + len(json.dumps(h._active_tools(True)))
-        self.assertEqual(h.estimate_context_chars(messages, h._active_tools(True)), total)
-        self.assertEqual(h.estimate_context_tokens(messages, h._active_tools(True)), total // 4)
+        self.assertEqual(h.measure.estimate_context_chars(messages, h._active_tools(True)), total)
+        self.assertEqual(h.measure.estimate_context_tokens(messages, h._active_tools(True)), total // 4)
 
     def test_format_tokens(self):
         self.assertEqual(h.render._format_tokens(999), "999")
@@ -6187,7 +6187,7 @@ class TestContextProgress(unittest.TestCase):
         self.assertEqual(h.render._format_elapsed(75), "1m15s")
 
     def test_noop_below_threshold(self):
-        spinner = h.ContextProgress([{"role": "user", "content": "hi"}], h._active_tools(True))
+        spinner = h.request.ContextProgress([{"role": "user", "content": "hi"}], h._active_tools(True))
         spinner.start()
         self.assertFalse(spinner.active)
         spinner.stop()
@@ -6195,15 +6195,15 @@ class TestContextProgress(unittest.TestCase):
     def test_noop_without_tty(self):
         if sys.stdout.isatty():
             self.skipTest("stdout is a tty")
-        spinner = h.ContextProgress(self._big_messages(), h._active_tools(True))
+        spinner = h.request.ContextProgress(self._big_messages(), h._active_tools(True))
         spinner.start()
         self.assertFalse(spinner.active)
         spinner.stop()
 
     def test_line_shows_upload_progress(self):
-        spinner = h.ContextProgress([{"role": "user", "content": "hi"}], h._active_tools(True))
+        spinner = h.request.ContextProgress([{"role": "user", "content": "hi"}], h._active_tools(True))
         spinner.tokens = 32_000
-        spinner.upload = h._UploadProgress(1000)
+        spinner.upload = h.request._UploadProgress(1000)
         spinner.upload.sent = 450
         line = spinner._line()
         self.assertIn("sending context", line)
@@ -6212,9 +6212,9 @@ class TestContextProgress(unittest.TestCase):
         self.assertIn("14.4k/32.0k", line)
 
     def test_line_waiting_state(self):
-        spinner = h.ContextProgress([{"role": "user", "content": "hi"}], h._active_tools(True))
+        spinner = h.request.ContextProgress([{"role": "user", "content": "hi"}], h._active_tools(True))
         spinner.tokens = 32_000
-        spinner.upload = h._UploadProgress(1000)
+        spinner.upload = h.request._UploadProgress(1000)
         spinner.upload.sent = 1000  # upload complete
         line = spinner._line()
         self.assertIn("waiting for first token", line)
@@ -6226,7 +6226,7 @@ class TestContextProgress(unittest.TestCase):
         self.addCleanup(setattr, h.state, "CONTEXT_PROGRESS_DELAY", old_delay)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf), mock.patch.object(buf, "isatty", return_value=True):
-            spinner = h.ContextProgress(self._big_messages(), h._active_tools(True))
+            spinner = h.request.ContextProgress(self._big_messages(), h._active_tools(True))
             spinner.start()
             self.assertTrue(spinner.active)
             deadline = time.time() + 5
@@ -6244,7 +6244,7 @@ class TestContextProgress(unittest.TestCase):
         self.addCleanup(setattr, h.state, "CONTEXT_PROGRESS_DELAY", old_delay)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf), mock.patch.object(buf, "isatty", return_value=True):
-            spinner = h.ContextProgress(self._big_messages(), h._active_tools(True))
+            spinner = h.request.ContextProgress(self._big_messages(), h._active_tools(True))
             spinner.start()
             deadline = time.time() + 5
             while "waiting for first token" not in buf.getvalue() and time.time() < deadline:
@@ -6258,7 +6258,7 @@ class TestContextProgress(unittest.TestCase):
     def test_open_request_plain_without_progress(self):
         req = urllib.request.Request("http://127.0.0.1:1/x", data=b"hi")
         with mock.patch.object(h.urllib.request, "urlopen", return_value="RESP") as m:
-            self.assertEqual(h._open_request(req, None), "RESP")
+            self.assertEqual(h.request._open_request(req, None), "RESP")
             m.assert_called_once_with(req, timeout=600)
 
     def test_upload_progress_counts_bytes(self):
@@ -6290,8 +6290,8 @@ class TestContextProgress(unittest.TestCase):
                 data=body,
                 headers={"Content-Type": "application/json"},
             )
-            spinner = h.ContextProgress([{"role": "user", "content": "hi"}])
-            with h._open_request(req, spinner) as resp:
+            spinner = h.request.ContextProgress([{"role": "user", "content": "hi"}])
+            with h.request._open_request(req, spinner) as resp:
                 data = resp.read()
             self.assertEqual(json.loads(data), {"ok": True})
             self.assertIsNotNone(spinner.upload)
@@ -6328,7 +6328,7 @@ class TestContextProgress(unittest.TestCase):
                 headers={"Content-Type": "application/json"},
             )
             seen = []
-            with h._open_request(req, None, seen.append) as resp:
+            with h.request._open_request(req, None, seen.append) as resp:
                 resp.read()
             self.assertTrue(seen)  # the connection socket was reported
         finally:
@@ -6359,7 +6359,7 @@ class TestContextProgress(unittest.TestCase):
             req = urllib.request.Request(f"http://127.0.0.1:{port}/x", data=b"hi")
             resp = urllib.request.urlopen(req, timeout=5)
             try:
-                self.assertIsNotNone(h._response_socket(resp))
+                self.assertIsNotNone(h.request._response_socket(resp))
             finally:
                 resp.read()
                 resp.close()
@@ -6409,7 +6409,7 @@ class TestSessionLog(unittest.TestCase):
         def no_live_api(*args, **kwargs):
             raise AssertionError("tests must not reach a live LLM server")
 
-        h.chat = no_live_api
+        h.request.chat = no_live_api
 
     def tearDown(self):
         for name, value in self._saved.items():
@@ -6445,7 +6445,7 @@ class TestSessionLog(unittest.TestCase):
             seen[depth] = turn + 1
             return decide(messages, depth, turn)
 
-        h.stream_once = fake_stream_once
+        h.request.stream_once = fake_stream_once
 
     def _run(self, extra_messages=True, **kw):
         """An interactive top-level run against the conversation journal."""
@@ -6519,12 +6519,12 @@ class TestSessionLog(unittest.TestCase):
 
     def test_usage_is_recorded_per_llm_call(self):
         h.journal.start_session()
-        h._record_usage(
+        h.journal._record_usage(
             [{"role": "user", "content": "hi"}],
             {"prompt_tokens": 1200, "completion_tokens": 3, "total_tokens": 1203},
             conv_id=h.state.MAIN_CONV_ID,
         )
-        h._record_usage([{"role": "user", "content": "hi"}], None, conv_id=h.state.MAIN_CONV_ID)
+        h.journal._record_usage([{"role": "user", "content": "hi"}], None, conv_id=h.state.MAIN_CONV_ID)
         records = self._log()
         self.assertEqual([r.get("type") for r in records], ["session", "usage"])
         self.assertEqual(records[1]["usage"]["prompt_tokens"], 1200)
@@ -6557,11 +6557,11 @@ class TestSessionLog(unittest.TestCase):
 
     def test_interrupted_partial_is_journaled(self):
         def interrupted(messages, model, tools=None, temperature=0.2, conv_id=None):
-            raise h.StreamInterrupted(
+            raise h.errors.StreamInterrupted(
                 {"role": "assistant", "content": "half a sentence", "tool_calls": [self._call("get_cwd", {})]}
             )
 
-        h.stream_once = interrupted
+        h.request.stream_once = interrupted
         h.journal.start_session()
         messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "go"}]
         h.journal._session_messages(messages, h.state.MAIN_CONV_ID)
@@ -7234,7 +7234,7 @@ class TestCompaction(unittest.TestCase):
         h.state.COMPACT_THRESHOLD_PCT = 85
         h.state.COMPACT_MAX_ATTEMPTS = 1
         h.state.COMPACT_SUMMARY_TRIMS = 3
-        h._open_request = self._saved["_open_request"]
+        h.request._open_request = self._saved["_open_request"]
         self.notes = []  # every request the summariser was asked to write
         self.turns = []  # what each model turn was actually shown
 
@@ -7247,7 +7247,7 @@ class TestCompaction(unittest.TestCase):
                 "usage": {"prompt_tokens": 999},
             }
 
-        h.chat = summariser
+        h.request.chat = summariser
 
     def tearDown(self):
         for name, value in self._saved.items():
@@ -7288,7 +7288,7 @@ class TestCompaction(unittest.TestCase):
             self.turns.append(list(messages))
             return decide(messages, depth, turn)
 
-        h.stream_once = fake_stream_once
+        h.request.stream_once = fake_stream_once
 
     def _seed(self, count=8, size=1200, tool_at=None, tool_size=None):
         """A journaled top-level conversation: system, then user/assistant pairs.
@@ -7311,7 +7311,7 @@ class TestCompaction(unittest.TestCase):
         return messages
 
     def _compact(self, messages, reason="manual"):
-        return h.compact_messages(
+        return h.compact.compact_messages(
             messages, h.state.MAIN_CONV_ID, model="test-model", reason=reason,
             tools=h._active_tools(True)
         )
@@ -7437,7 +7437,7 @@ class TestCompaction(unittest.TestCase):
         # two places back in the head. Cutting there would keep an answer to a call the
         # head swallowed, which is a request no server answers.
         self.assertEqual(messages[15].get("role"), "tool")
-        self.assertEqual(h._compact_cut(messages, 405), 17)  # nudged past both answers
+        self.assertEqual(h.compact._compact_cut(messages, 405), 17)  # nudged past both answers
 
     def test_a_tool_answer_never_outlives_its_call(self):
         h.state.CONTEXT_WINDOW = 1620  # a 405-token tail budget: the cut lands mid-batch
@@ -7458,7 +7458,7 @@ class TestCompaction(unittest.TestCase):
         self.assertIsNone(self.notes[0]["tools"])  # the note is written, not acted on
         self.assertEqual(request[0]["role"], "system")
         self.assertEqual(request[0]["content"], h.config.COMPACT_SUMMARY_PROMPT)
-        body = h._request_body(request, "test-model")
+        body = h.request._request_body(request, "test-model")
         self.assertNotIn("tools", body)
         self.assertNotIn("tool_choice", body)  # no tool_choice without tools to choose
 
@@ -7468,7 +7468,7 @@ class TestCompaction(unittest.TestCase):
             self.notes.append({"messages": messages, "tools": tools, "conv_id": conv_id})
             return {"choices": [{"message": {"role": "assistant", "content": "n" * 20_000}}]}
 
-        h.chat = long_note
+        h.request.chat = long_note
         messages = self._seed(8)
         self.assertTrue(self._compact(messages)[0])
         content = messages[1]["content"]
@@ -7609,7 +7609,7 @@ class TestCompaction(unittest.TestCase):
                    conv_id=None):
             raise urllib.error.URLError("no route to the summariser")
 
-        h.chat = broken
+        h.request.chat = broken
         self._compacted_once()
         self.assertIn("placeholder (the summarising request failed)",
                       h.journal.tool_sessions({"action": "spans"}))
@@ -7677,7 +7677,7 @@ class TestCompaction(unittest.TestCase):
                    conv_id=None):
             raise urllib.error.URLError("no route to the summariser")
 
-        h.chat = broken
+        h.request.chat = broken
         messages = self._seed(8)
         before = len(messages)
         ok, report = self._compact(messages)
@@ -7698,7 +7698,7 @@ class TestCompaction(unittest.TestCase):
                 raise h.errors.ContextOverflow("HTTP 400: prompt is too long")
             return {"choices": [{"message": {"role": "assistant", "content": "SMALLER NOTE"}}]}
 
-        h.chat = too_big
+        h.request.chat = too_big
         messages = self._seed(8, tool_at=2, tool_size=60_000)
         self.assertTrue(self._compact(messages)[0])
         self.assertEqual(len(self.notes), 2)
@@ -7818,7 +7818,7 @@ class TestCompaction(unittest.TestCase):
         seed = [{"role": "user", "content": f"u{i} " + "x" * 2000} for i in range(8)]
         seed += [{"role": "assistant", "content": f"a{i}"} for i in range(8)]
         self.assertLess(
-            h.estimate_context_tokens(seed, h._active_tools(True)), 20_000 * h.state.COMPACT_THRESHOLD_PCT // 100
+            h.measure.estimate_context_tokens(seed, h._active_tools(True)), 20_000 * h.state.COMPACT_THRESHOLD_PCT // 100
         )  # the estimate alone would not have triggered it
         h.state.USAGE_BY_CONV[h.state.MAIN_CONV_ID] = {"prompt_tokens": 18_000}
         code, _, _ = self._seeded_run(decide=lambda m, d, t: (
@@ -7838,8 +7838,8 @@ class TestCompaction(unittest.TestCase):
         # the threshold while the conversation is nowhere near it. Compacting would cut
         # turns that were never what filled the context — that overflow is the reactive
         # trigger's, and it says plainly when compaction cannot help.
-        self.assertGreater(h.estimate_context_tokens(request, h._active_tools(True)), threshold)
-        self.assertLess(h._turn_tokens(request), threshold)
+        self.assertGreater(h.measure.estimate_context_tokens(request, h._active_tools(True)), threshold)
+        self.assertLess(h.compact._turn_tokens(request), threshold)
         self._scripted(lambda m, d, t: ({"role": "assistant", "content": "done"}, True))
         code, _, _ = self._run(seed=seed)
         self.assertEqual(code, 0)
@@ -7966,7 +7966,7 @@ class TestCompaction(unittest.TestCase):
         def no_deltas(messages, model, tools=None, temperature=0.2, conv_id=None):
             return {"role": "assistant", "content": "no deltas"}, False  # run_agent falls back
 
-        h.stream_once = no_deltas
+        h.request.stream_once = no_deltas
 
         def chat(messages, model, tools=None, temperature=0.2, conv_id=None):
             if tools is None:  # the handoff note request: written, not acted on
@@ -7975,7 +7975,7 @@ class TestCompaction(unittest.TestCase):
                 return {"choices": [{"message": {"role": "assistant", "content": "HANDOFF"}}]}
             raise h.errors.ContextOverflow("HTTP 400: maximum context length exceeded")
 
-        h.chat = chat
+        h.request.chat = chat
         code, _, out = self._run(seed=seed)
         # The fallback is a request too: whichever path the server refused, a prompt
         # still too big after the one compaction ends the run the same way.
@@ -8007,7 +8007,7 @@ class TestCompaction(unittest.TestCase):
                 self.assertEqual(reason, "")
 
     def test_chat_raises_context_overflow_for_a_refused_prompt(self):
-        h.chat = self._saved["chat"]  # the real one, this time
+        h.request.chat = self._saved["chat"]  # the real one, this time
 
         def refuse(request, progress=None, on_socket=None):
             raise urllib.error.HTTPError(
@@ -8015,13 +8015,13 @@ class TestCompaction(unittest.TestCase):
                 io.BytesIO(b'{"error": {"message": "over n_ctx"}}'),
             )
 
-        h._open_request = refuse
+        h.request._open_request = refuse
         with self.assertRaises(h.errors.ContextOverflow) as caught:
-            h.chat([{"role": "user", "content": "x"}], "test-model")
+            h.request.chat([{"role": "user", "content": "x"}], "test-model")
         self.assertIn("n_ctx", str(caught.exception))
 
     def test_another_kind_of_bad_request_is_still_just_an_http_error(self):
-        h.chat = self._saved["chat"]
+        h.request.chat = self._saved["chat"]
 
         def refuse(request, progress=None, on_socket=None):
             raise urllib.error.HTTPError(
@@ -8029,9 +8029,9 @@ class TestCompaction(unittest.TestCase):
                 io.BytesIO(b'{"error": {"message": "invalid json in arguments"}}'),
             )
 
-        h._open_request = refuse
+        h.request._open_request = refuse
         with self.assertRaises(urllib.error.HTTPError):
-            h.chat([{"role": "user", "content": "x"}], "test-model")
+            h.request.chat([{"role": "user", "content": "x"}], "test-model")
 
     # ---- sub-agents
 

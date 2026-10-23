@@ -36,3 +36,28 @@ def _context_overflow_reason(exc) -> str:
     if not text or not config._CONTEXT_OVERFLOW_RE.search(text):
         return ""
     return f"HTTP {status}: {text[:300]}{'…' if len(text) > 300 else ''}"
+
+class StreamInterrupted(Exception):
+    """The user interrupted a streaming response (double ESC)."""
+
+    def __init__(self, message: dict):
+        super().__init__("stream interrupted")
+        self.message = message  # the partial assistant message
+
+class SubagentInterrupted(StreamInterrupted):
+    """A `task` tool call was interrupted, so the stop must bubble up.
+
+    Raised by `tool_task` when the user interrupts a sub-agent: every agent in
+    the delegation chain stops too, instead of the parent carrying on with the
+    half-finished sub-agent as if it had succeeded. `message["content"]` carries
+    the note (and any partial output) the delegating agent gets as the tool
+    result.
+    """
+
+class SubagentStepLimit(Exception):
+    """A sub-agent used up its allowed model turns (`SUBAGENT_STEP_LIMIT`).
+
+    A signal rather than a return code: an exit code would be indistinguishable
+    from a code the sub-agent's own `exit` call chose. Only `tool_task` ever
+    sees it — sub-agents are the only capped runs.
+    """

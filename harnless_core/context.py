@@ -10,7 +10,9 @@ import urllib
 
 from urllib.parse import urlparse
 from urllib.request import url2pathname
+
 from harnless_core import caps, config, journal, paths, state
+
 
 def _todo_render() -> str:
     if not state.TODO_ITEMS:

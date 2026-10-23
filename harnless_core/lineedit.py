@@ -9,6 +9,7 @@ import time
 
 from harnless_core import config, context, render, state
 
+
 def _windows_ctrl_held() -> bool:
     """Best-effort: True if Ctrl is held right now (GetAsyncKeyState sign bit).
 

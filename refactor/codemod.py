@@ -106,7 +106,6 @@ STAGES = {
         "_msg_tokens", "_turn_tokens", "_context_tokens_used", "_token_scale",
         "compact_messages",
         "_compact_if_needed", "_recover_overflow", "set_auto_compact", "format_compaction",
-        "estimate_context_chars", "estimate_context_tokens",
     ]},
     "search": {"search": [
         "re:^_gitignore", "re:^_ignore", "_is_ignored", "_iter_files", "tool_grep",
@@ -839,6 +838,23 @@ def cmd_cycle():
     cmd_shadow()
 
 
+def cmd_duplicates():
+    """Names defined in harnless.py *and* in a core module.
+
+    The older copy wins at import time, so a duplicate quietly un-splits a module — a
+    `git checkout harnless.py` after an extract is the usual way to create one.
+    """
+    here = defined_names(read_source())
+    out = {}
+    for path in sorted(PKG_DIR.glob("*.py")):
+        if path.name == "__init__.py":
+            continue
+        dup = sorted(here & defined_names(path.read_text(encoding="utf-8")))
+        if dup:
+            out[path.stem] = dup
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["pre", "extract", "move", "link", "facade", "tests",
@@ -880,6 +896,8 @@ def main():
         bad = [n for n in hits if n in moved]
         print(f"{len(registry)} names, {len(moved)} moved out")
         print(f"tests write {len(hits)} harness attributes; still targeting the facade: {bad}")
+        for module, names in cmd_duplicates().items():
+            print(f"duplicated in harnless.py and {module}.py: {names}")
 
 
 if __name__ == "__main__":

@@ -22,8 +22,8 @@ import urllib.error
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-from harnless_core import caps, config, context, errors, journal, lineedit, paths, render, state
-_MODULES = (caps, config, context, errors, journal, lineedit, paths, render, state)  # facade: moved modules
+from harnless_core import caps, compact, config, context, errors, journal, lineedit, measure, paths, render, request, state
+_MODULES = (caps, compact, config, context, errors, journal, lineedit, measure, paths, render, request, state)  # facade: moved modules
 
 
 # ---------------------------------------------------------------- output caps
@@ -33,452 +33,6 @@ _MODULES = (caps, config, context, errors, journal, lineedit, paths, render, sta
 
 
 # ------------------------------------------------------------ compaction
-
-
-def _prune_text(text: str, keep: int) -> tuple:
-    """Shrink a message body to its first and last `keep` characters.
-
-    Returns (text, chars_dropped), where 0 dropped means the body was already small
-    enough to keep whole — pruning what does not need it only adds a confusing note.
-    """
-    if keep <= 0 or len(text) <= keep:
-        return text, 0
-    head = keep // 2
-    tail = keep - head
-    return (
-        text[:head] + journal._elision_note(len(text) - keep) + (text[-tail:] if tail else ""),
-        len(text) - keep,
-    )
-
-
-def _compact_prune(msg: dict) -> tuple:
-    """A copy of a turn about to be replaced, shrunk for the summarising request.
-
-    Two switchable savings: the middle of an oversized tool result (the megabyte
-    carriers of a session) and the thinking a note replaces instead of replaying. The
-    originals stay in the log — and in the conversation — until this compaction drops
-    them. Returns (message, chars_saved).
-    """
-    out = msg
-    saved = 0
-    if state.COMPACT_PRUNE_TOOL_RESULTS and msg.get("role") == "tool":
-        text = msg.get("content")
-        if isinstance(text, str):
-            pruned, dropped = _prune_text(text, config.COMPACT_TOOL_RESULT_KEEP)
-            if dropped:
-                out = dict(msg)
-                out["content"] = pruned
-                saved += dropped
-    if state.COMPACT_DROP_REASONING and out.get("reasoning_content"):
-        if out is msg:
-            out = dict(out)
-        saved += len(out.get("reasoning_content") or "")
-        out.pop("reasoning_content", None)
-    return out, saved
-
-
-def _compact_tail_prune(messages: list) -> int:
-    """Stop replaying the thinking of turns that are no longer the current one.
-
-    Only the last assistant reply's reasoning can still shape what the agent does next;
-    the rest produced its tool calls and its answer already, and the log has it. Returns
-    the chars taken out of every request from here on.
-    """
-    if not state.COMPACT_DROP_REASONING or not messages:
-        return 0
-    last_assistant = -1
-    for i, msg in enumerate(messages):
-        if msg.get("role") == "assistant":
-            last_assistant = i
-    saved = 0
-    for i, msg in enumerate(messages):
-        if i == last_assistant or not msg.get("reasoning_content"):
-            continue
-        saved += len(msg.get("reasoning_content") or "")
-        msg.pop("reasoning_content", None)
-    return saved
-
-
-def _system_prefix(messages: list) -> int:
-    """How many leading messages are system prompts — never compacted away."""
-    i = 0
-    while i < len(messages) and messages[i].get("role") == "system":
-        i += 1
-    return i
-
-
-def _msg_tokens(msg: dict) -> int:
-    """What one message costs the next request: content + reasoning + tool arguments."""
-    total = caps._content_chars(msg.get("content"))
-    total += len(msg.get("reasoning_content") or "")
-    for tc in msg.get("tool_calls") or []:
-        total += len((tc.get("function") or {}).get("arguments") or "")
-    return max(1, total // 4)
-
-
-def _turn_tokens(messages: list) -> int:
-    """What a conversation's *turns* cost (chars/4) — the part compaction can act on.
-
-    Tool schemas and the system prompt are deliberately left out: they ride along with
-    every request no matter how short the conversation is, so measuring them here would
-    make the proactive trigger compact a conversation that is not what filled the
-    context — and then have nothing left to drop. What a request really costs (fixed
-    overhead included) is /status's estimate_context_tokens; a prompt too big for the
-    overhead's sake is the reactive trigger's business, and it says plainly that
-    compaction cannot help."""
-    return sum(_msg_tokens(msg) for msg in messages)
-
-
-def _context_tokens_used(messages: list, conv_key) -> int:
-    """How full this conversation is: what the server last reported for it, or the
-    estimate of its turns (see _turn_tokens)."""
-    usage = state.USAGE_BY_CONV.get(conv_key)
-    if isinstance(usage, dict) and usage.get("prompt_tokens"):
-        try:
-            return int(usage["prompt_tokens"])
-        except (TypeError, ValueError):
-            pass
-    return _turn_tokens(messages)
-
-
-def _token_scale(used: int, turn_tokens: int) -> float:
-    """How to read our chars/4 costs when the server has its own number for this
-    conversation: (reported / estimated).
-
-    A server counts the chat template, the tool schemas and its own tokenizer, so it
-    routinely reports more than the turns look like they cost. Compaction's tail budget
-    is in the server's units, so the budgets and the per-turn costs have to be compared
-    in one unit — this is the conversion. 1.0 when nothing was reported (then both
-    numbers are the same estimate)."""
-    if used <= 0 or turn_tokens <= 0:
-        return 1.0
-    return used / turn_tokens
-
-
-def _compact_cut(messages: list, keep_tokens: int, scale: float = 1.0) -> int:
-    """Index where the verbatim tail begins (everything after the system prefix that
-    comes before it is replaced by the handoff note).
-
-    Sized by the tail's token budget, floored at COMPACT_KEEP_MIN_MESSAGES so the model
-    always gets some real recent turns rather than only a summary, and nudged off a tool
-    answer: cutting there would keep an answer whose call was dropped — and a server
-    rejects that.
-    """
-    start = _system_prefix(messages)
-    cut = start
-    used = 0.0
-    for i in range(len(messages) - 1, start - 1, -1):
-        used += _msg_tokens(messages[i]) * scale
-        if used > keep_tokens:
-            cut = i + 1
-            break
-    floor = len(messages) - config.COMPACT_KEEP_MIN_MESSAGES
-    if floor < cut:
-        cut = floor  # never a tail smaller than the floor, however tight the budget
-    if cut < start:
-        cut = start
-    while cut < len(messages) and messages[cut].get("role") == "tool":
-        cut += 1
-    return cut
-
-
-def _fit_head(head: list, budget: int, scale: float = 1.0) -> list:
-    """The newest slice of the head that fits `budget` tokens.
-
-    Trimmed from the old end — a handoff lives on the recent turns — and never starting
-    on a tool answer, whose call would then be missing from the request."""
-    kept = []
-    used = 0.0
-    for msg in reversed(head):
-        cost = _msg_tokens(msg) * scale
-        if kept and used + cost > budget:
-            break
-        kept.append(msg)
-        used += cost
-    kept.reverse()
-    while len(kept) > 1 and kept[0].get("role") == "tool":
-        kept.pop(0)
-    return kept
-
-
-def _compact_summary(head: list, budget: int, model: str, scale: float = 1.0) -> tuple:
-    """Ask the model for the note that replaces the turns about to be dropped.
-
-    The head is what filled the context, so the request is trimmed to `budget` tokens —
-    in the same units the budget was set in (`scale`, see _token_scale) — and trimmed
-    again if even that was refused. No tools are sent (the note is written, not acted
-    on) and the call is keyed to a throwaway conversation id, so this request never
-    masquerades as the agent's own usage and nothing of its scaffolding is journaled
-    into the transcript. Returns (note, error); an empty note means fall back.
-    """
-    conv_id = state._NEXT_CONV_ID
-    state._NEXT_CONV_ID += 1
-    room = max(512, budget)
-    error = ""
-    for _ in range(max(1, state.COMPACT_SUMMARY_TRIMS)):
-        try:
-            data = chat(
-                [{"role": "system", "content": config.COMPACT_SUMMARY_PROMPT}]
-                + _fit_head(head, room, scale),
-                model or state.MODEL,
-                temperature=state.TEMPERATURE,
-                conv_id=conv_id,  # tools stay None: this request only writes the note
-            )
-        except errors.ContextOverflow as e:
-            # The head we are trying to summarise is what overflowed: read less of it.
-            error = f"the summarising request was itself too large ({e})"
-            room = max(512, room // 2)
-            continue
-        except (urllib.error.URLError, ConnectionError, OSError) as e:
-            return "", f"the summarising request failed ({e})"
-        except (KeyError, IndexError, TypeError, AttributeError) as e:
-            return "", f"the summarising request returned nothing usable ({e})"
-        finally:
-            state.USAGE_BY_CONV.pop(conv_id, None)  # not the agent's own usage
-        choices = data.get("choices") or [{}]
-        note = (choices[0].get("message") or {}).get("content") or ""
-        if isinstance(note, str) and note.strip():
-            return note.strip(), ""
-        return "", "the model replied with no note"
-    return "", error or "the summarising request kept being rejected"
-
-
-def compact_messages(messages: list, conv_key, model: str = "", reason: str = "manual",
-                     tools: list = None) -> tuple:
-    """Replace a conversation's oldest turns with one handoff note the model wrote.
-
-    The head — everything above the verbatim tail — is pruned first (an oversized tool
-    result keeps only its head and tail, old thinking is dropped): that is what makes
-    room for the summarising request, and the tail stops paying for it on every later
-    request too. Then the model rewrites the head (COMPACT_SUMMARY_PROMPT) and the
-    conversation gives it up for that note, marked with COMPACT_SUMMARY_HEADER so the
-    model knows the harness did the cutting rather than the user.
-
-    Nothing is lost for good — every turn was journaled as it entered the conversation,
-    and the `compact` record names the seqs it replaced, so the sessions tool (or a
-    resume) can read them back. A run that keeps its own journal (a sub-agent) keeps its
-    own compact record in it: the record always goes to `conv_key`'s log.
-
-    Returns (compacted, note) — `note` is what the user is told: what was replaced, or
-    why nothing was.
-    """
-    total = len(messages)
-    if total < state.COMPACT_MIN_MESSAGES:
-        return False, (
-            f"only {total} messages in play — compaction waits for {state.COMPACT_MIN_MESSAGES} "
-            "before there is worth summarising"
-        )
-    start = _system_prefix(messages)
-    used = _context_tokens_used(messages, conv_key)
-    turn_tokens = _turn_tokens(messages)
-    # What the whole request looked like (tool schemas and system prompt included):
-    # the part compaction cannot touch, recorded next to the part it cut.
-    request_tokens = estimate_context_tokens(messages, tools)
-    scale = _token_scale(used, turn_tokens)
-    # With no window known (--context-window unset, nothing probed), compare against
-    # what this conversation is actually using instead of a window we don't have.
-    window = state.CONTEXT_WINDOW if state.CONTEXT_WINDOW > 0 else max(used, 1)
-    keep_tokens = max(1, window * state.COMPACT_KEEP_TOKENS_PCT // 100)
-    # The budget is the server's number, the turns are ours: scale reads them in the
-    # same units, so a reported usage of 18k against a 4k-looking conversation cuts
-    # where 18k says it should instead of finding nothing to drop.
-    cut = _compact_cut(messages, keep_tokens, scale)
-    if cut <= start:
-        return False, "nothing is older than the verbatim tail — there is nothing to replace"
-
-    dropped = messages[start:cut]
-    head, pruned = [], 0
-    for msg in dropped:
-        shrunk, saved = _compact_prune(msg)
-        head.append(shrunk)
-        pruned += saved
-    tail_pruned = _compact_tail_prune(messages[cut:])  # the turns that stay, too
-    # Room the summarising request gets: it carries the head it is condensing and the
-    # note it is writing, but not the tail — so what is left after reserving the note
-    # (roughly COMPACT_SUMMARY_LIMIT tokens) is what it may read. _fit_head trims the
-    # oldest turns out of it, and _compact_summary trims again if it is still refused.
-    budget = max(512, window - config.COMPACT_SUMMARY_LIMIT // 4)
-    note, note_error = _compact_summary(head, budget, model, scale)
-
-    span = journal._session_span(conv_key, start, cut)
-    summary_msg = {
-        "role": "user",
-        "content": config.COMPACT_SUMMARY_HEADER
-        + "\n\n"
-        + (
-            caps._truncate(
-                note,
-                config.COMPACT_SUMMARY_LIMIT,
-                hint="the full transcript is in the session log (sessions tool)",
-            )
-            if note
-            else config.COMPACT_FALLBACK_NOTE
-        )
-        + "\n\n"
-        + journal._transcript_note(conv_key, span),
-    }
-
-    seq_now = state.SESSION_SEQ.get(conv_key)
-    summary_seq = seq_now + 1 if isinstance(seq_now, int) else None  # this record takes seq_now
-    journal._session_append(conv_key, {
-        "type": "compact",
-        "reason": reason,
-        "replaced": span,
-        "dropped": len(dropped),
-        "kept": total - len(dropped),
-        "summary_seq": summary_seq,
-        "summary": "model" if note else "fallback",
-        "summary_error": note_error or None,
-        "pruned_chars": pruned + tail_pruned,
-        "window": window,
-        "used_tokens": used,
-        "turn_tokens": turn_tokens,  # what the turns alone looked like (chars/4); the
-        # gap between it and used_tokens is what the server counts on top — the scale
-        # the cut was made with, recorded so a reader can re-derive the cut.
-        "token_scale": round(scale, 3),
-        "request_tokens": request_tokens,  # the whole request, fixed overhead included
-        "keep_tokens": keep_tokens,
-    })
-
-    messages[start:cut] = [summary_msg]
-    written = journal._session_message(summary_msg, conv_key)
-    entries = state.SESSION_MSG_SEQ.get(conv_key)
-    if entries is not None:
-        # Keep the seq list aligned with the conversation it describes: the summary
-        # takes the slot the replaced turns occupied.
-        if written >= 0:
-            entries.pop()  # the seq _session_message just appended at the end
-            entries[start:cut] = [written]
-        else:
-            entries[start:cut] = [None]
-
-    stats = state.COMPACT_STATS.setdefault(conv_key, {"rounds": 0, "dropped": 0})
-    stats["rounds"] += 1
-    stats["dropped"] += len(dropped)
-    # The server's last token count described the conversation *before* the cut, so it
-    # is no evidence about the one we now have — leaving it in place would make the
-    # proactive trigger compact again on every following turn. Until the next reply
-    # reports usage, /status and the trigger fall back to the estimate.
-    state.USAGE_BY_CONV.pop(conv_key, None)
-
-    report = (
-        f"compacted {len(dropped)} turns into a handoff note: {total} → {len(messages)} "
-        f"messages, {total - cut} kept verbatim"
-    )
-    if pruned or tail_pruned:
-        report += f", {pruned + tail_pruned} chars pruned first"
-    if span:
-        report += f" (transcript seqs {span[0]}–{span[1]} still readable)"
-    if not note:
-        report += f" — {note_error}, so the note is a placeholder; the turns still went"
-    return True, report
-
-
-def _compact_if_needed(messages: list, conv_key, model: str = "", tools: list = None) -> bool:
-    """Proactive trigger: compact before the next request once this conversation's
-    turns cross COMPACT_THRESHOLD_PCT of the window, rather than waiting for the server
-    to refuse the request (what the server reported for it wins when it has said so —
-    see _context_tokens_used for what is measured and why the fixed overhead is left
-    out).
-
-    Says what it did (or, once per conversation, why it is stuck) so a session that
-    compacts itself is visible instead of mysterious. Returns whether it compacted.
-    """
-    if not state.AUTO_COMPACT or state.CONTEXT_WINDOW <= 0:
-        return False  # no window to compare against: the reactive trigger covers that
-    used = _context_tokens_used(messages, conv_key)
-    threshold = max(1, state.CONTEXT_WINDOW * state.COMPACT_THRESHOLD_PCT // 100)
-    if used < threshold:
-        return False
-    ok, note = compact_messages(
-        messages, conv_key, model=model, reason="proactive", tools=tools
-    )
-    if ok:
-        print(state.OUTPUT_INDENT + render.colorize(f"{render.icon('wait')} {note}", "dim"))
-        return True
-    stats = state.COMPACT_STATS.setdefault(conv_key, {"rounds": 0, "dropped": 0, "warned": False})
-    if not stats.get("warned"):
-        # Said once: the threshold will keep being crossed from here, and repeating the
-        # same refusal every turn is noise.
-        stats["warned"] = True
-        print(
-            state.OUTPUT_INDENT
-            + render.colorize(
-                f"{render.icon('wait')} context is {used}/{state.CONTEXT_WINDOW} tokens but not compacting: {note}",
-                "dim",
-            )
-        )
-    return False
-
-
-def _recover_overflow(messages: list, conv_key, model: str, reason: str,
-                      attempts: int, tools: list = None) -> bool:
-    """Reactive trigger: the server rejected the prompt for being too long. Compact and
-    let the caller retry the turn — up to COMPACT_MAX_ATTEMPTS times, which is why the
-    caller counts them.
-
-    The rejection is said out loud first (`reason` is the server's own wording): a
-    session that silently re-sent a shrunken prompt is hard to trust afterwards.
-    Returns False when the run is genuinely out of context: the attempts are spent, or
-    there is nothing left that compaction could drop.
-    """
-    if attempts >= state.COMPACT_MAX_ATTEMPTS:
-        return False
-    if not state.AUTO_COMPACT:
-        print(
-            state.OUTPUT_INDENT
-            + render.colorize(f"{render.icon('wait')} context is full ({reason}) and auto-compaction is off — /compact to make room", "dim")
-        )
-        return False
-    print(state.OUTPUT_INDENT + render.colorize(f"{render.icon('wait')} the server rejected the prompt: {reason}", "error"))
-    ok, note = compact_messages(
-        messages, conv_key, model=model, reason="overflow", tools=tools
-    )
-    if not ok:
-        print(
-            state.OUTPUT_INDENT
-            + render.colorize(f"{render.icon('error')} context is full and compaction cannot help: {note}", "error")
-        )
-        return False
-    print(state.OUTPUT_INDENT + render.colorize(f"{render.icon('wait')} {note} — retrying the request", "tool"))
-    return True
-
-
-def set_auto_compact(arg: str) -> str:
-    """Apply an /auto-compact argument; return the status line to print ('' = unknown)."""
-    v = arg.strip().lower()
-    if v in ("on", "true", "yes", "1"):
-        state.AUTO_COMPACT = True
-        return f"auto-compact on — compaction starts at {state.COMPACT_THRESHOLD_PCT}% of the window"
-    if v in ("off", "false", "no", "0"):
-        state.AUTO_COMPACT = False
-        return "auto-compact off — only /compact (and a rejected request) will compact"
-    if v.startswith("threshold"):
-        rest = v[len("threshold"):].strip()
-        try:
-            state.COMPACT_THRESHOLD_PCT = caps._clamp_int(int(rest), 1, config.COMPACT_THRESHOLD_CEILING)
-        except ValueError:
-            return ""
-        return f"auto-compact threshold: {state.COMPACT_THRESHOLD_PCT}% of the context window"
-    if not v:
-        return (
-            f"auto-compact {'on' if state.AUTO_COMPACT else 'off'} at "
-            f"{state.COMPACT_THRESHOLD_PCT}% of the window (/auto-compact on|off|threshold N)"
-        )
-    return ""
-
-
-def format_compaction() -> str:
-    """The /status line on compaction: what it would do, and what it already did."""
-    window = f"{state.CONTEXT_WINDOW} tokens" if state.CONTEXT_WINDOW > 0 else "window unknown"
-    rounds = sum(int(s.get("rounds", 0)) for s in state.COMPACT_STATS.values())
-    dropped = sum(int(s.get("dropped", 0)) for s in state.COMPACT_STATS.values())
-    done = f"{rounds} round(s), {dropped} turns replaced" if rounds else "no compactions yet"
-    return (
-        f"compaction: auto-compact {'on' if state.AUTO_COMPACT else 'off'} at "
-        f"{state.COMPACT_THRESHOLD_PCT}% of {window}, tail keeps {state.COMPACT_KEEP_TOKENS_PCT}% of it "
-        f"({config.COMPACT_KEEP_MIN_MESSAGES} messages minimum); {done}; /compact to do it now"
-    )
 
 
 # ---------------------------------------------------------------- tools
@@ -1478,14 +1032,14 @@ def tool_task(args: dict) -> str:
                 depth=state._AGENT_DEPTH + 1,
                 conv_id=conv_id,
             )
-        except StreamInterrupted as e:
+        except errors.StreamInterrupted as e:
             # The user interrupted the sub-agent (or something it delegated).
             # Keep whatever it managed to say, then bubble the stop up: a
             # double ESC means "stop", not "carry on with half the work".
             interrupted = True
             interrupt_note = ((e.message or {}).get("content") or "").strip()
             code = 0
-        except SubagentStepLimit:
+        except errors.SubagentStepLimit:
             step_limited = True
             code = config.SUBAGENT_STEP_LIMIT_CODE
     finally:
@@ -1542,7 +1096,7 @@ def tool_task(args: dict) -> str:
             body = final[len(config.SUBAGENT_INTERRUPT_PREFIX):]  # wrapped already, deeper up
         else:
             body = f"\n{final}" if final else ""
-        raise SubagentInterrupted(
+        raise errors.SubagentInterrupted(
             {"role": "assistant", "content": config.SUBAGENT_INTERRUPT_PREFIX + body}
         )
     return f"exit code: {code}\n{final}"
@@ -2657,570 +2211,7 @@ def _mcp_server_tools(server: str) -> list:
 # ---------------------------------------------------------------- line editor
 
 
-class StreamInterrupted(Exception):
-    """The user interrupted a streaming response (double ESC)."""
-
-    def __init__(self, message: dict):
-        super().__init__("stream interrupted")
-        self.message = message  # the partial assistant message
-
-
-class SubagentInterrupted(StreamInterrupted):
-    """A `task` tool call was interrupted, so the stop must bubble up.
-
-    Raised by `tool_task` when the user interrupts a sub-agent: every agent in
-    the delegation chain stops too, instead of the parent carrying on with the
-    half-finished sub-agent as if it had succeeded. `message["content"]` carries
-    the note (and any partial output) the delegating agent gets as the tool
-    result.
-    """
-
-
-class SubagentStepLimit(Exception):
-    """A sub-agent used up its allowed model turns (`SUBAGENT_STEP_LIMIT`).
-
-    A signal rather than a return code: an exit code would be indistinguishable
-    from a code the sub-agent's own `exit` call chose. Only `tool_task` ever
-    sees it — sub-agents are the only capped runs.
-    """
-
-
-def _response_socket(resp):
-    """Best-effort: the underlying socket of a urllib response (for shutdown).
-
-    Older Pythons wrap the socket in a SocketFile (resp.fp.fp.raw._sock);
-    Python 3.14+ removed it, so resp.fp is the BufferedReader directly
-    (resp.fp.raw._sock). Try both layouts.
-    """
-    for attr in ("fp.fp.raw._sock", "fp.raw._sock"):
-        try:
-            obj = resp
-            for part in attr.split("."):
-                obj = getattr(obj, part)
-            return obj
-        except AttributeError:
-            continue
-    return None
-
-
-class ContextProgress:
-    """Shows a "sending context" progress line while waiting for the LLM's
-    first token, for large requests only (estimated >= CONTEXT_PROGRESS_THRESHOLD
-    tokens). The line appears CONTEXT_PROGRESS_DELAY seconds in, reports the
-    request-body upload (percent + tokens sent so far) while it is in flight,
-    then the elapsed wait, and is cleared when the wait ends.
-
-    Only active when stdout is a TTY. If lines are printed below the progress
-    line (e.g. the double-ESC hint), the line freezes so a redraw can't
-    clobber them, and stop() clears the right line.
-    """
-
-    def __init__(self, messages: list, tools: list = None):
-        self.tokens = estimate_context_tokens(messages, tools)
-        self.upload = None  # _UploadProgress, set by _open_request before sending
-        self._stop = threading.Event()
-        self._thread = None
-        self._drawn = False
-        self._hint_before = False
-        self._lock = threading.Lock()
-        self._t0 = time.monotonic()
-        self.extra_lines = 0  # lines printed below the progress line
-
-    @property
-    def active(self) -> bool:
-        return self._thread is not None
-
-    def start(self):
-        if self.tokens < config.CONTEXT_PROGRESS_THRESHOLD:
-            return
-        if not sys.stdout.isatty():
-            return
-        self._t0 = time.monotonic()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._stop.set()
-        thread = self._thread
-        self._thread = None
-        if (
-            thread is not None
-            and thread.is_alive()
-            and thread is not threading.current_thread()
-        ):
-            thread.join(timeout=2.0)
-        with self._lock:
-            if self._drawn:
-                self._drawn = False
-                if not self._hint_before and self.extra_lines:
-                    # lines were printed below us (e.g. the esc hint): move
-                    # back up to the progress line before clearing it
-                    sys.stdout.write(f"\x1b[{self.extra_lines}A")
-                sys.stdout.write("\r\x1b[2K")
-                sys.stdout.flush()
-
-    def note_lines_below(self, n: int):
-        """Called when `n` lines are printed below the progress line."""
-        self.extra_lines += n
-
-    def _run(self):
-        if self._stop.wait(state.CONTEXT_PROGRESS_DELAY):
-            return
-        with self._lock:
-            self._hint_before = self.extra_lines > 0
-            self._drawn = True
-            sys.stdout.write(self._line())
-            sys.stdout.flush()
-        while not self._stop.is_set():
-            if self._stop.wait(0.5):
-                return
-            if self.extra_lines:
-                # something was printed below us (e.g. the esc hint); freeze
-                # the line so the redraw can't clobber it
-                continue
-            with self._lock:
-                sys.stdout.write("\r\x1b[2K" + self._line())
-                sys.stdout.flush()
-
-    def _line(self) -> str:
-        elapsed = render._format_elapsed(time.monotonic() - self._t0)
-        upload = self.upload
-        if upload is None or upload.sent >= upload.total:
-            text = (
-                f"{render.icon('wait')} waiting for first token "
-                f"({render._format_tokens(self.tokens)} tokens) {elapsed}"
-            )
-        else:
-            pct = upload.sent * 100 // upload.total
-            sent_tokens = self.tokens * upload.sent // upload.total
-            text = (
-                f"{render.icon('wait')} sending context… {pct}% "
-                f"({render._format_tokens(sent_tokens)}/{render._format_tokens(self.tokens)} tokens) "
-                f"{elapsed}"
-            )
-        return state.OUTPUT_INDENT + render.colorize(text, "dim")
-
-
 # ---------------------------------------------------------------- client
-
-
-def normalize_api_url(url: str | None) -> str:
-    """Return the chat completions endpoint for a given API URL.
-
-    Accepts either a full endpoint (``https://openrouter.ai/api/v1/chat/completions``)
-    or just a base URL (``https://openrouter.ai/api/v1``), which gets
-    ``/chat/completions`` appended. A trailing slash is tolerated.
-    """
-    endpoint = (url or "").strip().rstrip("/")
-    if not endpoint or endpoint.endswith("/chat/completions"):
-        return endpoint
-    return endpoint + "/chat/completions"
-
-
-def _headers() -> dict:
-    headers = {"Content-Type": "application/json"}
-    if state.API_KEY:
-        headers["Authorization"] = f"Bearer {state.API_KEY}"
-    return headers
-
-
-def probe_context_window() -> int:
-    """Best-effort: query the API's /models endpoint for the context window size.
-
-    Returns the model's context window in tokens, or 0 if it cannot be
-    determined (server unreachable, no /models endpoint, field missing).
-    """
-    if not state.API_URL.endswith("/chat/completions"):
-        return 0
-    models_url = state.API_URL[: -len("/chat/completions")] + "/models"
-    try:
-        req = urllib.request.Request(models_url, headers=_headers())
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except Exception:
-        return 0
-    models = data.get("data") or []
-    if not models:
-        return 0
-    model = models[0]
-    if len(models) > 1:
-        for m in models:
-            if m.get("id") == state.MODEL:
-                model = m
-                break
-
-    def _as_int(v):
-        return int(v) if isinstance(v, (int, float)) and v > 0 else 0
-
-    # OpenAI/OpenRouter use context_length; llama.cpp exposes meta.n_ctx.
-    return _as_int(model.get("context_length")) or _as_int(
-        (model.get("meta") or {}).get("n_ctx")
-    )
-
-
-def _record_usage(messages: list, usage, conv_id: int = None) -> None:
-    """Remember the server-reported token usage for a conversation.
-
-    Keyed by an explicit conversation id when given (MAIN_CONV_ID for the
-    top-level conversation, a unique counter per sub-agent run), else by
-    id(messages). Explicit ids matter: id() is a memory address, and a
-    freed sub-agent messages list can be reallocated at the same address,
-    which would make /status resurrect stale sub-agent usage. Sub-agent
-    entries are deleted when the sub-agent finishes (tool_task).
-
-    The same key journals the call: a `usage` record is the log's record of
-    how full the context was at that point — what a compaction trigger, and a
-    post-mortem, both need.
-    """
-    if isinstance(usage, dict) and usage.get("prompt_tokens"):
-        key = conv_id if conv_id is not None else id(messages)
-        state.USAGE_BY_CONV[key] = usage
-        journal._session_append(
-            key,
-            {"messages": len(messages), "usage": usage, "type": "usage"},
-        )
-
-
-class _UploadProgress:
-    """Bytes-sent counter for a request body (updated by the counting opener)."""
-
-    def __init__(self, total: int):
-        self.total = total
-        self.sent = 0
-        self.on_socket = None  # called with the connection socket once open
-
-    def add(self, n: int):
-        self.sent = min(self.total, self.sent + n)
-
-
-def _progress_opener(upload: _UploadProgress) -> urllib.request.OpenerDirector:
-    """A urllib opener whose HTTP(S) connections report body upload progress.
-
-    Large writes are sent in PROGRESS_CHUNK pieces (http.client would
-    otherwise sendall() the whole body at once, so no progress would be
-    observable). All other urllib behavior (proxies, redirects, https,
-    timeouts) is unchanged.
-    """
-
-    def make_handler(base):
-        class Handler(base):
-            # Before the stock HTTP/HTTPS handlers (order 500) so ours wins.
-            handler_order = 499
-
-            def do_open(self, http_class, request, **kwargs):
-                class Counting(http_class):
-                    def connect(self):
-                        super().connect()
-                        # Report the socket as soon as it exists so a
-                        # double ESC can close it to abort the send.
-                        if upload.on_socket is not None:
-                            upload.on_socket(self.sock)
-
-                    def send(self, data):
-                        total = len(data)
-                        if total <= config.PROGRESS_CHUNK:
-                            return super().send(data)
-                        mv = memoryview(data)
-                        for i in range(0, total, config.PROGRESS_CHUNK):
-                            piece = bytes(mv[i : i + config.PROGRESS_CHUNK])
-                            super().send(piece)
-                            upload.add(len(piece))
-
-                return super(Handler, self).do_open(Counting, request, **kwargs)
-
-        return Handler()
-
-    opener = urllib.request.build_opener()
-    opener.add_handler(make_handler(urllib.request.HTTPHandler))
-    opener.add_handler(make_handler(urllib.request.HTTPSHandler))
-    return opener
-
-
-def _open_request(req: urllib.request.Request, progress=None, on_socket=None):
-    """urlopen `req`; if `progress` (a ContextProgress) is given, track the
-    request-body upload in it (progress.upload is set before sending); if
-    `on_socket` is given it is called with the connection socket once open,
-    so an interrupt can close it to abort the send."""
-    if progress is None and on_socket is None:
-        return urllib.request.urlopen(req, timeout=600)
-    upload = _UploadProgress(len(req.data or b""))
-    if progress is not None:
-        progress.upload = upload
-    upload.on_socket = on_socket
-    return _progress_opener(upload).open(req, timeout=600)
-
-
-def chat(
-    messages: list,
-    model: str,
-    tools: list = None,
-    temperature: float = 1.0,
-    conv_id: int = None,
-) -> dict:
-    payload = json.dumps(
-        _request_body(messages, model, tools=tools, temperature=temperature)
-    ).encode("utf-8")
-    req = urllib.request.Request(state.API_URL, data=payload, headers=_headers())
-    spinner = ContextProgress(messages, tools)
-    spinner.start()
-    try:
-        with _open_request(req, spinner if spinner.active else None) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        # A prompt the server refuses because it is too long is something the agent can
-        # act on — compact and retry. Anything else stays the error it was.
-        reason = errors._context_overflow_reason(e)
-        if reason:
-            raise errors.ContextOverflow(reason) from e
-        raise
-    finally:
-        spinner.stop()
-    _record_usage(messages, data.get("usage"), conv_id)
-    return data
-
-
-def _request_body(
-    messages: list,
-    model: str,
-    stream=None,
-    tools: list = None,
-    temperature: float = 1.0,
-) -> dict:
-    """What a chat request sends.
-
-    `stream=None` (the non-streaming call) omits the key entirely. `tools` is the list of
-    tool schemas this request may answer with: None or empty sends none — a request whose
-    job is to write something, like a compaction handoff note, must not be one the server
-    answers with a tool call. Which schemas the agent's own turns advertise is the agent
-    layer's call (`_active_tools`); this layer is told, it does not decide.
-    """
-    body: dict = {"model": model, "messages": messages, "temperature": temperature}
-    if tools:
-        body["tools"] = tools
-        body["tool_choice"] = "auto"
-    if stream is not None:
-        body["stream"] = stream
-        if stream:
-            # Ask for a final usage chunk so /status can show exact token counts.
-            body["stream_options"] = {"include_usage": True}
-    return body
-
-
-def _build_request(
-    messages: list,
-    model: str,
-    stream: bool,
-    tools: list = None,
-    temperature: float = 1.0,
-) -> urllib.request.Request:
-    payload = json.dumps(
-        _request_body(messages, model, stream, tools=tools, temperature=temperature)
-    ).encode("utf-8")
-    return urllib.request.Request(state.API_URL, data=payload, headers=_headers())
-
-
-def parse_sse_line(line: str):
-    """Parse one SSE line from a streaming chat response.
-
-    Returns the delta dict for data lines, a {"usage": ...} dict for the
-    final usage chunk (when stream_options.include_usage is set), the
-    string "[DONE]" for the terminator, or None for comments/blank/
-    malformed lines.
-    """
-    line = line.strip()
-    if not line.startswith("data:"):
-        return None
-    data = line[5:].strip()
-    if data == "[DONE]":
-        return "[DONE]"
-    try:
-        chunk = json.loads(data)
-    except json.JSONDecodeError:
-        return None
-    usage = chunk.get("usage")
-    if usage:
-        return {"usage": usage}
-    choices = chunk.get("choices") or []
-    if not choices:
-        return None
-    return choices[0].get("delta") or {}
-
-
-def stream_chat(
-    messages: list,
-    model: str,
-    tools: list = None,
-    temperature: float = 1.0,
-    watcher=None,
-    progress=None,
-    conv_id: int = None,
-):
-    """Yield deltas from a streaming chat response until [DONE].
-
-    `tools` is what this request advertises (see _request_body). If `watcher` (an
-    InterruptWatcher) is given, the connection and response sockets are attached to it and
-    the stream stops once it is triggered: a double ESC during the request-body upload
-    closes the upload socket and aborts the send. If `progress` (a ContextProgress) is
-    given, the request-body upload is tracked in it.
-    """
-    req = _build_request(messages, model, stream=True, tools=tools, temperature=temperature)
-    try:
-        resp_cm = _open_request(req, progress, watcher.attach_socket if watcher else None)
-    except urllib.error.HTTPError as e:
-        # Refused before the stream even started: if it is a size rejection, raise the
-        # thing the agent loop knows how to recover from.
-        reason = errors._context_overflow_reason(e)
-        if reason:
-            raise errors.ContextOverflow(reason) from e
-        if watcher is None or not watcher.triggered:
-            raise
-        return
-    except (OSError, http.client.HTTPException):
-        # An interrupt during the context send closes the socket, which
-        # surfaces as a send error; swallow it only when the interrupt
-        # caused it.
-        if watcher is None or not watcher.triggered:
-            raise
-        return
-    with resp_cm as resp:
-        if watcher is not None:
-            watcher.attach_socket(_response_socket(resp))
-        try:
-            for raw in resp:
-                if watcher is not None and watcher.triggered:
-                    break
-                parsed = parse_sse_line(raw.decode("utf-8"))
-                if parsed is None:
-                    continue
-                if parsed == "[DONE]":
-                    break
-                if "usage" in parsed:
-                    _record_usage(messages, parsed["usage"], conv_id)
-                    continue
-                yield parsed
-        except (OSError, http.client.HTTPException):
-            # An interrupt closes the socket, which surfaces as a read
-            # error here; swallow it only when the interrupt caused it.
-            if watcher is None or not watcher.triggered:
-                raise
-
-
-def accumulate_delta(message: dict, delta: dict) -> dict:
-    """Merge a streaming delta into an assistant message in place."""
-    if not delta:
-        return message
-    content = delta.get("content")
-    if content:
-        message["content"] = message.get("content", "") + content
-    reasoning = delta.get("reasoning_content")
-    if reasoning:
-        message["reasoning_content"] = message.get("reasoning_content", "") + reasoning
-    for tc in delta.get("tool_calls") or []:
-        idx = int(tc.get("index", 0))
-        calls = message.setdefault("tool_calls", [])
-        while len(calls) <= idx:
-            calls.append(
-                {
-                    "id": "",
-                    "type": "function",
-                    "function": {"name": "", "arguments": ""},
-                }
-            )
-        target = calls[idx]
-        if tc.get("id"):
-            target["id"] = tc["id"]
-        fn = tc.get("function") or {}
-        if fn.get("name"):
-            target["function"]["name"] += fn["name"]
-        if fn.get("arguments"):
-            target["function"]["arguments"] += fn["arguments"]
-    return message
-
-
-def stream_once(
-    messages: list,
-    model: str,
-    tools: list = None,
-    temperature: float = 1.0,
-    conv_id: int = None,
-) -> tuple[dict, bool]:
-    """Stream one chat turn, printing reasoning and content live.
-
-    Returns (message, streamed) where streamed is False if no deltas
-    arrived (e.g. server ignored stream mode) — caller should fall back.
-    Raises StreamInterrupted (carrying the partial message) if the user
-    interrupts with a double ESC.
-    """
-    message = {"role": "assistant"}
-    started_reasoning = False
-    renderer = None
-    streamed = False
-    watcher = lineedit.InterruptWatcher() if state.INTERRUPT_ENABLED else None
-    if watcher is not None:
-        watcher.start()
-    spinner = ContextProgress(messages, tools)
-    spinner.start()
-    if watcher is not None:
-        # the esc hint prints 2 lines below the progress line; tell the
-        # spinner so it can clear the right line on stop
-        watcher.on_hint = lambda: spinner.note_lines_below(2)
-    try:
-        for delta in stream_chat(
-            messages,
-            model,
-            tools=tools,
-            temperature=temperature,
-            watcher=watcher,
-            progress=spinner if spinner.active else None,
-            conv_id=conv_id,
-        ):
-            spinner.stop()
-            streamed = True
-            reasoning = delta.get("reasoning_content")
-            if reasoning:
-                if not started_reasoning:
-                    print(
-                        state.OUTPUT_INDENT
-                        + render.colorize(f"{render.icon('thinking')} thinking: ", "thinking"),
-                        end="",
-                        flush=True,
-                    )
-                    started_reasoning = True
-                print(reasoning, end="", flush=True)
-            content = delta.get("content")
-            if content:
-                if renderer is None:
-                    if started_reasoning:
-                        print()
-                    label = f"{render.icon('assistant')} assistant> "
-                    print(
-                        state.OUTPUT_INDENT + render.colorize(label, "assistant"),
-                        end="",
-                        flush=True,
-                    )
-                    renderer = render.MarkdownRenderer(
-                        indent=render.display_width(state.OUTPUT_INDENT + label)
-                    )
-                renderer.write(content)
-            accumulate_delta(message, delta)
-    finally:
-        if watcher is not None:
-            watcher.stop()
-        spinner.stop()
-    if watcher is not None and watcher.triggered:
-        if started_reasoning:
-            print()
-        if renderer is not None:
-            renderer.flush()
-            print()
-        print(state.OUTPUT_INDENT + render.colorize("(interrupted)", "dim"))
-        raise StreamInterrupted(message)
-    if started_reasoning:
-        print()
-    if renderer is not None:
-        renderer.flush()
-        print()
-    return message, streamed
 
 
 def execute_tool(name: str, raw_args: str) -> str:
@@ -3246,7 +2237,7 @@ def execute_tool(name: str, raw_args: str) -> str:
     else:
         try:
             result = str(fn(args))
-        except (errors.ExitSignal, StreamInterrupted):
+        except (errors.ExitSignal, errors.StreamInterrupted):
             # Control-flow, not a tool failure: `exit` ends the agent's loop,
             # an interrupt ends the whole delegation chain.
             raise
@@ -3520,31 +2511,10 @@ def tools_menu(keys=None) -> bool:
     return applied
 
 
-def estimate_context_chars(messages: list, tools: list = None) -> int:
-    """Approximate character count of the next request payload.
-
-    Counts the tool schemas the request will advertise (`tools`, see _request_body — the
-    caller decides them) plus all message content (text, reasoning, tool-call arguments).
-    Dividing by 4 gives a rough token estimate — the same heuristic /status uses.
-    """
-    total = len(json.dumps(tools or []))
-    for m in messages:
-        total += caps._content_chars(m.get("content"))
-        total += len(m.get("reasoning_content") or "")
-        for tc in m.get("tool_calls") or []:
-            total += len((tc.get("function") or {}).get("arguments") or "")
-    return total
-
-
-def estimate_context_tokens(messages: list, tools: list = None) -> int:
-    """Rough token count of the next request (chars/4)."""
-    return estimate_context_chars(messages, tools) // 4
-
-
 def format_status(messages: list, context_window: int = 0, conv_id: int = None) -> str:
     """Build the /status report: context usage, API URL, tool names, MCP servers."""
     tools = _active_tools(True)
-    total_chars = estimate_context_chars(messages, tools)
+    total_chars = measure.estimate_context_chars(messages, tools)
     approx_tokens = total_chars // 4
     usage = state.USAGE_BY_CONV.get(conv_id if conv_id is not None else id(messages))
     prompt_tokens = (
@@ -3567,7 +2537,7 @@ def format_status(messages: list, context_window: int = 0, conv_id: int = None) 
         f"api url: {state.API_URL}",
         f"tools: {tool_names}",
         f"session: {state.SESSION_ID or '(no session id)'}  {journal._session_note()}",
-        format_compaction(),
+        compact.format_compaction(),
     ]
     if state.MCP_CLIENTS:
         mcp_lines = []
@@ -3767,7 +2737,7 @@ def _agent_loop(
                 "error",
             )
         )
-        raise SubagentStepLimit(f"sub-agent exceeded {state.SUBAGENT_STEP_LIMIT} model turns")
+        raise errors.SubagentStepLimit(f"sub-agent exceeded {state.SUBAGENT_STEP_LIMIT} model turns")
 
     while True:
         if is_subagent and state.SUBAGENT_STEP_LIMIT and steps >= state.SUBAGENT_STEP_LIMIT:
@@ -3789,7 +2759,7 @@ def _agent_loop(
         # What this turn advertises is the agent's decision (which tools the model may
         # call); the request layer only sends the list it is handed — see _request_body.
         tools = _active_tools(interactive)
-        _compact_if_needed(messages, conv_key, model, tools)
+        compact._compact_if_needed(messages, conv_key, model, tools)
         steps += 1
         # A rejected-for-size prompt gets retried after compacting — one turn either
         # way, so `steps` counts it once, and `attempts` is how many times compaction
@@ -3799,7 +2769,7 @@ def _agent_loop(
             message = None
             streamed = False
             try:
-                message, streamed = stream_once(
+                message, streamed = request.stream_once(
                     messages,
                     model,
                     tools=tools,
@@ -3809,7 +2779,7 @@ def _agent_loop(
                 if not streamed:
                     message = None
             except errors.ContextOverflow as e:
-                if not _recover_overflow(messages, conv_key, model, str(e), attempts, tools):
+                if not compact._recover_overflow(messages, conv_key, model, str(e), attempts, tools):
                     print(
                         state.OUTPUT_INDENT
                         + render.colorize(f"{render.icon('error')} out of context ({e}) — this run stops here", "error")
@@ -3818,7 +2788,7 @@ def _agent_loop(
                     return config.CONTEXT_OVERFLOW_CODE
                 attempts += 1
                 continue
-            except StreamInterrupted as e:
+            except errors.StreamInterrupted as e:
                 # Keep the partial output (minus any half-formed tool calls,
                 # which would leave the conversation in an invalid state) so
                 # the model can see what it had said, then back out. Partials
@@ -3846,7 +2816,7 @@ def _agent_loop(
                 )
             if message is None:
                 try:
-                    data = chat(
+                    data = request.chat(
                         messages,
                         model,
                         tools=tools,
@@ -3854,7 +2824,7 @@ def _agent_loop(
                         conv_id=conv_id,
                     )
                 except errors.ContextOverflow as e:
-                    if not _recover_overflow(messages, conv_key, model, str(e), attempts, tools):
+                    if not compact._recover_overflow(messages, conv_key, model, str(e), attempts, tools):
                         print(
                             state.OUTPUT_INDENT
                             + render.colorize(f"{render.icon('error')} out of context ({e}) — this run stops here", "error")
@@ -3927,7 +2897,7 @@ def _agent_loop(
                 if closing_turn:
                     _step_limited()  # a capped run reports itself capped
                 return e.code
-            except StreamInterrupted as e:
+            except errors.StreamInterrupted as e:
                 # A tool (the task tool) was interrupted. Answer this call and
                 # every remaining one in the batch — a server rejects an
                 # assistant message whose tool calls were never answered — then
@@ -4129,7 +3099,7 @@ def main():
     )
     args = parser.parse_args()
 
-    state.API_URL = normalize_api_url(args.api_url)
+    state.API_URL = request.normalize_api_url(args.api_url)
     state.API_KEY = args.api_key
     state.MODEL = args.model
     state.TEMPERATURE = args.temperature
@@ -4145,7 +3115,7 @@ def main():
 
     context_window = args.context_window
     if context_window == 0 and args.prompt is None:
-        context_window = probe_context_window()
+        context_window = request.probe_context_window()
     # The compaction triggers compare against this: 0 (no flag, nothing probed) means
     # no proactive compaction — the reactive one still fires if the server complains.
     state.CONTEXT_WINDOW = max(0, int(context_window or 0))
@@ -4345,14 +3315,14 @@ def main():
                         print(render.colorize(f"{name}: {toggled}", "dim"))
             continue
         if user_input == "/auto-compact" or user_input.startswith("/auto-compact "):
-            msg = set_auto_compact(user_input[len("/auto-compact"):])
+            msg = compact.set_auto_compact(user_input[len("/auto-compact"):])
             if msg:
                 print(render.colorize(msg, "dim"))
             else:
                 print(render.colorize("usage: /auto-compact on|off|threshold N", "error"))
             continue
         if user_input == "/compact":
-            ok, note = compact_messages(
+            ok, note = compact.compact_messages(
                 messages, state.MAIN_CONV_ID, model=args.model, reason="manual",
                 tools=_active_tools(True),
             )
