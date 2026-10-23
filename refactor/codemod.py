@@ -142,13 +142,7 @@ STAGES = {
         "_shell_timeout", "tool_run_shell",
     ]},
     "agent": {"agent": [
-        "TOOLS", "OPENAI_TOOLS", "OPENAI_TOOLS_INTERACTIVE", "DISPATCH",
-        "_prompt_line", "_print_question", "tool_ask_user",
-        "tool_get_cwd", "tool_exit", "tool_mkdir", "tool_read_file", "tool_write_file",
-        "_html_to_text", "tool_fetch_url", "_closing_summary", "tool_task", "execute_tool",
-        "_active_tools", "_all_tool_names", "format_tools", "toggle_tools", "tools_menu",
-        "format_status", "set_auto_send", "commands_menu", "format_help",
-        "run_agent", "_agent_loop",
+        "run_agent", "_agent_loop", "_closing_summary", "_active_tools", "_all_tool_names",
     ]},
 }
 

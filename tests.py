@@ -1,11 +1,13 @@
 """Tests for harnless.py. Run from the repo root: python tests.py"""
 
+import ast
 import base64
 import contextlib
 import email.message
 import io
 import json
 import os
+import pathlib
 import shutil
 import subprocess
 import sys
@@ -2032,9 +2034,9 @@ class TestSubagents(unittest.TestCase):
         return messages, calls
 
     def _fake_run_agent(self, behavior):
-        old = h.run_agent
-        h.run_agent = behavior
-        self.addCleanup(setattr, h, "run_agent", old)
+        old = h.agent.run_agent
+        h.agent.run_agent = behavior
+        self.addCleanup(setattr, h.agent, "run_agent", old)
 
     def test_task_registered_in_both_tool_lists(self):
         all_names = [s["function"]["name"] for s in h.toolspec.OPENAI_TOOLS]
@@ -2053,13 +2055,13 @@ class TestSubagents(unittest.TestCase):
         self.assertTrue(out.startswith("error: sub-agent depth limit reached"))
 
     def test_task_summary_capped(self):
-        def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None):
+        def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None, execute=None):
             messages.append({"role": "assistant", "content": "s" * 30_000})
             return 0
 
-        old = h.run_agent
-        h.run_agent = fake_run_agent
-        self.addCleanup(setattr, h, "run_agent", old)
+        old = h.agent.run_agent
+        h.agent.run_agent = fake_run_agent
+        self.addCleanup(setattr, h.agent, "run_agent", old)
         out = h.tool_task({"task": "do X"})
         self.assertTrue(out.startswith("exit code: 0\n" + "s" * h.config.SUBAGENT_SUMMARY_LIMIT))
         self.assertIn(
@@ -2070,7 +2072,7 @@ class TestSubagents(unittest.TestCase):
     def test_task_runs_nested_agent(self):
         calls = []
 
-        def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None):
+        def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None, execute=None):
             calls.append({
                 "messages": list(messages), "model": model,
                 "interactive": interactive, "temperature": temperature, "depth": depth,
@@ -2078,9 +2080,9 @@ class TestSubagents(unittest.TestCase):
             messages.append({"role": "assistant", "content": "sub summary"})
             return 0
 
-        old = h.run_agent
-        h.run_agent = fake_run_agent
-        self.addCleanup(setattr, h, "run_agent", old)
+        old = h.agent.run_agent
+        h.agent.run_agent = fake_run_agent
+        self.addCleanup(setattr, h.agent, "run_agent", old)
         out = h.tool_task({"task": "do X"})
         self.assertEqual(out, "exit code: 0\nsub summary")
         self.assertEqual(len(calls), 1)
@@ -2094,12 +2096,12 @@ class TestSubagents(unittest.TestCase):
         self.assertEqual(h.state.OUTPUT_INDENT, "")
 
     def test_task_indent_restored_on_error(self):
-        def boom(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None):
+        def boom(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None, execute=None):
             raise RuntimeError("nope")
 
-        old = h.run_agent
-        h.run_agent = boom
-        self.addCleanup(setattr, h, "run_agent", old)
+        old = h.agent.run_agent
+        h.agent.run_agent = boom
+        self.addCleanup(setattr, h.agent, "run_agent", old)
         with self.assertRaises(RuntimeError):
             h.tool_task({"task": "do X"})
         self.assertEqual(h.state.OUTPUT_INDENT, "")
@@ -2108,13 +2110,13 @@ class TestSubagents(unittest.TestCase):
         """Nothing to hand back: the result says so. A bare "exit code: 2" read
         as "the sub-agent found nothing", which is how a lost summary got paid
         for twice."""
-        def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None):
+        def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None, execute=None):
             messages.append({"role": "assistant", "content": ""})
             return 2
 
-        old = h.run_agent
-        h.run_agent = fake_run_agent
-        self.addCleanup(setattr, h, "run_agent", old)
+        old = h.agent.run_agent
+        h.agent.run_agent = fake_run_agent
+        self.addCleanup(setattr, h.agent, "run_agent", old)
         self.assertEqual(h.tool_task({"task": "do X"}), f"exit code: 2\n{h.config.NO_SUMMARY_NOTE}")
 
     # --- the hand-off: what the parent actually receives as the summary ---
@@ -2153,9 +2155,9 @@ class TestSubagents(unittest.TestCase):
             "content": "done",
             "tool_calls": [self._call("exit", {"code": 0, "message": long})],
         }
-        self.assertEqual(h._closing_summary([in_reply], "done"), long)
-        self.assertEqual(h._closing_summary([in_exit], long), long)
-        self.assertEqual(h._closing_summary([in_exit], ""), "done")
+        self.assertEqual(h.agent._closing_summary([in_reply], "done"), long)
+        self.assertEqual(h.agent._closing_summary([in_exit], long), long)
+        self.assertEqual(h.agent._closing_summary([in_exit], ""), "done")
 
     def test_closing_summary_salvages_lesser_sources(self):
         """A reasoning-only ending, or narration left over from an earlier turn,
@@ -2166,7 +2168,7 @@ class TestSubagents(unittest.TestCase):
             "reasoning_content": "answer: main() at 4760",
         }
         self.assertEqual(
-            h._closing_summary([reasoning_only], ""),
+            h.agent._closing_summary([reasoning_only], ""),
             h.config.SALVAGED_SUMMARY_NOTE + "\nanswer: main() at 4760",
         )
         leftover_narration = [
@@ -2174,10 +2176,10 @@ class TestSubagents(unittest.TestCase):
             {"role": "assistant", "content": ""},  # the closing turn: a bare exit
         ]
         self.assertEqual(
-            h._closing_summary(leftover_narration, ""),
+            h.agent._closing_summary(leftover_narration, ""),
             h.config.SALVAGED_SUMMARY_NOTE + "\nnow let me check the tool registry",
         )
-        self.assertEqual(h._closing_summary([{"role": "assistant", "content": ""}], ""), "")
+        self.assertEqual(h.agent._closing_summary([{"role": "assistant", "content": ""}], ""), "")
 
     def test_task_survives_a_reasoning_only_subagent(self):
         """Reasoning models leave `content` empty: the analysis printed live used
@@ -2238,7 +2240,7 @@ class TestSubagents(unittest.TestCase):
 
         messages, _ = self._scripted(decide)
         with contextlib.redirect_stdout(io.StringIO()):
-            code = h.run_agent(messages, "m")
+            code = h.agent.run_agent(messages, "m", execute=h.execute_tool)
         self.assertEqual(code, 3)
         answered = {m["tool_call_id"]: m["content"] for m in messages if m["role"] == "tool"}
         self.assertEqual(sorted(answered), ["a", "b", "c"])
@@ -2246,16 +2248,16 @@ class TestSubagents(unittest.TestCase):
         self.assertIn("skipped", answered["c"])
 
     def test_task_cleans_up_subagent_usage(self):
-        def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None):
+        def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None, execute=None):
             # Simulate the sub-agent's API call recording usage under its
             # own conversation id.
             h.journal._record_usage(messages, {"prompt_tokens": 999999}, conv_id)
             messages.append({"role": "assistant", "content": "done"})
             return 0
 
-        old = h.run_agent
-        h.run_agent = fake_run_agent
-        self.addCleanup(setattr, h, "run_agent", old)
+        old = h.agent.run_agent
+        h.agent.run_agent = fake_run_agent
+        self.addCleanup(setattr, h.agent, "run_agent", old)
         h.tool_task({"task": "do X"})
         # The sub-agent's usage entry must not survive the run: its
         # messages list is freed, and a recycled address would resurrect
@@ -2263,13 +2265,13 @@ class TestSubagents(unittest.TestCase):
         self.assertEqual(h.state.USAGE_BY_CONV, {})
 
     def test_task_usage_cleaned_up_on_error(self):
-        def boom(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None):
+        def boom(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None, execute=None):
             h.journal._record_usage(messages, {"prompt_tokens": 424242}, conv_id)
             raise RuntimeError("nope")
 
-        old = h.run_agent
-        h.run_agent = boom
-        self.addCleanup(setattr, h, "run_agent", old)
+        old = h.agent.run_agent
+        h.agent.run_agent = boom
+        self.addCleanup(setattr, h.agent, "run_agent", old)
         with self.assertRaises(RuntimeError):
             h.tool_task({"task": "do X"})
         self.assertEqual(h.state.USAGE_BY_CONV, {})
@@ -2302,7 +2304,7 @@ class TestSubagents(unittest.TestCase):
         messages, calls = self._scripted(decide)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            code = h.run_agent(messages, "m")
+            code = h.agent.run_agent(messages, "m", execute=h.execute_tool)
         self.assertEqual(code, 0)
         results = [m["content"] for m in messages if m["role"] == "tool"]
         self.assertEqual(len(results), 2)  # both top-level delegations ran
@@ -2323,7 +2325,7 @@ class TestSubagents(unittest.TestCase):
 
         messages, _ = self._scripted(decide)
         with contextlib.redirect_stdout(io.StringIO()):
-            h.run_agent(messages, "m")
+            h.agent.run_agent(messages, "m", execute=h.execute_tool)
         # 0: the parent's first turn, 1: the sub-agent's, 0: the parent's turn
         # after the sub-agent returned — the parent is back at level 0.
         self.assertEqual(depths, [0, 1, 0])
@@ -2347,7 +2349,7 @@ class TestSubagents(unittest.TestCase):
         h.request.stream_once = fake_stream_once
         self.addCleanup(setattr, h.request, "stream_once", old)
         with contextlib.redirect_stdout(io.StringIO()):
-            code = h.run_agent([{"role": "user", "content": "go"}], "m", depth=2)
+            code = h.agent.run_agent([{"role": "user", "content": "go"}], "m", execute=h.execute_tool, depth=2)
         self.assertEqual(code, 7)
         self.assertEqual(depths, [2])
         self.assertEqual(h.state._AGENT_DEPTH, 0)
@@ -2361,7 +2363,7 @@ class TestSubagents(unittest.TestCase):
         self.addCleanup(setattr, h.request, "stream_once", old)
         with self.assertRaises(RuntimeError):
             with contextlib.redirect_stdout(io.StringIO()):
-                h.run_agent([{"role": "user", "content": "go"}], "m", depth=1)
+                h.agent.run_agent([{"role": "user", "content": "go"}], "m", execute=h.execute_tool, depth=1)
         self.assertEqual(h.state._AGENT_DEPTH, 0)
 
     def test_task_failure_does_not_corrupt_parent_depth(self):
@@ -2376,7 +2378,7 @@ class TestSubagents(unittest.TestCase):
 
         messages, calls = self._scripted(decide)
         with contextlib.redirect_stdout(io.StringIO()):
-            code = h.run_agent(messages, "m")
+            code = h.agent.run_agent(messages, "m", execute=h.execute_tool)
         self.assertEqual(code, 0)
         self.assertEqual(calls, [0, 1, 0])
         results = [m["content"] for m in messages if m["role"] == "tool"]
@@ -2386,7 +2388,7 @@ class TestSubagents(unittest.TestCase):
     # --- a double ESC during a sub-agent stops the whole delegation chain ---
 
     def test_task_bubbles_up_subagent_interrupt(self):
-        def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None):
+        def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None, execute=None):
             raise h.errors.StreamInterrupted(
                 {
                     "role": "assistant",
@@ -2406,7 +2408,7 @@ class TestSubagents(unittest.TestCase):
         self.assertEqual(h.state.USAGE_BY_CONV, {})
 
     def test_execute_tool_does_not_swallow_subagent_interrupt(self):
-        def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None):
+        def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None, execute=None):
             raise h.errors.StreamInterrupted({"role": "assistant", "content": "partial"})
 
         self._fake_run_agent(fake_run_agent)
@@ -2434,7 +2436,7 @@ class TestSubagents(unittest.TestCase):
         messages, calls = self._scripted(decide)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            code = h.run_agent(messages, "m")
+            code = h.agent.run_agent(messages, "m", execute=h.execute_tool)
         self.assertEqual(code, 0)
         self.assertEqual(calls, [0, 1])  # the parent does not ask the LLM again
         answered = {m["tool_call_id"]: m["content"] for m in messages if m["role"] == "tool"}
@@ -2456,7 +2458,7 @@ class TestSubagents(unittest.TestCase):
 
         messages, calls = self._scripted(decide)
         with contextlib.redirect_stdout(io.StringIO()):
-            code = h.run_agent(messages, "m")
+            code = h.agent.run_agent(messages, "m", execute=h.execute_tool)
         self.assertEqual(code, 0)
         self.assertEqual(calls, [0, 1, 2])  # stopped all the way up, no retries
         results = [m["content"] for m in messages if m["role"] == "tool"]
@@ -2477,7 +2479,7 @@ class TestSubagents(unittest.TestCase):
         self.addCleanup(setattr, h.request, "stream_once", old)
         messages = [{"role": "user", "content": "go"}]
         with contextlib.redirect_stdout(io.StringIO()):
-            code = h.run_agent(messages, "m")
+            code = h.agent.run_agent(messages, "m", execute=h.execute_tool)
         self.assertEqual(code, 0)
         self.assertEqual(messages[-1], {"role": "assistant", "content": "partial answer"})
         self.assertEqual(h.state._AGENT_DEPTH, 0)
@@ -2571,12 +2573,12 @@ class TestSubagents(unittest.TestCase):
 
         messages, _ = self._scripted(decide)
         with contextlib.redirect_stdout(io.StringIO()):
-            code = h.run_agent(messages, "m")
+            code = h.agent.run_agent(messages, "m", execute=h.execute_tool)
         self.assertEqual(code, 0)
         self.assertEqual(turns, [0] * 6)  # 5 tool turns + the finishing one, uncapped
 
     def test_model_exit_code_is_not_mistaken_for_the_step_limit(self):
-        def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None):
+        def fake_run_agent(messages, model, interactive=False, temperature=0.2, depth=0, conv_id=None, execute=None):
             messages.append({"role": "assistant", "content": "done"})
             return h.config.SUBAGENT_STEP_LIMIT_CODE  # the sub-agent's own `exit` code collides
 
@@ -2619,7 +2621,7 @@ class TestSubagents(unittest.TestCase):
         self.addCleanup(setattr, h.request, "stream_once", old)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            code = h.run_agent([{"role": "user", "content": "go"}], "m")
+            code = h.agent.run_agent([{"role": "user", "content": "go"}], "m", execute=h.execute_tool)
         self.assertEqual(code, 7)
         self.assertIn("done", buf.getvalue())
 
@@ -2645,14 +2647,14 @@ class TestStatus(unittest.TestCase):
         out = h.format_status(messages)
         # 100 + 50 + 10 + 40 + 20 = 220 chars of conversation, plus the tool
         # schemas that are sent with every request
-        total = 220 + len(json.dumps(h._active_tools(True)))
+        total = 220 + len(json.dumps(h.agent._active_tools(True)))
         self.assertTrue(
             out.startswith(f"context: ~{total // 4} tokens (estimated, ~{total} chars) in 4 messages")
         )
 
     def test_empty_history(self):
         out = h.format_status([])
-        total = len(json.dumps(h._active_tools(True)))
+        total = len(json.dumps(h.agent._active_tools(True)))
         self.assertTrue(
             out.startswith(f"context: ~{total // 4} tokens (estimated, ~{total} chars) in 0 messages")
         )
@@ -2662,7 +2664,7 @@ class TestStatus(unittest.TestCase):
             {"role": "assistant", "content": "c" * 10, "reasoning_content": "r" * 30},
         ]
         out = h.format_status(messages)
-        total = 40 + len(json.dumps(h._active_tools(True)))
+        total = 40 + len(json.dumps(h.agent._active_tools(True)))
         self.assertTrue(
             out.startswith(f"context: ~{total // 4} tokens (estimated, ~{total} chars) in 1 messages")
         )
@@ -2670,7 +2672,7 @@ class TestStatus(unittest.TestCase):
     def test_context_window_percentage(self):
         messages = [{"role": "system", "content": "x" * 400}]
         out = h.format_status(messages, context_window=10000)
-        total = 400 + len(json.dumps(h._active_tools(True)))
+        total = 400 + len(json.dumps(h.agent._active_tools(True)))
         pct = (total // 4) * 100 // 10000
         self.assertIn(f"~{pct}% of 10000 window", out)
 
@@ -4655,7 +4657,7 @@ class TestToolsToggle(unittest.TestCase):
 
     def test_active_tools_excludes_disabled(self):
         h.state.DISABLED_TOOLS.add("read_file")
-        names = [s["function"]["name"] for s in h._active_tools(True)]
+        names = [s["function"]["name"] for s in h.agent._active_tools(True)]
         self.assertNotIn("read_file", names)
         self.assertIn("grep", names)
 
@@ -5150,7 +5152,7 @@ class TestTodo(Base):
         messages = [{"role": "user", "content": "go"}]
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            code = h.run_agent(messages, "m")
+            code = h.agent.run_agent(messages, "m", execute=h.execute_tool)
         self.assertEqual(code, 0)
         reminders = [m for m in messages if m.get("role") == "user" and "todo list" in (m.get("content") or "")]
         self.assertEqual(len(reminders), 1)
@@ -5960,7 +5962,7 @@ class TestInterrupt(Base):
         messages = [{"role": "user", "content": "go"}]
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            code = h.run_agent(messages, "m")
+            code = h.agent.run_agent(messages, "m", execute=h.execute_tool)
         self.assertEqual(code, 0)
         self.assertEqual(messages[-1], {"role": "assistant", "content": "partial answer"})
 
@@ -5974,7 +5976,7 @@ class TestInterrupt(Base):
         messages = [{"role": "user", "content": "go"}]
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            code = h.run_agent(messages, "m")
+            code = h.agent.run_agent(messages, "m", execute=h.execute_tool)
         self.assertEqual(code, 0)
         self.assertEqual(len(messages), 1)
 
@@ -5994,7 +5996,7 @@ class TestInterrupt(Base):
         messages = [{"role": "user", "content": "go"}]
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            code = h.run_agent(messages, "m")
+            code = h.agent.run_agent(messages, "m", execute=h.execute_tool)
         self.assertEqual(code, 0)
         self.assertEqual(len(messages), 1)
 
@@ -6023,7 +6025,7 @@ class TestInterrupt(Base):
         messages = [{"role": "user", "content": "go"}]
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            code = h.run_agent(messages, "m")
+            code = h.agent.run_agent(messages, "m", execute=h.execute_tool)
         self.assertEqual(code, 0)
         self.assertEqual(len(messages), 1)
 
@@ -6043,7 +6045,7 @@ class TestInterrupt(Base):
         messages = [{"role": "user", "content": "go"}]
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            code = h.run_agent(messages, "m")
+            code = h.agent.run_agent(messages, "m", execute=h.execute_tool)
         self.assertEqual(code, 0)
         self.assertEqual(
             messages[-1],
@@ -6146,18 +6148,18 @@ class TestToolsArePassedDown(unittest.TestCase):
 
     def test_an_agent_turn_advertises_the_active_tools(self):
         calls = self._tool_names(
-            h.run_agent, [{"role": "user", "content": "go"}], "m",
-            interactive=True, temperature=0.2,
+            h.agent.run_agent, [{"role": "user", "content": "go"}], "m",
+            execute=h.execute_tool, interactive=True, temperature=0.2,
         )
         self.assertEqual(
-            sorted(calls[0]), sorted(s["function"]["name"] for s in h._active_tools(True))
+            sorted(calls[0]), sorted(s["function"]["name"] for s in h.agent._active_tools(True))
         )  # what the agent layer decided, unchanged on the way down
 
     def test_a_tool_toggled_off_leaves_the_next_request(self):
         h.state.DISABLED_TOOLS = {"fetch_url"}
         calls = self._tool_names(
-            h.run_agent, [{"role": "user", "content": "go"}], "m",
-            interactive=True, temperature=0.2,
+            h.agent.run_agent, [{"role": "user", "content": "go"}], "m",
+            execute=h.execute_tool, interactive=True, temperature=0.2,
         )
         self.assertNotIn("fetch_url", calls[0])
         self.assertIn("grep", calls[0])
@@ -6166,13 +6168,13 @@ class TestToolsArePassedDown(unittest.TestCase):
         # `exit` belongs to a sub-agent's own table; the interactive REPL hides it
         # (OPENAI_TOOLS_INTERACTIVE), so the two turns advertise different sets.
         calls = self._tool_names(
-            h.run_agent, [{"role": "user", "content": "go"}], "m",
-            interactive=False, temperature=0.2,
+            h.agent.run_agent, [{"role": "user", "content": "go"}], "m",
+            execute=h.execute_tool, interactive=False, temperature=0.2,
         )
         self.assertIn("exit", calls[0])
         calls = self._tool_names(
-            h.run_agent, [{"role": "user", "content": "go"}], "m",
-            interactive=True, temperature=0.2,
+            h.agent.run_agent, [{"role": "user", "content": "go"}], "m",
+            execute=h.execute_tool, interactive=True, temperature=0.2,
         )
         self.assertNotIn("exit", calls[0])
 
@@ -6199,9 +6201,9 @@ class TestContextProgress(unittest.TestCase):
             },
             {"role": "tool", "tool_call_id": "1", "content": "e" * 20},
         ]
-        total = 220 + len(json.dumps(h._active_tools(True)))
-        self.assertEqual(h.measure.estimate_context_chars(messages, h._active_tools(True)), total)
-        self.assertEqual(h.measure.estimate_context_tokens(messages, h._active_tools(True)), total // 4)
+        total = 220 + len(json.dumps(h.agent._active_tools(True)))
+        self.assertEqual(h.measure.estimate_context_chars(messages, h.agent._active_tools(True)), total)
+        self.assertEqual(h.measure.estimate_context_tokens(messages, h.agent._active_tools(True)), total // 4)
 
     def test_format_tokens(self):
         self.assertEqual(h.render._format_tokens(999), "999")
@@ -6215,7 +6217,7 @@ class TestContextProgress(unittest.TestCase):
         self.assertEqual(h.render._format_elapsed(75), "1m15s")
 
     def test_noop_below_threshold(self):
-        spinner = h.request.ContextProgress([{"role": "user", "content": "hi"}], h._active_tools(True))
+        spinner = h.request.ContextProgress([{"role": "user", "content": "hi"}], h.agent._active_tools(True))
         spinner.start()
         self.assertFalse(spinner.active)
         spinner.stop()
@@ -6223,13 +6225,13 @@ class TestContextProgress(unittest.TestCase):
     def test_noop_without_tty(self):
         if sys.stdout.isatty():
             self.skipTest("stdout is a tty")
-        spinner = h.request.ContextProgress(self._big_messages(), h._active_tools(True))
+        spinner = h.request.ContextProgress(self._big_messages(), h.agent._active_tools(True))
         spinner.start()
         self.assertFalse(spinner.active)
         spinner.stop()
 
     def test_line_shows_upload_progress(self):
-        spinner = h.request.ContextProgress([{"role": "user", "content": "hi"}], h._active_tools(True))
+        spinner = h.request.ContextProgress([{"role": "user", "content": "hi"}], h.agent._active_tools(True))
         spinner.tokens = 32_000
         spinner.upload = h.request._UploadProgress(1000)
         spinner.upload.sent = 450
@@ -6240,7 +6242,7 @@ class TestContextProgress(unittest.TestCase):
         self.assertIn("14.4k/32.0k", line)
 
     def test_line_waiting_state(self):
-        spinner = h.request.ContextProgress([{"role": "user", "content": "hi"}], h._active_tools(True))
+        spinner = h.request.ContextProgress([{"role": "user", "content": "hi"}], h.agent._active_tools(True))
         spinner.tokens = 32_000
         spinner.upload = h.request._UploadProgress(1000)
         spinner.upload.sent = 1000  # upload complete
@@ -6254,7 +6256,7 @@ class TestContextProgress(unittest.TestCase):
         self.addCleanup(setattr, h.state, "CONTEXT_PROGRESS_DELAY", old_delay)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf), mock.patch.object(buf, "isatty", return_value=True):
-            spinner = h.request.ContextProgress(self._big_messages(), h._active_tools(True))
+            spinner = h.request.ContextProgress(self._big_messages(), h.agent._active_tools(True))
             spinner.start()
             self.assertTrue(spinner.active)
             deadline = time.time() + 5
@@ -6272,7 +6274,7 @@ class TestContextProgress(unittest.TestCase):
         self.addCleanup(setattr, h.state, "CONTEXT_PROGRESS_DELAY", old_delay)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf), mock.patch.object(buf, "isatty", return_value=True):
-            spinner = h.request.ContextProgress(self._big_messages(), h._active_tools(True))
+            spinner = h.request.ContextProgress(self._big_messages(), h.agent._active_tools(True))
             spinner.start()
             deadline = time.time() + 5
             while "waiting for first token" not in buf.getvalue() and time.time() < deadline:
@@ -6480,8 +6482,8 @@ class TestSessionLog(unittest.TestCase):
         h.journal.start_session(kw.pop("mode", "interactive"))
         messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "go"}]
         h.journal._session_messages(messages, h.state.MAIN_CONV_ID)
-        code = h.run_agent(
-            messages, "test-model", interactive=True, temperature=0.2, conv_id=h.state.MAIN_CONV_ID
+        code = h.agent.run_agent(
+            messages, "test-model", execute=h.execute_tool, interactive=True, temperature=0.2, conv_id=h.state.MAIN_CONV_ID
         )
         return code, messages
 
@@ -6534,8 +6536,8 @@ class TestSessionLog(unittest.TestCase):
     def test_journal_is_untouched_when_no_session_was_opened(self):
         self._scripted(lambda m, d, t: ({"role": "assistant", "content": "done"}, True))
         messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "go"}]
-        self.assertEqual(h.run_agent(
-            messages, "test-model", interactive=True, temperature=0.2, conv_id=h.state.MAIN_CONV_ID
+        self.assertEqual(h.agent.run_agent(
+            messages, "test-model", execute=h.execute_tool, interactive=True, temperature=0.2, conv_id=h.state.MAIN_CONV_ID
         ), 0)
         self.assertFalse(os.path.isdir(self.sessions))
 
@@ -6593,8 +6595,8 @@ class TestSessionLog(unittest.TestCase):
         h.journal.start_session()
         messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "go"}]
         h.journal._session_messages(messages, h.state.MAIN_CONV_ID)
-        self.assertEqual(h.run_agent(
-            messages, "test-model", interactive=True, temperature=0.2, conv_id=h.state.MAIN_CONV_ID
+        self.assertEqual(h.agent.run_agent(
+            messages, "test-model", execute=h.execute_tool, interactive=True, temperature=0.2, conv_id=h.state.MAIN_CONV_ID
         ), 0)
         last = self._jmessages()[-1]
         self.assertEqual(last["role"], "assistant")
@@ -6613,8 +6615,8 @@ class TestSessionLog(unittest.TestCase):
             h.journal.start_session()
             messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "go"}]
             h.journal._session_messages(messages, h.state.MAIN_CONV_ID)
-            code = h.run_agent(
-                messages, "test-model", interactive=True, temperature=0.2, conv_id=h.state.MAIN_CONV_ID
+            code = h.agent.run_agent(
+                messages, "test-model", execute=h.execute_tool, interactive=True, temperature=0.2, conv_id=h.state.MAIN_CONV_ID
             )
         self.assertEqual(code, 0)  # the agent carries on with no journal at all
         self.assertFalse(h.state.SESSION_LOG)
@@ -7341,7 +7343,7 @@ class TestCompaction(unittest.TestCase):
     def _compact(self, messages, reason="manual"):
         return h.compact.compact_messages(
             messages, h.state.MAIN_CONV_ID, model="test-model", reason=reason,
-            tools=h._active_tools(True)
+            tools=h.agent._active_tools(True)
         )
 
     def _run(self, **kw):
@@ -7351,8 +7353,8 @@ class TestCompaction(unittest.TestCase):
         h.journal._session_messages(messages, h.state.MAIN_CONV_ID)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            code = h.run_agent(
-                messages, "test-model", interactive=True, temperature=0.2,
+            code = h.agent.run_agent(
+                messages, "test-model", execute=h.execute_tool, interactive=True, temperature=0.2,
                 conv_id=h.state.MAIN_CONV_ID,
             )
         return code, messages, buf.getvalue()
@@ -7846,7 +7848,7 @@ class TestCompaction(unittest.TestCase):
         seed = [{"role": "user", "content": f"u{i} " + "x" * 2000} for i in range(8)]
         seed += [{"role": "assistant", "content": f"a{i}"} for i in range(8)]
         self.assertLess(
-            h.measure.estimate_context_tokens(seed, h._active_tools(True)), 20_000 * h.state.COMPACT_THRESHOLD_PCT // 100
+            h.measure.estimate_context_tokens(seed, h.agent._active_tools(True)), 20_000 * h.state.COMPACT_THRESHOLD_PCT // 100
         )  # the estimate alone would not have triggered it
         h.state.USAGE_BY_CONV[h.state.MAIN_CONV_ID] = {"prompt_tokens": 18_000}
         code, _, _ = self._seeded_run(decide=lambda m, d, t: (
@@ -7866,7 +7868,7 @@ class TestCompaction(unittest.TestCase):
         # the threshold while the conversation is nowhere near it. Compacting would cut
         # turns that were never what filled the context — that overflow is the reactive
         # trigger's, and it says plainly when compaction cannot help.
-        self.assertGreater(h.measure.estimate_context_tokens(request, h._active_tools(True)), threshold)
+        self.assertGreater(h.measure.estimate_context_tokens(request, h.agent._active_tools(True)), threshold)
         self.assertLess(h.compact._turn_tokens(request), threshold)
         self._scripted(lambda m, d, t: ({"role": "assistant", "content": "done"}, True))
         code, _, _ = self._run(seed=seed)
@@ -8079,12 +8081,146 @@ class TestCompaction(unittest.TestCase):
         self._scripted(lambda m, d, t: ({"role": "assistant", "content": "sub done"}, True))
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            code = h.run_agent(sub, "test-model", interactive=False, temperature=0.2,
+            code = h.agent.run_agent(sub, "test-model", execute=h.execute_tool, interactive=False, temperature=0.2,
                                depth=1, conv_id=conv_id)
         self.assertEqual(code, 0)
         self.assertEqual([r["reason"] for r in self._compacts("test-session.1.jsonl")],
                          ["proactive"])
         self.assertEqual(self._compacts(), [])  # a sub-agent's room is its own business
         self.assertIn(h.config.COMPACT_SUMMARY_HEADER, sub[1]["content"])
+class TestAgentSeam(Base):
+    """harnless_core/agent.py drives a run without knowing what the harness's tools are.
+
+    These run the real loop, so they save the state the loop writes as it goes — a leaked
+    conversation id shifts the file names a later journal test expects.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # The loop writes into this state as it runs; a value left behind here is the reason a
+        # later journal test finds test-session.3.jsonl where it expected .1.
+        self._isolated(
+            "_AGENT_DEPTH", "MODEL", "TEMPERATURE", "_NEXT_CONV_ID", "SUBAGENT_STEP_LIMIT",
+            "SESSION_LOG", "SUBAGENT_CHILDREN", "SESSION_FILES", "SESSION_SEQ",
+            "USAGE_BY_CONV", "EXIT_NOTE_BY_CONV", "MAIN_CONV_ID", "AGENT_LOG_ID", "OUTPUT_INDENT",
+        )
+        old_chat = h.request.chat
+
+        def no_live_api(*args, **kwargs):
+            raise AssertionError("tests must not reach a live LLM server")
+
+        h.request.chat = no_live_api  # a non-streaming fallback would hit the real API
+        self.addCleanup(setattr, h.request, "chat", old_chat)
+        h.state.SESSION_LOG = False
+
+    def _isolated(self, *names):
+        saved = {}
+        for name in names:
+            value = getattr(h.state, name)
+            if isinstance(value, dict):
+                saved[name] = dict(value)
+                value.clear()
+            elif isinstance(value, set):
+                saved[name] = set(value)
+                value.clear()
+            else:
+                saved[name] = value
+
+        def restore():
+            for name, value in saved.items():
+                live = getattr(h.state, name)
+                if isinstance(value, dict):
+                    live.clear()
+                    live.update(value)
+                elif isinstance(value, set):
+                    live.clear()
+                    live.update(value)
+                else:
+                    setattr(h.state, name, value)
+
+        self.addCleanup(restore)
+
+    def _scripted(self, decide):
+        """Feed run_agent a script of assistant turns, per nesting level.
+
+        Never returns streamed=False: run_agent treats that as "this server does not stream"
+        and falls back to chat(), which would reach whatever model is listening on the port.
+        """
+        old = h.request.stream_once
+        turns = {}
+
+        def fake_stream_once(messages, model, tools=None, temperature=0.2, conv_id=None):
+            depth = h.state._AGENT_DEPTH
+            turn = turns.get(depth, 0)
+            turns[depth] = turn + 1
+            return decide(messages, depth, turn), True
+
+        h.request.stream_once = fake_stream_once
+        self.addCleanup(setattr, h.request, "stream_once", old)
+
+    @staticmethod
+    def _call(name, args):
+        return {"role": "assistant", "content": "", "tool_calls": [
+            {"id": f"c-{name}", "type": "function",
+             "function": {"name": name, "arguments": json.dumps(args)}}
+        ]}
+
+    def test_run_agent_has_to_be_told_how_to_run_a_call(self):
+        self._scripted(lambda m, d, t: {"role": "assistant", "content": "done"})
+        with self.assertRaises(TypeError):
+            h.agent.run_agent([{"role": "user", "content": "go"}], "m")
+
+    def test_the_loop_dispatches_through_the_executor_it_was_given(self):
+        self._scripted(lambda m, d, t: self._call("made_up", {"a": 1}) if t == 0
+                       else {"role": "assistant", "content": "finished"})
+        seen = []
+        messages = [{"role": "user", "content": "go"}]
+        code = h.agent.run_agent(messages, "m", execute=lambda name, raw: seen.append((name, raw)) or "ran it")
+        self.assertEqual(code, 0)
+        # A tool the harness does not even have: the loop never consults the tool table, it
+        # hands the call to whoever gave it the run.
+        self.assertEqual(seen, [("made_up", '{"a": 1}')])
+        self.assertEqual([m["content"] for m in messages if m.get("role") == "tool"], ["ran it"])
+
+    def test_a_delegated_run_answers_calls_with_its_parents_executor(self):
+        def decide(messages, depth, turn):
+            if turn > 0:
+                return {"role": "assistant", "content": "done"}
+            return self._call("task", {"task": "dig"}) if depth == 0 else self._call("made_up", {})
+
+        self._scripted(decide)
+        seen, real = [], h.execute_tool
+
+        def spy(name, raw_args):
+            seen.append((h.state._AGENT_DEPTH, name))
+            return real(name, raw_args)
+
+        old = h.execute_tool
+        h.execute_tool = spy
+        self.addCleanup(setattr, h, "execute_tool", old)
+        code = h.agent.run_agent([{"role": "user", "content": "go"}], "m", execute=h.execute_tool)
+        self.assertEqual(code, 0)
+        self.assertEqual(seen, [(0, "task"), (1, "made_up")])
+
+    def test_no_core_module_reaches_up_to_the_entry_point(self):
+        """The rule the split rests on: a module under harnless_core may read anything below
+        it, but a name owned by harnless.py would mean importing the thing that imports it."""
+        entry = ast.parse(pathlib.Path("harnless.py").read_text(encoding="utf-8"))
+        owned = set()
+        for node in entry.body:
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                owned.add(node.name)
+            elif isinstance(node, ast.Assign):
+                owned.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        for path in sorted(pathlib.Path("harnless_core").glob("*.py")):
+            if path.name == "__init__.py":
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+            used |= {n.value.id for n in ast.walk(tree)
+                     if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)}
+            self.assertEqual(sorted(used & owned), [], f"{path.name} uses a name owned by harnless.py")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

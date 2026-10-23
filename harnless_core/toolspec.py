@@ -10,6 +10,7 @@ schemas are data, implementations are behaviour. Keys must match.
 
 from harnless_core import config
 
+
 SPECS = {
     "get_cwd": {
         "type": "function",

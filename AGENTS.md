@@ -29,21 +29,34 @@ tests make.
 | `paths.py` | CWD containment and path resolution |
 | `measure.py` | what the next request costs (`estimate_context_tokens`) |
 | `render.py` | colour/icon tables, the Markdown renderer, printers, terminal widths |
+| `toolspec.py` | the contract the model is shown: one OpenAI schema per built-in tool |
 | `journal.py` | the session journal: records, resume, replay, the `sessions` tool |
 | `context.py` | system prompt, `AGENTS.md`, memory, the todo block, `file://` refs, history |
 | `lineedit.py` | key iterators, the multi-line editor, `InterruptWatcher` |
 | `request.py` | request building, the abortable/counting opener, chat + streaming, SSE |
 | `compact.py` | the cut, the pruning, the handoff note, both triggers |
-| `harnless.py` | the tools themselves, the tool tables, the agent loop, the REPL, `main()` |
+| `search.py` | the walking/.gitignore engine and the grep, glob, list_dir, patch, move, copy tools |
+| `shell.py` | shell resolution, process-tree killing, timeouts, `run_shell` |
+| `mcp.py` | the MCP client: JSON-RPC over stdio or HTTP, discovery, registration |
+| `agent.py` | the loop: `run_agent`/`_agent_loop`, what a turn advertises, closing summaries |
+| `harnless.py` | the tools themselves, `DISPATCH`, `execute_tool`, the CLI/REPL, `main()` |
 
-Two rules keep the layers honest:
+Three rules keep the layers honest:
 
-- **A core module never imports `harnless`.** If one needs a name that is still in the
-  entry point, that name has to move down first (the link stage refuses it).
+- **A core module never imports `harnless`.** If one needs a name that is still in the entry
+  point, that name moves down first (the link stage refuses it, and
+  `TestAgentSeam.test_no_core_module_reaches_up_to_the_entry_point` checks it from the test
+  side too).
 - **Nothing above the agent layer decides which tools a request advertises.**
   `chat`/`stream_chat`/`stream_once`/`_request_body` take `tools: list | None`; the agent
   loop hands them `_active_tools(interactive)`, and a request meant only to write something
   (the compaction handoff note) is handed `None`.
+- **The loop is handed the thing that runs a tool call.** `run_agent(..., execute=...)` is
+  keyword-only and required: `harnless.py` passes its own `execute_tool`, and `tool_task`
+  passes it on so a sub-agent answers calls with the same executor. The tool table is split
+  the same way — `toolspec.SPECS` is the contract (data, ordered), `harnless.DISPATCH` is the
+  behaviour (name → function) — and a test asserts the two halves name the same tools in the
+  same order.
 
 ## Moving code
 
