@@ -6275,7 +6275,7 @@ class TestSessionLog(unittest.TestCase):
         h.state.SESSION_LOG = True
         h.state.SESSION_WARNED = False
         h.state.SESSION_ID = ""
-        h._session_new_id = lambda: "test-session"  # predictable file names
+        h.journal._session_new_id = lambda: "test-session"  # predictable file names
         h.state.AGENT_LOG_ID = ""
         h.state.OUTPUT_INDENT = ""
         h.state.MODEL = "test-model"
@@ -6328,9 +6328,9 @@ class TestSessionLog(unittest.TestCase):
 
     def _run(self, extra_messages=True, **kw):
         """An interactive top-level run against the conversation journal."""
-        h.start_session(kw.pop("mode", "interactive"))
+        h.journal.start_session(kw.pop("mode", "interactive"))
         messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "go"}]
-        h._session_messages(messages, h.state.MAIN_CONV_ID)
+        h.journal._session_messages(messages, h.state.MAIN_CONV_ID)
         code = h.run_agent(
             messages, "test-model", interactive=True, temperature=0.2, conv_id=h.state.MAIN_CONV_ID
         )
@@ -6397,7 +6397,7 @@ class TestSessionLog(unittest.TestCase):
         self.assertFalse(os.path.isdir(self.sessions))
 
     def test_usage_is_recorded_per_llm_call(self):
-        h.start_session()
+        h.journal.start_session()
         h._record_usage(
             [{"role": "user", "content": "hi"}],
             {"prompt_tokens": 1200, "completion_tokens": 3, "total_tokens": 1203},
@@ -6410,7 +6410,7 @@ class TestSessionLog(unittest.TestCase):
         self.assertEqual(records[1]["messages"], 1)
 
     def test_todo_reminder_is_journaled(self):
-        h.start_session()
+        h.journal.start_session()
         h.tool_todo({"action": "add", "text": "write the log"})
         messages = [{"role": "system", "content": "s"}]
         h._todo_reminder(messages, h.state.MAIN_CONV_ID)
@@ -6418,9 +6418,9 @@ class TestSessionLog(unittest.TestCase):
         self.assertIn("write the log", self._jmessages()[-1]["content"])
 
     def test_inline_image_data_does_not_land_in_the_log(self):
-        h.start_session()
+        h.journal.start_session()
         big = "data:image/png;base64," + "A" * 4000
-        h._session_message(
+        h.journal._session_message(
             {"role": "user", "content": [
                 {"type": "text", "text": "see"},
                 {"type": "image_url", "image_url": {"url": big}},
@@ -6441,9 +6441,9 @@ class TestSessionLog(unittest.TestCase):
             )
 
         h.stream_once = interrupted
-        h.start_session()
+        h.journal.start_session()
         messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "go"}]
-        h._session_messages(messages, h.state.MAIN_CONV_ID)
+        h.journal._session_messages(messages, h.state.MAIN_CONV_ID)
         self.assertEqual(h.run_agent(
             messages, "test-model", interactive=True, temperature=0.2, conv_id=h.state.MAIN_CONV_ID
         ), 0)
@@ -6461,9 +6461,9 @@ class TestSessionLog(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as out:
             # Already the header is where it fails: nothing can be created inside
             # a file. The session must carry on regardless.
-            h.start_session()
+            h.journal.start_session()
             messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "go"}]
-            h._session_messages(messages, h.state.MAIN_CONV_ID)
+            h.journal._session_messages(messages, h.state.MAIN_CONV_ID)
             code = h.run_agent(
                 messages, "test-model", interactive=True, temperature=0.2, conv_id=h.state.MAIN_CONV_ID
             )
@@ -6557,7 +6557,7 @@ class TestSessionLog(unittest.TestCase):
             if t == 0 else ({"role": "assistant", "content": "done"}, True)
         )
         self._run()
-        messages, note = h.resume_session("test-session")
+        messages, note = h.journal.resume_session("test-session")
         self.assertIsNotNone(messages)
         self.assertIn("resumed session test-session", note)
         # Journal envelope keys are gone, and so is the old system message: the
@@ -6566,7 +6566,7 @@ class TestSessionLog(unittest.TestCase):
         self.assertEqual(set(messages[0]), {"role", "content"})
         self.assertEqual(messages[-1]["content"], "done")
         self.assertEqual(h.state.SESSION_ID, "test-session")
-        self.assertEqual(h._session_path(), os.path.join(self.sessions, "test-session.jsonl"))
+        self.assertEqual(h.journal._session_path(), os.path.join(self.sessions, "test-session.jsonl"))
 
     def test_resume_latest_picks_the_newest_top_level_log(self):
         self._write_log("older.jsonl", [
@@ -6586,7 +6586,7 @@ class TestSessionLog(unittest.TestCase):
         future = time.time() + 60
         for name in ("newer.jsonl", "newer.1.jsonl"):
             os.utime(os.path.join(self.sessions, name), (future, future))
-        messages, note = h.resume_session("latest")
+        messages, note = h.journal.resume_session("latest")
         self.assertEqual(messages[0]["content"], "new run")
         self.assertEqual(h.state.SESSION_ID, "newer")
 
@@ -6598,11 +6598,11 @@ class TestSessionLog(unittest.TestCase):
         self._run()
         before = len(self._jmessages())
         last_seq = self._log()[-1]["seq"]
-        messages, _ = h.resume_session("test-session")
+        messages, _ = h.journal.resume_session("test-session")
         # A resumed run appends a `resume` marker, then only what it adds itself:
         # re-recording the restored messages would double the log at every resume.
-        h._session_messages([{"role": "system", "content": "new system"}], h.state.MAIN_CONV_ID)
-        h._session_messages([{"role": "user", "content": "carry on"}], h.state.MAIN_CONV_ID)
+        h.journal._session_messages([{"role": "system", "content": "new system"}], h.state.MAIN_CONV_ID)
+        h.journal._session_messages([{"role": "user", "content": "carry on"}], h.state.MAIN_CONV_ID)
         records = self._log()
         self.assertEqual(len([r for r in records if r.get("type") == "message"]), before + 2)
         self.assertEqual(records[before + 1]["type"], "resume")
@@ -6619,7 +6619,7 @@ class TestSessionLog(unittest.TestCase):
                 "tool_calls": [self._call("run_shell", {"command": "sleep"}, "a1")],
             },
         ])
-        messages, _ = h.resume_session("half")
+        messages, _ = h.journal.resume_session("half")
         self.assertEqual([m["role"] for m in messages], ["user", "assistant", "tool"])
         answer = messages[-1]
         self.assertEqual(answer["tool_call_id"], "a1")
@@ -6641,7 +6641,7 @@ class TestSessionLog(unittest.TestCase):
             {"type": "message", "seq": 7, "ts": "t", "role": "tool", "tool_call_id": "ok1",
              "content": "here"},
         ])
-        messages, _ = h.resume_session("dirty")
+        messages, _ = h.journal.resume_session("dirty")
         self.assertEqual([m["role"] for m in messages],
                          ["user", "user", "assistant", "tool"])
         self.assertNotIn("reasoning_content", messages[0])  # contentless partial dropped
@@ -6658,7 +6658,7 @@ class TestSessionLog(unittest.TestCase):
                         "tool_call_id": "c", "content": "cwd"})
         records.append({"type": "message", "seq": 4, "ts": "t", "role": "assistant", "content": "late"})
         self._write_log("long.jsonl", records)
-        messages, note = h.resume_session("long", keep=3)
+        messages, note = h.journal.resume_session("long", keep=3)
         self.assertEqual([m["role"] for m in messages], ["assistant", "tool", "assistant"])
         self.assertEqual(messages[1]["content"], "cwd")  # the call and its answer stay together
         self.assertIn("kept the last 3", note)
@@ -6674,16 +6674,16 @@ class TestSessionLog(unittest.TestCase):
             {"type": "message", "seq": 3, "ts": "t", "role": "tool", "tool_call_id": "c2",
              "content": "the cwd"},
         ])
-        messages, note = h.resume_session("cut", keep=1)
+        messages, note = h.journal.resume_session("cut", keep=1)
         self.assertIsNone(messages)
         self.assertIn("no messages to resume", note)
 
     def test_resume_of_an_unknown_session_names_what_it_tried(self):
-        messages, note = h.resume_session("nope")
+        messages, note = h.journal.resume_session("nope")
         self.assertIsNone(messages)
         self.assertIn("no session log for 'nope'", note)
         self.assertIn("/sessions", note)
-        messages, note = h.resume_session("")
+        messages, note = h.journal.resume_session("")
         self.assertIsNone(messages)
         self.assertIn("lists recent sessions", note)
 
@@ -6694,7 +6694,7 @@ class TestSessionLog(unittest.TestCase):
         buf = io.StringIO()
         try:
             with contextlib.redirect_stdout(buf):
-                messages, note = h.resume_session(*args, **kwargs)
+                messages, note = h.journal.resume_session(*args, **kwargs)
         finally:
             h.render.set_color_enabled(saved)
         return messages, note, buf.getvalue()
@@ -6858,31 +6858,31 @@ class TestSessionLog(unittest.TestCase):
 
     def test_resume_target_reads_both_resume_flags(self):
         # --resume names the session; --resume-last only trims it.
-        self.assertEqual(h._resume_target("abc", None), ("abc", 0, False))
-        self.assertEqual(h._resume_target("abc", 20), ("abc", 20, False))
+        self.assertEqual(h.journal._resume_target("abc", None), ("abc", 0, False))
+        self.assertEqual(h.journal._resume_target("abc", 20), ("abc", 20, False))
         # Neither flag: no resume at all (resume_last is None, not 0, when absent).
-        self.assertEqual(h._resume_target(None, None), ("", 0, False))
+        self.assertEqual(h.journal._resume_target(None, None), ("", 0, False))
         # --resume-last on its own, with or without N, means "the newest session".
-        self.assertEqual(h._resume_target(None, 0), ("latest", 0, True))
-        self.assertEqual(h._resume_target(None, 7), ("latest", 7, True))
-        self.assertEqual(h._resume_target("", 3), ("latest", 3, True))
+        self.assertEqual(h.journal._resume_target(None, 0), ("latest", 0, True))
+        self.assertEqual(h.journal._resume_target(None, 7), ("latest", 7, True))
+        self.assertEqual(h.journal._resume_target("", 3), ("latest", 3, True))
         # The keep limit is clamped like every other CLI knob.
-        self.assertEqual(h._resume_target(None, -4), ("latest", 0, True))
+        self.assertEqual(h.journal._resume_target(None, -4), ("latest", 0, True))
         self.assertEqual(
-            h._resume_target(None, h.config.SESSION_KEEP_CEILING + 99),
+            h.journal._resume_target(None, h.config.SESSION_KEEP_CEILING + 99),
             ("latest", h.config.SESSION_KEEP_CEILING, True),
         )
-        self.assertEqual(h._resume_target("abc", -4), ("abc", 0, False))
+        self.assertEqual(h.journal._resume_target("abc", -4), ("abc", 0, False))
 
     def test_resuming_a_sub_agent_log_continues_that_chain(self):
         self._write_log("chain.1.2.jsonl", [
             {"type": "session", "seq": 0, "ts": "t", "session_id": "chain", "subagent_id": "1.2"},
             {"type": "message", "seq": 1, "ts": "t", "role": "user", "content": "nested task"},
         ])
-        messages, _ = h.resume_session("chain.1.2")
+        messages, _ = h.journal.resume_session("chain.1.2")
         self.assertEqual(h.state.SESSION_ID, "chain.1.2")
         # The chain keeps its place: a sub-agent of the resumed run nests under it.
-        self.assertEqual(h._session_path(h.state.SESSION_ID, "1"),
+        self.assertEqual(h.journal._session_path(h.state.SESSION_ID, "1"),
                          os.path.join(self.sessions, "chain.1.2.1.jsonl"))
         self.assertEqual(messages[0]["content"], "nested task")
 
@@ -6894,7 +6894,7 @@ class TestSessionLog(unittest.TestCase):
 
         self._scripted(decide)
         self._run()
-        out = h.format_sessions()
+        out = h.journal.format_sessions()
         self.assertIn("test-session", out)
         self.assertIn("1 sub-agent logs", out)
         self.assertIn("5 messages", out)  # system, user, the task call, its result, the reply
@@ -6903,10 +6903,10 @@ class TestSessionLog(unittest.TestCase):
         h.state.SESSION_ID = ""
         for name in os.listdir(self.sessions):
             os.remove(os.path.join(self.sessions, name))
-        self.assertEqual(h.format_sessions(), f"no session logs in {self.sessions}")
+        self.assertEqual(h.journal.format_sessions(), f"no session logs in {self.sessions}")
 
     def test_status_reports_the_session_and_its_log(self):
-        h.start_session("one-shot")
+        h.journal.start_session("one-shot")
         out = h.format_status([{"role": "user", "content": "hi"}])
         self.assertIn("session: test-session", out)
         self.assertIn("test-session.jsonl", out)
@@ -7097,7 +7097,7 @@ class TestCompaction(unittest.TestCase):
         h.state.SESSION_LOG = True
         h.state.SESSION_WARNED = False
         h.state.SESSION_ID = ""
-        h._session_new_id = lambda: "test-session"
+        h.journal._session_new_id = lambda: "test-session"
         h.state.AGENT_LOG_ID = ""
         h.state.OUTPUT_INDENT = ""
         h.state.MODEL = "test-model"
@@ -7175,7 +7175,7 @@ class TestCompaction(unittest.TestCase):
 
         `tool_at` puts an assistant tool call and its (fat) answer after that many
         pairs — where a test wants a batch near the cut."""
-        h.start_session("interactive")
+        h.journal.start_session("interactive")
         messages = [{"role": "system", "content": "sys"}]
         for i in range(count):
             messages.append({"role": "user", "content": f"u{i} " + "x" * size})
@@ -7187,7 +7187,7 @@ class TestCompaction(unittest.TestCase):
                     "tool_call_id": f"c{i}",
                     "content": "z" * (tool_size if tool_size is not None else 20_000),
                 })
-        h._session_messages(messages, h.state.MAIN_CONV_ID)
+        h.journal._session_messages(messages, h.state.MAIN_CONV_ID)
         return messages
 
     def _compact(self, messages, reason="manual"):
@@ -7197,9 +7197,9 @@ class TestCompaction(unittest.TestCase):
 
     def _run(self, **kw):
         """A real top-level run against a seeded conversation (stream_once scripted)."""
-        h.start_session(kw.pop("mode", "interactive"))
+        h.journal.start_session(kw.pop("mode", "interactive"))
         messages = [{"role": "system", "content": "sys"}] + list(kw.pop("seed", []))
-        h._session_messages(messages, h.state.MAIN_CONV_ID)
+        h.journal._session_messages(messages, h.state.MAIN_CONV_ID)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             code = h.run_agent(
@@ -7321,8 +7321,8 @@ class TestCompaction(unittest.TestCase):
     def test_a_tool_answer_never_outlives_its_call(self):
         h.state.CONTEXT_WINDOW = 1620  # a 405-token tail budget: the cut lands mid-batch
         messages = self._straddling()
-        h.start_session("interactive")
-        h._session_messages(messages, h.state.MAIN_CONV_ID)
+        h.journal.start_session("interactive")
+        h.journal._session_messages(messages, h.state.MAIN_CONV_ID)
         self.assertTrue(self._batches_intact(messages))
         self.assertTrue(self._compact(messages)[0])
         self.assertTrue(self._batches_intact(messages))
@@ -7399,7 +7399,7 @@ class TestCompaction(unittest.TestCase):
         messages = self._seed(8)
         self._compact(messages)
         messages.append({"role": "user", "content": "next " + "x" * 2000})
-        h._session_message(messages[-1], h.state.MAIN_CONV_ID)
+        h.journal._session_message(messages[-1], h.state.MAIN_CONV_ID)
         seqs = [r["seq"] for r in self._log()]
         self.assertEqual(seqs, list(range(len(seqs))))  # gapless, no seq reused
         self.assertEqual(max(seqs), h.state.SESSION_SEQ[h.state.MAIN_CONV_ID] - 1)
@@ -7416,11 +7416,11 @@ class TestCompaction(unittest.TestCase):
     def test_a_resumed_conversation_keeps_the_original_numbering(self):
         messages = self._seed(8)
         last_seq = self._log()[-1]["seq"]
-        resumed, _ = h.resume_session("test-session")
+        resumed, _ = h.journal.resume_session("test-session")
         # The way main() puts a fresh system prompt in front of restored turns — with
         # _session_prepend, so the seq list stays aligned with the conversation.
         resumed.insert(0, {"role": "system", "content": "sys again"})
-        h._session_prepend(resumed[0], h.state.MAIN_CONV_ID)
+        h.journal._session_prepend(resumed[0], h.state.MAIN_CONV_ID)
         entries = h.state.SESSION_MSG_SEQ[h.state.MAIN_CONV_ID]
         self.assertEqual(len(entries), len(resumed))
         self.assertEqual(entries[0], last_seq + 2)  # resume marker, then the new prompt
@@ -7433,7 +7433,7 @@ class TestCompaction(unittest.TestCase):
         self._compact(messages)
         extra = [{"role": "user", "content": f"more{i} " + "x" * 2000} for i in range(8)]
         messages.extend(extra)
-        h._session_messages(extra, h.state.MAIN_CONV_ID)
+        h.journal._session_messages(extra, h.state.MAIN_CONV_ID)
         self.notes.clear()
         self.assertTrue(self._compact(messages)[0])
         self.assertEqual(len(self._compacts()), 2)
@@ -7450,7 +7450,7 @@ class TestCompaction(unittest.TestCase):
 
     def test_the_sessions_tool_lists_the_recorded_logs(self):
         self._seed(8)
-        out = h.tool_sessions({"action": "list"})
+        out = h.journal.tool_sessions({"action": "list"})
         self.assertIn("test-session", out)
         self.assertIn("interactive (test-model)", out)  # what the run was, from its header
         self.assertIn("/resume", out)  # the other way back, named in the same answer
@@ -7459,7 +7459,7 @@ class TestCompaction(unittest.TestCase):
         _, record = self._compacted_once(tool_at=2, tool_size=4000)
         first, last = record["replaced"]
         recorded = {r["seq"]: r for r in self._records("message")}
-        out = h.tool_sessions({"action": "read", "from": first, "to": last})
+        out = h.journal.tool_sessions({"action": "read", "from": first, "to": last})
         self.assertIn(f"records {first}-{last}", out)
         self.assertIn(f"#{first} {recorded[first]['role']}", out)
         self.assertIn(f"#{last} {recorded[last]['role']}", out)
@@ -7472,14 +7472,14 @@ class TestCompaction(unittest.TestCase):
     def test_a_compaction_reads_as_the_gap_it_made(self):
         _, record = self._compacted_once()
         first, last = record["replaced"]
-        spans = h.tool_sessions({"action": "spans"})
+        spans = h.journal.tool_sessions({"action": "spans"})
         self.assertIn("1 compaction", spans)
         self.assertIn("HARNLESS COMPACTED", spans)
         self.assertIn(f"seqs {first}-{last}", spans)
         self.assertIn("handoff note", spans)
         self.assertIn(record["reason"], spans)
         # A plain read shows the cut where it happened, between the turns it left.
-        out = h.tool_sessions({"action": "read", "from": first, "to": record["summary_seq"] + 1})
+        out = h.journal.tool_sessions({"action": "read", "from": first, "to": record["summary_seq"] + 1})
         self.assertIn("HARNLESS COMPACTED", out)
         self.assertIn(f"#{record['seq']} [", out)
 
@@ -7491,18 +7491,18 @@ class TestCompaction(unittest.TestCase):
         h.chat = broken
         self._compacted_once()
         self.assertIn("placeholder (the summarising request failed)",
-                      h.tool_sessions({"action": "spans"}))
+                      h.journal.tool_sessions({"action": "spans"}))
 
     def test_a_record_line_shows_the_calls_the_turn_made(self):
         self._seed(3, tool_at=1, tool_size=200)
-        lines = "\n".join(h._session_record_line(r) for r in self._records("message"))
+        lines = "\n".join(h.journal._session_record_line(r) for r in self._records("message"))
         self.assertIn("called read_file(", lines)
         self.assertIn('"path": "./x"', lines)  # the arguments, as the model sent them
         self.assertIn("(answer to c1)", lines)  # an answer says which call it answers
 
     def test_an_inline_image_reads_as_a_note_not_a_blob(self):
-        h.start_session("interactive")
-        h._session_message({
+        h.journal.start_session("interactive")
+        h.journal._session_message({
             "role": "user",
             "content": [
                 {"type": "text", "text": "what is in this screenshot?"},
@@ -7510,36 +7510,36 @@ class TestCompaction(unittest.TestCase):
                 {"type": "image_url", "image_url": {"url": "http://x/y.png"}},
             ],
         }, h.state.MAIN_CONV_ID)
-        out = h.tool_sessions({"action": "read"})
+        out = h.journal.tool_sessions({"action": "read"})
         self.assertIn("what is in this screenshot?", out)
         self.assertIn("[image elided in the session log", out)  # the pixels stay out of the transcript
         self.assertIn("[image]", out)  # a short reference is kept, as a label
         self.assertNotIn("AAAA", out)
 
     def test_a_long_turn_is_clipped_and_says_where_the_rest_is(self):
-        h.start_session("interactive")
-        h._session_message(
+        h.journal.start_session("interactive")
+        h.journal._session_message(
             {"role": "assistant", "content": "b" * (h.config.SESSION_RECORD_CHARS + 400)}, h.state.MAIN_CONV_ID
         )
-        out = h.tool_sessions({"action": "read"})
+        out = h.journal.tool_sessions({"action": "read"})
         self.assertIn("[truncated:", out)
         self.assertIn("the rest of this turn is in the log file itself", out)
 
     def test_reading_is_capped_and_says_how_to_narrow_it(self):
         self._seed(8)
-        out = h.tool_sessions({"action": "read", "limit": 3})
+        out = h.journal.tool_sessions({"action": "read", "limit": 3})
         self.assertIn("showing the last 3 of", out)
         self.assertIn("narrower from/to", out)
         self.assertEqual(len([line for line in out.splitlines() if line.startswith("#")]), 3)
-        out = h.tool_sessions({"action": "read", "max_chars": 900})
+        out = h.journal.tool_sessions({"action": "read", "max_chars": 900})
         self.assertIn("[truncated:", out)
         self.assertIn("narrow from/to", out)
 
     def test_the_sessions_tool_says_what_it_could_not_find(self):
         self._seed(8)
-        self.assertIn("no records", h.tool_sessions({"action": "read", "from": 900, "to": 999}))
-        self.assertIn("unknown action", h.tool_sessions({"action": "archaeology"}))
-        missing = h.tool_sessions({"action": "read", "session": "no-such-session"})
+        self.assertIn("no records", h.journal.tool_sessions({"action": "read", "from": 900, "to": 999}))
+        self.assertIn("unknown action", h.journal.tool_sessions({"action": "archaeology"}))
+        missing = h.journal.tool_sessions({"action": "read", "session": "no-such-session"})
         self.assertTrue(missing.startswith("error:"))
         self.assertIn("no session log for 'no-such-session'", missing)
         self.assertIn("test-session", missing)  # and it names what it does have
@@ -7630,7 +7630,7 @@ class TestCompaction(unittest.TestCase):
         self.assertNotIn("harnless elided", json.dumps(self._summary_request()))
 
     def test_thinking_stops_being_replayed_once_it_produced_its_turn(self):
-        h.start_session("interactive")
+        h.journal.start_session("interactive")
         messages = [{"role": "system", "content": "sys"}]
         for i in range(8):
             messages.append({"role": "user", "content": f"u{i} " + "x" * 1200})
@@ -7639,7 +7639,7 @@ class TestCompaction(unittest.TestCase):
                 "content": f"a{i}",
                 "reasoning_content": "r" * 4000,
             })
-        h._session_messages(messages, h.state.MAIN_CONV_ID)
+        h.journal._session_messages(messages, h.state.MAIN_CONV_ID)
         current = messages[-1]  # the thinking that produced the turn in progress
         self.assertTrue(self._compact(messages)[0])
         assistants = [m for m in messages[2:] if m.get("role") == "assistant"]
@@ -7657,7 +7657,7 @@ class TestCompaction(unittest.TestCase):
         h.state.COMPACT_DROP_REASONING = False
         messages = self._seed(8)
         messages.append({"role": "assistant", "content": "late", "reasoning_content": "r" * 4000})
-        h._session_message(messages[-1], h.state.MAIN_CONV_ID)
+        h.journal._session_message(messages[-1], h.state.MAIN_CONV_ID)
         self.assertTrue(self._compact(messages)[0])
         self.assertEqual(messages[-1].get("reasoning_content"), "r" * 4000)
         self.assertEqual(self._compacts()[0]["pruned_chars"], 0)
@@ -7727,11 +7727,11 @@ class TestCompaction(unittest.TestCase):
 
     def _spread_seed(self):
         """8 long user turns then 8 short replies — cheap to measure, big enough to cut."""
-        h.start_session("interactive")
+        h.journal.start_session("interactive")
         messages = [{"role": "system", "content": "sys"}]
         messages += [{"role": "user", "content": f"u{i} " + "x" * 2000} for i in range(8)]
         messages += [{"role": "assistant", "content": f"a{i}"} for i in range(8)]
-        h._session_messages(messages, h.state.MAIN_CONV_ID)
+        h.journal._session_messages(messages, h.state.MAIN_CONV_ID)
         return messages
 
     def test_a_reported_usage_is_what_the_tail_budget_is_counted_against(self):
@@ -7919,16 +7919,16 @@ class TestCompaction(unittest.TestCase):
 
     def test_a_sub_agent_compacts_its_own_run_in_its_own_log(self):
         conv_id = 7
-        h.start_session("interactive")  # the parent's log exists, and stays untouched
-        h._session_open(
-            conv_id, h._session_path(h.state.SESSION_ID, "1"),
+        h.journal.start_session("interactive")  # the parent's log exists, and stays untouched
+        h.journal._session_open(
+            conv_id, h.journal._session_path(h.state.SESSION_ID, "1"),
             {"depth": 1, "mode": "sub-agent", "subagent_id": "1"},
         )
         sub = [{"role": "system", "content": "sub sys"}, {"role": "user", "content": "the task"}]
         for i in range(8):
             sub.append({"role": "assistant", "content": f"a{i} " + "y" * 1600})
             sub.append({"role": "user", "content": f"u{i} " + "x" * 1600})
-        h._session_messages(sub, conv_id)
+        h.journal._session_messages(sub, conv_id)
         h.state.USAGE_BY_CONV[conv_id] = {"prompt_tokens": 9_000}  # over 85% of the window
         self._scripted(lambda m, d, t: ({"role": "assistant", "content": "sub done"}, True))
         buf = io.StringIO()

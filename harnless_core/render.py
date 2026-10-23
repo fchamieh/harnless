@@ -12,6 +12,7 @@ import unicodedata
 
 from harnless_core import config, state
 
+
 def set_color_enabled(enabled: bool):
     state.COLORS_ENABLED = enabled
 def set_emoji_enabled(enabled: bool):

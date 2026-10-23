@@ -94,12 +94,12 @@ STAGES = {
         "re:^_session_", "re:^log_", "start_session", "replay_session_tail",
         "resume_session", "_resume_target", "format_sessions", "_record_text",
         "_elision_note", "_seq_arg", "tool_sessions", "_transcript_note",
-        "_transcript_hint", "_session_span", "_md_block",
+        "_transcript_hint", "_session_span",
     ]},
     "compact": {"compact": [
-        "re:^_compact", "re:^_fit_", "re:^_prune_", "_system_prefix", "_thinking_prefix",
+        "re:^_compact", "re:^_fit_", "re:^_prune_", "_system_prefix",
         "_msg_tokens", "_turn_tokens", "_context_tokens_used", "_token_scale",
-        "_summary_request", "_transcript_note", "_compact_note", "compact_messages",
+        "compact_messages",
         "_compact_if_needed", "_recover_overflow", "set_auto_compact", "format_compaction",
         "estimate_context_chars", "estimate_context_tokens",
     ]},
@@ -282,6 +282,11 @@ PRE_RENAMES = [
     ("    def render(commit=False):", "    def redraw(commit=False):"),
     ("        render(commit=True)", "        redraw(commit=True)"),
     ("    render()", "    redraw()"),
+    # _session_files() built its own list named `paths`, shadowing the paths module.
+    ("    paths = []", "    logs = []"),
+    ("            paths.append(path)", "            logs.append(path)"),
+    ("    paths.sort(key=_session_mtime_key, reverse=True)", "    logs.sort(key=_session_mtime_key, reverse=True)"),
+    ("    return paths", "    return logs"),
 ]
 
 
@@ -302,7 +307,7 @@ def expand(names, by_name):
     out = []
     for entry in names:
         if isinstance(entry, str) and entry.startswith("re:"):
-            out += sorted(n for n in by_name if re.fullmatch(entry[3:], n))
+            out += sorted(n for n in by_name if re.search(entry[3:], n))
         else:
             out.append(entry)
     return out
@@ -343,7 +348,7 @@ def cmd_extract(stage: str):
             if start >= last_end:
                 picked.append((start, end))
                 last_end = end
-        body = "\n".join("\n".join(lines[s:e]) for s, e in picked)
+        body = "\n\n".join("\n".join(lines[s:e]).rstrip() for s, e in picked)
         PKG_DIR.mkdir(exist_ok=True)
         doc = DOCSTRINGS.get(module, f"{module}: part of harnless (see harnless.py).")
         text = f'"""{doc}"""\n\n# __IMPORTS__\n\n' + body + "\n"
