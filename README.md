@@ -1,6 +1,6 @@
 # harnless
 
-A minimal, single-file agent harness for local LLM servers. `harnless` talks to any
+A minimal agent harness for local LLM servers. `harnless` talks to any
 OpenAI-compatible chat API (built for a local [llama-server](https://github.com/ggml-org/llama.cpp))
 and gives the model a set of file and shell tools so it can read, write, search, and run
 commands in your working directory.
@@ -9,7 +9,7 @@ Pure Python standard library — **no dependencies, no venv, no build step**.
 
 ## Features
 
-- **Single file** — the entire harness is `harnless.py` (stdlib only)
+- **No dependencies** — `harnless.py` and a small `harnless_core/` package, standard library only
 - **OpenAI-compatible** — works with llama-server, llama.cpp, OpenRouter, or any `/v1/chat/completions` endpoint
 - **File & shell tools** — read/write/patch/search files and run shell commands (PowerShell on Windows, bash on POSIX)
 - **Sub-agents** — the `task` tool delegates self-contained work to a nested agent (configurable depth) and hands the result back as the sub-agent's closing summary
@@ -206,8 +206,8 @@ case (`grep` applies it to both the search pattern and `file_pattern`).
 They also skip what a **`.gitignore`** would hide: the same rules git applies in that
 directory, including nested `.gitignore` files (a nearer one outranks a shallower), `!`
 re-includes, `**`, and case-insensitive matching where the filesystem is. No `git` needed —
-the engine is in `harnless.py`, so it behaves the same outside a repository and on every
-platform. `list_dir` still reports what is really on disk.
+the matching is our own (`harnless_core/paths.py`), so it behaves the same outside a
+repository and on every platform. `list_dir` still reports what is really on disk.
 
 ```
 grep  {"path": "./", "pattern": "TODO"}                        # .gitignored files skipped
