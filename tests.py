@@ -2008,7 +2008,7 @@ class TestSubagents(unittest.TestCase):
         seen = {}
         calls = []
 
-        def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
+        def fake_stream_once(messages, model, tools=None, temperature=0.2, conv_id=None):
             depth = h.state._AGENT_DEPTH
             calls.append(depth)
             turn = seen.get(depth, 0)
@@ -2322,7 +2322,7 @@ class TestSubagents(unittest.TestCase):
     def test_run_agent_restores_depth_after_exit_tool(self):
         depths = []
 
-        def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
+        def fake_stream_once(messages, model, tools=None, temperature=0.2, conv_id=None):
             depths.append(h.state._AGENT_DEPTH)
             return (
                 {
@@ -2343,7 +2343,7 @@ class TestSubagents(unittest.TestCase):
         self.assertEqual(h.state._AGENT_DEPTH, 0)
 
     def test_run_agent_restores_depth_on_exception(self):
-        def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
+        def fake_stream_once(messages, model, tools=None, temperature=0.2, conv_id=None):
             raise RuntimeError("sub-agent exploded")
 
         old = h.stream_once
@@ -2459,7 +2459,7 @@ class TestSubagents(unittest.TestCase):
         """The top-level agent is not a sub-agent: an interrupt there keeps the
         long-standing behaviour (keep the partial, return 0)."""
 
-        def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
+        def fake_stream_once(messages, model, tools=None, temperature=0.2, conv_id=None):
             raise h.StreamInterrupted({"role": "assistant", "content": "partial answer"})
 
         old = h.stream_once
@@ -2479,7 +2479,7 @@ class TestSubagents(unittest.TestCase):
         h.state.SUBAGENT_STEP_LIMIT = 3
         depths = []
 
-        def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
+        def fake_stream_once(messages, model, tools=None, temperature=0.2, conv_id=None):
             depths.append(h.state._AGENT_DEPTH)
             return (self._tool_turn("todo", {"action": "list"}), True)
 
@@ -2599,7 +2599,7 @@ class TestSubagents(unittest.TestCase):
         self.assertEqual(h.caps._clamp_int(-5, 0, h.config.SUBAGENT_STEPS_CEILING), 0)
 
     def test_run_agent_exit_returns_code(self):
-        def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
+        def fake_stream_once(messages, model, tools=None, temperature=0.2, conv_id=None):
             return ({"role": "assistant", "content": "", "tool_calls": [
                 {"id": "c1", "type": "function",
                  "function": {"name": "exit", "arguments": '{"code": 7, "message": "done"}'}}]}, True)
@@ -5105,7 +5105,7 @@ class TestTodo(Base):
         self.assertEqual(len(messages), 2)  # re-added list injects again
 
     def test_run_agent_injects_reminder(self):
-        def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
+        def fake_stream_once(messages, model, tools=None, temperature=0.2, conv_id=None):
             if len(messages) == 1:
                 return ({"role": "assistant", "content": "", "tool_calls": [
                     {"id": "c1", "type": "function",
@@ -5851,7 +5851,7 @@ class TestInterrupt(Base):
             def attach_socket(self, sock):
                 pass
 
-        def fake_stream_chat(messages, model, interactive=False, temperature=0.2, watcher=None, progress=None, conv_id=None):
+        def fake_stream_chat(messages, model, tools=None, temperature=0.2, watcher=None, progress=None, conv_id=None):
             yield {"content": "partial"}
 
         old_enabled = h.state.INTERRUPT_ENABLED
@@ -5887,7 +5887,7 @@ class TestInterrupt(Base):
             def attach_socket(self, sock):
                 pass
 
-        def fake_stream_chat(messages, model, interactive=False, temperature=0.2, watcher=None, progress=None, conv_id=None):
+        def fake_stream_chat(messages, model, tools=None, temperature=0.2, watcher=None, progress=None, conv_id=None):
             yield from ()
 
         old_enabled = h.state.INTERRUPT_ENABLED
@@ -5907,7 +5907,7 @@ class TestInterrupt(Base):
         self.assertIn("(interrupted)", buf.getvalue())
 
     def test_run_agent_interrupt_keeps_partial_strips_tool_calls(self):
-        def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
+        def fake_stream_once(messages, model, tools=None, temperature=0.2, conv_id=None):
             raise h.StreamInterrupted(
                 {
                     "role": "assistant",
@@ -5933,7 +5933,7 @@ class TestInterrupt(Base):
         self.assertEqual(messages[-1], {"role": "assistant", "content": "partial answer"})
 
     def test_run_agent_interrupt_empty_appends_nothing(self):
-        def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
+        def fake_stream_once(messages, model, tools=None, temperature=0.2, conv_id=None):
             raise h.StreamInterrupted({"role": "assistant"})
 
         old = h.stream_once
@@ -5951,7 +5951,7 @@ class TestInterrupt(Base):
         reject assistant messages without content/tool_calls, which would
         break every later request in the conversation."""
 
-        def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
+        def fake_stream_once(messages, model, tools=None, temperature=0.2, conv_id=None):
             raise h.StreamInterrupted(
                 {"role": "assistant", "reasoning_content": "still thinking"}
             )
@@ -5970,7 +5970,7 @@ class TestInterrupt(Base):
         """Stripping the half-formed tool calls leaves a content-less
         partial (reasoning only), which is dropped too."""
 
-        def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
+        def fake_stream_once(messages, model, tools=None, temperature=0.2, conv_id=None):
             raise h.StreamInterrupted(
                 {
                     "role": "assistant",
@@ -5996,7 +5996,7 @@ class TestInterrupt(Base):
         self.assertEqual(len(messages), 1)
 
     def test_run_agent_interrupt_content_and_reasoning_kept(self):
-        def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
+        def fake_stream_once(messages, model, tools=None, temperature=0.2, conv_id=None):
             raise h.StreamInterrupted(
                 {
                     "role": "assistant",
@@ -6028,6 +6028,123 @@ class TestInterrupt(Base):
         watcher.stop()
 
 
+class TestToolsArePassedDown(unittest.TestCase):
+    """Who decides what a request advertises.
+
+    The request layer sends the tool schemas it is handed and none when handed none;
+    choosing them (`_active_tools`, which tool set an agent turn advertises) is the agent
+    layer's job. That split is what lets the request and compaction code live below the
+    agent instead of reaching up into the entry point.
+    """
+
+    def setUp(self):
+        self._saved = (h.state.API_URL, h.state.MCP_TOOLS, h.state.DISABLED_TOOLS)
+        h.state.API_URL = "http://127.0.0.1:1/v1/chat/completions"
+        self._stream_once = h.stream_once
+
+    def tearDown(self):
+        h.state.API_URL, h.state.MCP_TOOLS, h.state.DISABLED_TOOLS = self._saved
+        h.stream_once = self._stream_once
+
+    def _sent(self, fn, *args, **kw):
+        """Run a request function with the transport stubbed, returning its JSON payload."""
+
+        class Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def __iter__(self):
+                return iter([b"data: [DONE]\n"])
+
+            def read(self):
+                return b'{"choices": [{"message": {"role": "assistant", "content": "ok"}}]}'
+
+        seen = {}
+
+        def open_request(req, progress=None, attach=None):
+            seen["payload"] = json.loads(req.data.decode("utf-8"))
+            return Resp(b"")
+
+        old = h._open_request
+        h._open_request = open_request
+        self.addCleanup(setattr, h, "_open_request", old)
+        fn(*args, **kw)
+        return seen["payload"]
+
+    def _tool_names(self, fn, *args, **kw):
+        """Patch stream_once with a spy, run `fn`, and return the tools each request got."""
+        calls = []
+
+        def fake_stream_once(messages, model, tools=None, temperature=0.2, conv_id=None):
+            calls.append({s["function"]["name"] for s in (tools or [])})
+            return {"role": "assistant", "content": "done"}, True
+
+        h.stream_once = fake_stream_once
+        fn(*args, **kw)
+        return calls
+
+    def test_request_body_sends_what_it_is_handed(self):
+        spec = {"type": "function", "function": {"name": "grep", "parameters": {}}}
+        body = h._request_body([{"role": "user", "content": "x"}], "m", tools=[spec])
+        self.assertEqual(body["tools"], [spec])
+        self.assertEqual(body["tool_choice"], "auto")
+
+    def test_request_body_without_tools_sends_neither_key(self):
+        for tools in (None, []):
+            body = h._request_body([{"role": "user", "content": "x"}], "m", tools=tools)
+            self.assertNotIn("tools", body)
+            self.assertNotIn("tool_choice", body)
+
+    def test_chat_sends_the_tools_it_was_given(self):
+        msgs = [{"role": "user", "content": "x"}]
+        spec = {"type": "function", "function": {"name": "grep", "parameters": {}}}
+        payload = self._sent(h.chat, msgs, "m", tools=[spec])
+        self.assertEqual(payload["tools"], [spec])
+        self.assertNotIn("tools", self._sent(h.chat, msgs, "m"))
+
+    def test_stream_chat_sends_the_tools_it_was_given(self):
+        msgs = [{"role": "user", "content": "x"}]
+        spec = {"type": "function", "function": {"name": "grep", "parameters": {}}}
+        stream = lambda *a, **k: list(h.stream_chat(*a, **k))
+        self.assertEqual(self._sent(stream, msgs, "m", tools=[spec])["tools"], [spec])
+        self.assertNotIn("tools", self._sent(stream, msgs, "m"))
+
+    def test_an_agent_turn_advertises_the_active_tools(self):
+        calls = self._tool_names(
+            h.run_agent, [{"role": "user", "content": "go"}], "m",
+            interactive=True, temperature=0.2,
+        )
+        self.assertEqual(
+            sorted(calls[0]), sorted(s["function"]["name"] for s in h._active_tools(True))
+        )  # what the agent layer decided, unchanged on the way down
+
+    def test_a_tool_toggled_off_leaves_the_next_request(self):
+        h.state.DISABLED_TOOLS = {"fetch_url"}
+        calls = self._tool_names(
+            h.run_agent, [{"role": "user", "content": "go"}], "m",
+            interactive=True, temperature=0.2,
+        )
+        self.assertNotIn("fetch_url", calls[0])
+        self.assertIn("grep", calls[0])
+
+    def test_a_sub_agent_turn_advertises_the_non_interactive_set(self):
+        # `exit` belongs to a sub-agent's own table; the interactive REPL hides it
+        # (OPENAI_TOOLS_INTERACTIVE), so the two turns advertise different sets.
+        calls = self._tool_names(
+            h.run_agent, [{"role": "user", "content": "go"}], "m",
+            interactive=False, temperature=0.2,
+        )
+        self.assertIn("exit", calls[0])
+        calls = self._tool_names(
+            h.run_agent, [{"role": "user", "content": "go"}], "m",
+            interactive=True, temperature=0.2,
+        )
+        self.assertNotIn("exit", calls[0])
+
+
 class TestContextProgress(unittest.TestCase):
     def _big_messages(self):
         # Well over CONTEXT_PROGRESS_THRESHOLD tokens (chars/4).
@@ -6051,8 +6168,8 @@ class TestContextProgress(unittest.TestCase):
             {"role": "tool", "tool_call_id": "1", "content": "e" * 20},
         ]
         total = 220 + len(json.dumps(h._active_tools(True)))
-        self.assertEqual(h.estimate_context_chars(messages, interactive=True), total)
-        self.assertEqual(h.estimate_context_tokens(messages, interactive=True), total // 4)
+        self.assertEqual(h.estimate_context_chars(messages, h._active_tools(True)), total)
+        self.assertEqual(h.estimate_context_tokens(messages, h._active_tools(True)), total // 4)
 
     def test_format_tokens(self):
         self.assertEqual(h.render._format_tokens(999), "999")
@@ -6066,7 +6183,7 @@ class TestContextProgress(unittest.TestCase):
         self.assertEqual(h.render._format_elapsed(75), "1m15s")
 
     def test_noop_below_threshold(self):
-        spinner = h.ContextProgress([{"role": "user", "content": "hi"}], interactive=True)
+        spinner = h.ContextProgress([{"role": "user", "content": "hi"}], h._active_tools(True))
         spinner.start()
         self.assertFalse(spinner.active)
         spinner.stop()
@@ -6074,13 +6191,13 @@ class TestContextProgress(unittest.TestCase):
     def test_noop_without_tty(self):
         if sys.stdout.isatty():
             self.skipTest("stdout is a tty")
-        spinner = h.ContextProgress(self._big_messages(), interactive=True)
+        spinner = h.ContextProgress(self._big_messages(), h._active_tools(True))
         spinner.start()
         self.assertFalse(spinner.active)
         spinner.stop()
 
     def test_line_shows_upload_progress(self):
-        spinner = h.ContextProgress([{"role": "user", "content": "hi"}], interactive=True)
+        spinner = h.ContextProgress([{"role": "user", "content": "hi"}], h._active_tools(True))
         spinner.tokens = 32_000
         spinner.upload = h._UploadProgress(1000)
         spinner.upload.sent = 450
@@ -6091,7 +6208,7 @@ class TestContextProgress(unittest.TestCase):
         self.assertIn("14.4k/32.0k", line)
 
     def test_line_waiting_state(self):
-        spinner = h.ContextProgress([{"role": "user", "content": "hi"}], interactive=True)
+        spinner = h.ContextProgress([{"role": "user", "content": "hi"}], h._active_tools(True))
         spinner.tokens = 32_000
         spinner.upload = h._UploadProgress(1000)
         spinner.upload.sent = 1000  # upload complete
@@ -6105,7 +6222,7 @@ class TestContextProgress(unittest.TestCase):
         self.addCleanup(setattr, h.state, "CONTEXT_PROGRESS_DELAY", old_delay)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf), mock.patch.object(buf, "isatty", return_value=True):
-            spinner = h.ContextProgress(self._big_messages(), interactive=True)
+            spinner = h.ContextProgress(self._big_messages(), h._active_tools(True))
             spinner.start()
             self.assertTrue(spinner.active)
             deadline = time.time() + 5
@@ -6123,7 +6240,7 @@ class TestContextProgress(unittest.TestCase):
         self.addCleanup(setattr, h.state, "CONTEXT_PROGRESS_DELAY", old_delay)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf), mock.patch.object(buf, "isatty", return_value=True):
-            spinner = h.ContextProgress(self._big_messages(), interactive=True)
+            spinner = h.ContextProgress(self._big_messages(), h._active_tools(True))
             spinner.start()
             deadline = time.time() + 5
             while "waiting for first token" not in buf.getvalue() and time.time() < deadline:
@@ -6318,7 +6435,7 @@ class TestSessionLog(unittest.TestCase):
         """Install a scripted stream_once: decide(messages, depth, turn) -> (msg, True)."""
         seen = {}
 
-        def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
+        def fake_stream_once(messages, model, tools=None, temperature=0.2, conv_id=None):
             depth = h.state._AGENT_DEPTH
             turn = seen.get(depth, 0)
             seen[depth] = turn + 1
@@ -6435,7 +6552,7 @@ class TestSessionLog(unittest.TestCase):
         self.assertEqual(record["content"][0]["text"], "see")
 
     def test_interrupted_partial_is_journaled(self):
-        def interrupted(messages, model, interactive=False, temperature=0.2, conv_id=None):
+        def interrupted(messages, model, tools=None, temperature=0.2, conv_id=None):
             raise h.StreamInterrupted(
                 {"role": "assistant", "content": "half a sentence", "tool_calls": [self._call("get_cwd", {})]}
             )
@@ -7117,10 +7234,9 @@ class TestCompaction(unittest.TestCase):
         self.notes = []  # every request the summariser was asked to write
         self.turns = []  # what each model turn was actually shown
 
-        def summariser(messages, model, interactive=False, temperature=0.2,
-                       conv_id=None, send_tools=True):
+        def summariser(messages, model, tools=None, temperature=0.2, conv_id=None):
             self.notes.append({
-                "messages": messages, "send_tools": send_tools, "conv_id": conv_id,
+                "messages": messages, "tools": tools, "conv_id": conv_id,
             })
             return {
                 "choices": [{"message": {"role": "assistant", "content": "HANDOFF NOTE"}}],
@@ -7161,7 +7277,7 @@ class TestCompaction(unittest.TestCase):
         compaction happen *between* requests rather than after them."""
         seen = {}
 
-        def fake_stream_once(messages, model, interactive=False, temperature=0.2, conv_id=None):
+        def fake_stream_once(messages, model, tools=None, temperature=0.2, conv_id=None):
             depth = h.state._AGENT_DEPTH
             turn = seen.get(depth, 0)
             seen[depth] = turn + 1
@@ -7192,7 +7308,8 @@ class TestCompaction(unittest.TestCase):
 
     def _compact(self, messages, reason="manual"):
         return h.compact_messages(
-            messages, h.state.MAIN_CONV_ID, model="test-model", reason=reason, interactive=True
+            messages, h.state.MAIN_CONV_ID, model="test-model", reason=reason,
+            tools=h._active_tools(True)
         )
 
     def _run(self, **kw):
@@ -7334,17 +7451,17 @@ class TestCompaction(unittest.TestCase):
         self._compact(messages)
         self.assertEqual(len(self.notes), 1)
         request = self._summary_request()
-        self.assertFalse(self.notes[0]["send_tools"])
+        self.assertIsNone(self.notes[0]["tools"])  # the note is written, not acted on
         self.assertEqual(request[0]["role"], "system")
         self.assertEqual(request[0]["content"], h.config.COMPACT_SUMMARY_PROMPT)
-        body = h._request_body(request, "test-model", send_tools=False)
+        body = h._request_body(request, "test-model")
         self.assertNotIn("tools", body)
         self.assertNotIn("tool_choice", body)  # no tool_choice without tools to choose
 
     def test_the_note_is_capped(self):
-        def long_note(messages, model, interactive=False, temperature=0.2,
-                      conv_id=None, send_tools=True):
-            self.notes.append({"messages": messages, "send_tools": send_tools, "conv_id": conv_id})
+        def long_note(messages, model, tools=None, temperature=0.2,
+                      conv_id=None):
+            self.notes.append({"messages": messages, "tools": tools, "conv_id": conv_id})
             return {"choices": [{"message": {"role": "assistant", "content": "n" * 20_000}}]}
 
         h.chat = long_note
@@ -7484,8 +7601,8 @@ class TestCompaction(unittest.TestCase):
         self.assertIn(f"#{record['seq']} [", out)
 
     def test_a_gap_made_without_a_note_says_the_note_failed(self):
-        def broken(messages, model, interactive=False, temperature=0.2,
-                   conv_id=None, send_tools=True):
+        def broken(messages, model, tools=None, temperature=0.2,
+                   conv_id=None):
             raise urllib.error.URLError("no route to the summariser")
 
         h.chat = broken
@@ -7552,8 +7669,8 @@ class TestCompaction(unittest.TestCase):
     # ---- when the summarising request fails
 
     def test_fallback_note_when_the_summarising_request_fails(self):
-        def broken(messages, model, interactive=False, temperature=0.2,
-                   conv_id=None, send_tools=True):
+        def broken(messages, model, tools=None, temperature=0.2,
+                   conv_id=None):
             raise urllib.error.URLError("no route to the summariser")
 
         h.chat = broken
@@ -7570,9 +7687,9 @@ class TestCompaction(unittest.TestCase):
         self.assertIn("placeholder", report)
 
     def test_summariser_retries_smaller_when_the_head_itself_is_too_big(self):
-        def too_big(messages, model, interactive=False, temperature=0.2,
-                    conv_id=None, send_tools=True):
-            self.notes.append({"messages": messages, "send_tools": send_tools, "conv_id": conv_id})
+        def too_big(messages, model, tools=None, temperature=0.2,
+                    conv_id=None):
+            self.notes.append({"messages": messages, "tools": tools, "conv_id": conv_id})
             if len(self.notes) == 1:
                 raise h.errors.ContextOverflow("HTTP 400: prompt is too long")
             return {"choices": [{"message": {"role": "assistant", "content": "SMALLER NOTE"}}]}
@@ -7697,7 +7814,7 @@ class TestCompaction(unittest.TestCase):
         seed = [{"role": "user", "content": f"u{i} " + "x" * 2000} for i in range(8)]
         seed += [{"role": "assistant", "content": f"a{i}"} for i in range(8)]
         self.assertLess(
-            h.estimate_context_tokens(seed, True), 20_000 * h.state.COMPACT_THRESHOLD_PCT // 100
+            h.estimate_context_tokens(seed, h._active_tools(True)), 20_000 * h.state.COMPACT_THRESHOLD_PCT // 100
         )  # the estimate alone would not have triggered it
         h.state.USAGE_BY_CONV[h.state.MAIN_CONV_ID] = {"prompt_tokens": 18_000}
         code, _, _ = self._seeded_run(decide=lambda m, d, t: (
@@ -7717,7 +7834,7 @@ class TestCompaction(unittest.TestCase):
         # the threshold while the conversation is nowhere near it. Compacting would cut
         # turns that were never what filled the context — that overflow is the reactive
         # trigger's, and it says plainly when compaction cannot help.
-        self.assertGreater(h.estimate_context_tokens(request, True), threshold)
+        self.assertGreater(h.estimate_context_tokens(request, h._active_tools(True)), threshold)
         self.assertLess(h._turn_tokens(request), threshold)
         self._scripted(lambda m, d, t: ({"role": "assistant", "content": "done"}, True))
         code, _, _ = self._run(seed=seed)
@@ -7842,15 +7959,14 @@ class TestCompaction(unittest.TestCase):
     def test_a_refused_prompt_on_the_non_streaming_path_compacts_too(self):
         seed = [{"role": "user", "content": f"u{i} " + "x" * 1200} for i in range(8)]
 
-        def no_deltas(messages, model, interactive=False, temperature=0.2, conv_id=None):
+        def no_deltas(messages, model, tools=None, temperature=0.2, conv_id=None):
             return {"role": "assistant", "content": "no deltas"}, False  # run_agent falls back
 
         h.stream_once = no_deltas
 
-        def chat(messages, model, interactive=False, temperature=0.2, conv_id=None,
-                 send_tools=True):
-            if not send_tools:  # the handoff note request
-                self.notes.append({"messages": messages, "send_tools": send_tools,
+        def chat(messages, model, tools=None, temperature=0.2, conv_id=None):
+            if tools is None:  # the handoff note request: written, not acted on
+                self.notes.append({"messages": messages, "tools": tools,
                                    "conv_id": conv_id})
                 return {"choices": [{"message": {"role": "assistant", "content": "HANDOFF"}}]}
             raise h.errors.ContextOverflow("HTTP 400: maximum context length exceeded")
@@ -7864,8 +7980,6 @@ class TestCompaction(unittest.TestCase):
         self.assertEqual(len(self.notes), 1)  # one note, one retry — not a loop
         self.assertIn("out of context", out)
         self.assertIn("test-session", out)  # and where the transcript still is
-
-        self.assertEqual(len(self.notes), 1)  # one note, one retry — not a loop
 
     def test_overflow_recognition_is_about_size_not_any_bad_request(self):
         def rejected(code, body):

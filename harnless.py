@@ -221,10 +221,8 @@ def _compact_summary(head: list, budget: int, model: str, scale: float = 1.0) ->
                 [{"role": "system", "content": config.COMPACT_SUMMARY_PROMPT}]
                 + _fit_head(head, room, scale),
                 model or state.MODEL,
-                interactive=False,
                 temperature=state.TEMPERATURE,
-                conv_id=conv_id,
-                send_tools=False,
+                conv_id=conv_id,  # tools stay None: this request only writes the note
             )
         except errors.ContextOverflow as e:
             # The head we are trying to summarise is what overflowed: read less of it.
@@ -246,7 +244,7 @@ def _compact_summary(head: list, budget: int, model: str, scale: float = 1.0) ->
 
 
 def compact_messages(messages: list, conv_key, model: str = "", reason: str = "manual",
-                     interactive: bool = False) -> tuple:
+                     tools: list = None) -> tuple:
     """Replace a conversation's oldest turns with one handoff note the model wrote.
 
     The head — everything above the verbatim tail — is pruned first (an oversized tool
@@ -275,7 +273,7 @@ def compact_messages(messages: list, conv_key, model: str = "", reason: str = "m
     turn_tokens = _turn_tokens(messages)
     # What the whole request looked like (tool schemas and system prompt included):
     # the part compaction cannot touch, recorded next to the part it cut.
-    request_tokens = estimate_context_tokens(messages, interactive)
+    request_tokens = estimate_context_tokens(messages, tools)
     scale = _token_scale(used, turn_tokens)
     # With no window known (--context-window unset, nothing probed), compare against
     # what this conversation is actually using instead of a window we don't have.
@@ -376,7 +374,7 @@ def compact_messages(messages: list, conv_key, model: str = "", reason: str = "m
     return True, report
 
 
-def _compact_if_needed(messages: list, conv_key, model: str = "", interactive: bool = False) -> bool:
+def _compact_if_needed(messages: list, conv_key, model: str = "", tools: list = None) -> bool:
     """Proactive trigger: compact before the next request once this conversation's
     turns cross COMPACT_THRESHOLD_PCT of the window, rather than waiting for the server
     to refuse the request (what the server reported for it wins when it has said so —
@@ -393,7 +391,7 @@ def _compact_if_needed(messages: list, conv_key, model: str = "", interactive: b
     if used < threshold:
         return False
     ok, note = compact_messages(
-        messages, conv_key, model=model, reason="proactive", interactive=interactive
+        messages, conv_key, model=model, reason="proactive", tools=tools
     )
     if ok:
         print(state.OUTPUT_INDENT + render.colorize(f"{render.icon('wait')} {note}", "dim"))
@@ -414,7 +412,7 @@ def _compact_if_needed(messages: list, conv_key, model: str = "", interactive: b
 
 
 def _recover_overflow(messages: list, conv_key, model: str, reason: str,
-                      attempts: int, interactive: bool = False) -> bool:
+                      attempts: int, tools: list = None) -> bool:
     """Reactive trigger: the server rejected the prompt for being too long. Compact and
     let the caller retry the turn — up to COMPACT_MAX_ATTEMPTS times, which is why the
     caller counts them.
@@ -434,7 +432,7 @@ def _recover_overflow(messages: list, conv_key, model: str, reason: str,
         return False
     print(state.OUTPUT_INDENT + render.colorize(f"{render.icon('wait')} the server rejected the prompt: {reason}", "error"))
     ok, note = compact_messages(
-        messages, conv_key, model=model, reason="overflow", interactive=interactive
+        messages, conv_key, model=model, reason="overflow", tools=tools
     )
     if not ok:
         print(
@@ -3518,8 +3516,8 @@ class ContextProgress:
     clobber them, and stop() clears the right line.
     """
 
-    def __init__(self, messages: list, interactive: bool = False):
-        self.tokens = estimate_context_tokens(messages, interactive)
+    def __init__(self, messages: list, tools: list = None):
+        self.tokens = estimate_context_tokens(messages, tools)
         self.upload = None  # _UploadProgress, set by _open_request before sending
         self._stop = threading.Event()
         self._thread = None
@@ -4020,22 +4018,15 @@ def _open_request(req: urllib.request.Request, progress=None, on_socket=None):
 def chat(
     messages: list,
     model: str,
-    interactive: bool = False,
+    tools: list = None,
     temperature: float = 1.0,
     conv_id: int = None,
-    send_tools: bool = True,
 ) -> dict:
     payload = json.dumps(
-        _request_body(
-            messages,
-            model,
-            interactive=interactive,
-            temperature=temperature,
-            send_tools=send_tools,
-        )
+        _request_body(messages, model, tools=tools, temperature=temperature)
     ).encode("utf-8")
     req = urllib.request.Request(state.API_URL, data=payload, headers=_headers())
-    spinner = ContextProgress(messages, interactive)
+    spinner = ContextProgress(messages, tools)
     spinner.start()
     try:
         with _open_request(req, spinner if spinner.active else None) as resp:
@@ -4057,19 +4048,20 @@ def _request_body(
     messages: list,
     model: str,
     stream=None,
-    interactive: bool = False,
+    tools: list = None,
     temperature: float = 1.0,
-    send_tools: bool = True,
 ) -> dict:
     """What a chat request sends.
 
-    `stream=None` (the non-streaming call) omits the key entirely; `send_tools=False`
-    leaves `tools` and `tool_choice` out — a request whose job is to write something,
-    like a compaction handoff note, must not be one the server answers with a tool call.
+    `stream=None` (the non-streaming call) omits the key entirely. `tools` is the list of
+    tool schemas this request may answer with: None or empty sends none — a request whose
+    job is to write something, like a compaction handoff note, must not be one the server
+    answers with a tool call. Which schemas the agent's own turns advertise is the agent
+    layer's call (`_active_tools`); this layer is told, it does not decide.
     """
     body: dict = {"model": model, "messages": messages, "temperature": temperature}
-    if send_tools:
-        body["tools"] = _active_tools(interactive)
+    if tools:
+        body["tools"] = tools
         body["tool_choice"] = "auto"
     if stream is not None:
         body["stream"] = stream
@@ -4083,19 +4075,11 @@ def _build_request(
     messages: list,
     model: str,
     stream: bool,
-    interactive: bool = False,
+    tools: list = None,
     temperature: float = 1.0,
-    send_tools: bool = True,
 ) -> urllib.request.Request:
     payload = json.dumps(
-        _request_body(
-            messages,
-            model,
-            stream,
-            interactive=interactive,
-            temperature=temperature,
-            send_tools=send_tools,
-        )
+        _request_body(messages, model, stream, tools=tools, temperature=temperature)
     ).encode("utf-8")
     return urllib.request.Request(state.API_URL, data=payload, headers=_headers())
 
@@ -4130,7 +4114,7 @@ def parse_sse_line(line: str):
 def stream_chat(
     messages: list,
     model: str,
-    interactive: bool = False,
+    tools: list = None,
     temperature: float = 1.0,
     watcher=None,
     progress=None,
@@ -4138,15 +4122,13 @@ def stream_chat(
 ):
     """Yield deltas from a streaming chat response until [DONE].
 
-    If `watcher` (an InterruptWatcher) is given, the connection and response
-    sockets are attached to it and the stream stops once it is triggered: a
-    double ESC during the request-body upload closes the upload socket and
-    aborts the send. If `progress` (a ContextProgress) is given, the
-    request-body upload is tracked in it.
+    `tools` is what this request advertises (see _request_body). If `watcher` (an
+    InterruptWatcher) is given, the connection and response sockets are attached to it and
+    the stream stops once it is triggered: a double ESC during the request-body upload
+    closes the upload socket and aborts the send. If `progress` (a ContextProgress) is
+    given, the request-body upload is tracked in it.
     """
-    req = _build_request(
-        messages, model, stream=True, interactive=interactive, temperature=temperature
-    )
+    req = _build_request(messages, model, stream=True, tools=tools, temperature=temperature)
     try:
         resp_cm = _open_request(req, progress, watcher.attach_socket if watcher else None)
     except urllib.error.HTTPError as e:
@@ -4223,7 +4205,7 @@ def accumulate_delta(message: dict, delta: dict) -> dict:
 def stream_once(
     messages: list,
     model: str,
-    interactive: bool = False,
+    tools: list = None,
     temperature: float = 1.0,
     conv_id: int = None,
 ) -> tuple[dict, bool]:
@@ -4241,7 +4223,7 @@ def stream_once(
     watcher = InterruptWatcher() if state.INTERRUPT_ENABLED else None
     if watcher is not None:
         watcher.start()
-    spinner = ContextProgress(messages, interactive)
+    spinner = ContextProgress(messages, tools)
     spinner.start()
     if watcher is not None:
         # the esc hint prints 2 lines below the progress line; tell the
@@ -4251,7 +4233,7 @@ def stream_once(
         for delta in stream_chat(
             messages,
             model,
-            interactive=interactive,
+            tools=tools,
             temperature=temperature,
             watcher=watcher,
             progress=spinner if spinner.active else None,
@@ -4603,14 +4585,14 @@ def tools_menu(keys=None) -> bool:
     return applied
 
 
-def estimate_context_chars(messages: list, interactive: bool = False) -> int:
+def estimate_context_chars(messages: list, tools: list = None) -> int:
     """Approximate character count of the next request payload.
 
-    Counts the tool schemas (sent with every request) plus all message
-    content (text, reasoning, tool-call arguments). Dividing by 4 gives a
-    rough token estimate — the same heuristic /status uses.
+    Counts the tool schemas the request will advertise (`tools`, see _request_body — the
+    caller decides them) plus all message content (text, reasoning, tool-call arguments).
+    Dividing by 4 gives a rough token estimate — the same heuristic /status uses.
     """
-    total = len(json.dumps(_active_tools(interactive)))
+    total = len(json.dumps(tools or []))
     for m in messages:
         total += caps._content_chars(m.get("content"))
         total += len(m.get("reasoning_content") or "")
@@ -4619,15 +4601,15 @@ def estimate_context_chars(messages: list, interactive: bool = False) -> int:
     return total
 
 
-def estimate_context_tokens(messages: list, interactive: bool = False) -> int:
+def estimate_context_tokens(messages: list, tools: list = None) -> int:
     """Rough token count of the next request (chars/4)."""
-    return estimate_context_chars(messages, interactive) // 4
+    return estimate_context_chars(messages, tools) // 4
 
 
 def format_status(messages: list, context_window: int = 0, conv_id: int = None) -> str:
     """Build the /status report: context usage, API URL, tool names, MCP servers."""
     tools = _active_tools(True)
-    total_chars = estimate_context_chars(messages, interactive=True)
+    total_chars = estimate_context_chars(messages, tools)
     approx_tokens = total_chars // 4
     usage = state.USAGE_BY_CONV.get(conv_id if conv_id is not None else id(messages))
     prompt_tokens = (
@@ -4869,7 +4851,10 @@ def _agent_loop(
             journal._session_message(messages[-1], conv_key)
         # Make room before asking, not after the server refuses: compact when this
         # conversation's usage has crossed the threshold of the window.
-        _compact_if_needed(messages, conv_key, model, interactive)
+        # What this turn advertises is the agent's decision (which tools the model may
+        # call); the request layer only sends the list it is handed — see _request_body.
+        tools = _active_tools(interactive)
+        _compact_if_needed(messages, conv_key, model, tools)
         steps += 1
         # A rejected-for-size prompt gets retried after compacting — one turn either
         # way, so `steps` counts it once, and `attempts` is how many times compaction
@@ -4882,14 +4867,14 @@ def _agent_loop(
                 message, streamed = stream_once(
                     messages,
                     model,
-                    interactive=interactive,
+                    tools=tools,
                     temperature=temperature,
                     conv_id=conv_id,
                 )
                 if not streamed:
                     message = None
             except errors.ContextOverflow as e:
-                if not _recover_overflow(messages, conv_key, model, str(e), attempts, interactive):
+                if not _recover_overflow(messages, conv_key, model, str(e), attempts, tools):
                     print(
                         state.OUTPUT_INDENT
                         + render.colorize(f"{render.icon('error')} out of context ({e}) — this run stops here", "error")
@@ -4929,12 +4914,12 @@ def _agent_loop(
                     data = chat(
                         messages,
                         model,
-                        interactive=interactive,
+                        tools=tools,
                         temperature=temperature,
                         conv_id=conv_id,
                     )
                 except errors.ContextOverflow as e:
-                    if not _recover_overflow(messages, conv_key, model, str(e), attempts, interactive):
+                    if not _recover_overflow(messages, conv_key, model, str(e), attempts, tools):
                         print(
                             state.OUTPUT_INDENT
                             + render.colorize(f"{render.icon('error')} out of context ({e}) — this run stops here", "error")
@@ -5431,7 +5416,8 @@ def main():
             continue
         if user_input == "/compact":
             ok, note = compact_messages(
-                messages, state.MAIN_CONV_ID, model=args.model, reason="manual", interactive=True
+                messages, state.MAIN_CONV_ID, model=args.model, reason="manual",
+                tools=_active_tools(True),
             )
             print(render.colorize(note, "dim" if ok else "error"))
             continue
