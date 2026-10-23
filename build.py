@@ -16,11 +16,14 @@ Usage:
 
 Requires:  pip install nuitka
            (Windows: a C compiler, or Nuitka downloads MinGW64 automatically;
+            Linux: also 'pip install scons' -- build.py then has Nuitka use the
+                   complete SCons instead of its stripped inline copy;
             macOS: Xcode Command Line Tools, `xcode-select --install`)
 Output:    dist/harnless  (dist/harnless.exe on Windows)
 """
 
 import argparse
+import importlib.util
 import shutil
 import subprocess
 import sys
@@ -48,6 +51,12 @@ def nuitka_available() -> bool:
         text=True,
     )
     return probe.returncode == 0
+
+
+def system_scons_available() -> bool:
+    """True when a complete SCons is importable (Nuitka's own is stripped)."""
+    return importlib.util.find_spec("SCons") is not None
+
 
 
 def find_container_engine() -> str | None:
@@ -151,6 +160,12 @@ def main() -> int:
     ]
     if args.lto:
         cmd.append("--lto=yes")
+    if platform == "linux" and system_scons_available():
+        # Nuitka 4.3+ bundles a stripped SCons without the 'ilink' tool module its
+        # Linux linker probe asks for ('No tool module 'ilink' found' -> the C
+        # build aborts; Nuitka issue #3734). A complete SCons declines the probe
+        # and falls back to gnulink. The harnless-builder image installs it.
+        cmd.append("--experimental=force-system-scons")
     if platform == "windows":
         cmd.append("--windows-console-mode=force")
     cmd.append(str(SOURCE))

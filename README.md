@@ -230,6 +230,9 @@ max 3600s) the whole process tree is killed and whatever it printed so far is re
 
 ```bash
 pip install "nuitka[onefile]"   # zstandard enables onefile compression
+pip install scons               # Linux only: Nuitka 4.3's bundled SCons is stripped of the
+                                # 'ilink' tool its linker probe needs (issue #3734); build.py
+                                # then passes --experimental=force-system-scons automatically
 python build.py                 # single-file binary -> dist/harnless (dist/harnless.exe on Windows)
 python build.py --onedir        # folder build (faster startup, fewer AV false positives)
 python build.py --lto           # link-time optimization (faster binary, slower build)
