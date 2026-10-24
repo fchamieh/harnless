@@ -589,6 +589,211 @@ class TestGlob(Base):
         self.assertEqual(out, "error: path not found: ./_test_tmp/nope")
 
 
+class TestSearchDepth(Base):
+    """`depth` narrows grep/glob/list_dir to that many directory levels.
+
+    Levels count the path searched as 1, so 1 means "only what is directly inside
+    it" and 2 adds one level of subdirectories; omitting it keeps the whole subtree,
+    which is what every other search test assumes. It has no ceiling because the
+    knob can only ever ask for *less* than the default walk.
+    """
+
+    NOTE = "; pass a larger depth (or omit it) to search"
+
+    def setUp(self):
+        super().setUp()
+        self.w("top.txt", "AAA top\n")
+        self.w("src/a.py", "AAA src/a\n")
+        self.w("src/deep/b.py", "AAA src/deep/b\n")
+        self.w("src/deep/deeper/c.py", "AAA src/deep/deeper/c\n")
+
+    def grep(self, **kw):
+        args = {"path": self.tmp, "pattern": "AAA"}
+        args.update(kw)
+        return h.search.tool_grep(args)
+
+    def glob(self, **kw):
+        args = {"path": f"{self.tmp}/src", "pattern": "*.py"}
+        args.update(kw)
+        return h.search.tool_glob(args)
+
+    def ls(self, **kw):
+        args = {"path": f"{self.tmp}/src"}
+        args.update(kw)
+        return h.search.tool_list_dir(args)
+
+    # --- grep
+
+    def test_default_is_the_whole_subtree(self):
+        self.assertEqual(
+            self.grep(),
+            "_test_tmp/top.txt:1: AAA top\n"
+            "_test_tmp/src/a.py:1: AAA src/a\n"
+            "_test_tmp/src/deep/b.py:1: AAA src/deep/b\n"
+            "_test_tmp/src/deep/deeper/c.py:1: AAA src/deep/deeper/c",
+        )
+
+    def test_depth_1_searches_only_files_sitting_in_the_path(self):
+        self.assertEqual(self.grep(depth=1), "_test_tmp/top.txt:1: AAA top")
+
+    def test_depth_2_adds_one_level_of_subdirectories(self):
+        self.assertEqual(
+            self.grep(depth=2),
+            "_test_tmp/top.txt:1: AAA top\n_test_tmp/src/a.py:1: AAA src/a",
+        )
+
+    def test_depth_counts_from_the_path_searched_not_from_cwd(self):
+        self.assertEqual(
+            self.grep(path=f"{self.tmp}/src", depth=2),
+            "_test_tmp/src/a.py:1: AAA src/a\n_test_tmp/src/deep/b.py:1: AAA src/deep/b",
+        )
+
+    def test_depth_past_the_deepest_level_is_the_whole_subtree(self):
+        self.assertEqual(self.grep(depth=9), self.grep())
+
+    def test_depth_does_not_filter_a_file_named_as_path(self):
+        self.assertEqual(
+            self.grep(path=f"{self.tmp}/src/deep/b.py", depth=1),
+            "_test_tmp/src/deep/b.py:1: AAA src/deep/b",
+        )
+
+    def test_depth_below_one_is_the_shallowest_search(self):
+        for value in (0, -3):
+            self.assertEqual(self.grep(depth=value), "_test_tmp/top.txt:1: AAA top", repr(value))
+
+    def test_depth_accepts_what_models_send(self):
+        self.assertEqual(self.grep(depth="2"), self.grep(depth=2))
+        # an unrecognisable value falls back to the tool's default, as _limit_arg does
+        self.assertEqual(self.grep(depth="a few"), self.grep())
+
+    def test_empty_result_says_the_depth_is_what_stopped_it(self):
+        self.assertEqual(
+            self.grep(pattern="ZZZ", depth=1),
+            "no matches\n... [depth 1 stopped at 1 directory" + self.NOTE + " it]",
+        )
+
+    def test_the_note_counts_every_directory_the_depth_refused(self):
+        self.w("docs/d.txt", "x\n")
+        self.assertEqual(
+            self.grep(pattern="ZZZ", depth=1),
+            "no matches\n... [depth 1 stopped at 2 directories" + self.NOTE + " them]",
+        )
+
+    def test_no_note_when_the_depth_had_nothing_to_refuse(self):
+        # a leaf directory: nothing was pruned, so `no matches` stands on its own
+        self.assertEqual(
+            self.grep(path=f"{self.tmp}/src/deep/deeper", pattern="ZZZ", depth=1), "no matches"
+        )
+
+    def test_a_gitignored_directory_is_counted_as_ignored_not_pruned(self):
+        self.w(".gitignore", "build/\n")
+        self.w("build/z.txt", "AAA\n")
+        out = self.grep(pattern="ZZZ", path=f"{self.tmp}/build", depth=1)
+        self.assertEqual(out, "no matches")  # build/ is the searched path; nothing below it was pruned
+        out = self.grep(pattern="ZZZ", depth=1)
+        self.assertIn("1 gitignored path skipped per .gitignore", out)  # build/, refused by git
+        self.assertIn("depth 1 stopped at 1 directory", out)  # src/, refused by the depth
+
+    def test_depth_alone_does_not_make_a_hit_file_visible_if_it_is_ignored(self):
+        self.w(".gitignore", "deep/\n")
+        self.assertEqual(self.grep(path=f"{self.tmp}/src", depth=2), "_test_tmp/src/a.py:1: AAA src/a")
+
+    # --- glob
+
+    def test_glob_depth(self):
+        self.assertEqual(self.glob(depth=1), "_test_tmp/src/a.py")
+        self.assertEqual(
+            self.glob(depth=2), "_test_tmp/src/a.py\n_test_tmp/src/deep/b.py"
+        )
+        self.assertEqual(
+            self.glob(), "_test_tmp/src/a.py\n_test_tmp/src/deep/b.py\n_test_tmp/src/deep/deeper/c.py"
+        )
+
+    def test_glob_depth_is_not_the_pattern_saying_the_same_thing(self):
+        # `**/` in a pattern already reaches any depth, so depth is what limits it here
+        self.assertEqual(
+            self.glob(pattern="**/*.py", depth=1), "_test_tmp/src/a.py"
+        )
+
+    def test_glob_empty_result_carries_the_depth_note(self):
+        self.assertEqual(
+            self.glob(pattern="*.txt", depth=1),
+            "no files matched\n... [depth 1 stopped at 1 directory" + self.NOTE + " it]",
+        )
+
+    # --- list_dir
+
+    def test_list_dir_default_stays_the_flat_listing(self):
+        self.assertEqual(self.ls(), "a.py\ndeep/")
+        self.assertEqual(self.ls(depth=1), self.ls())
+
+    def test_list_dir_depth_2_prints_a_directory_then_its_own_entries(self):
+        self.assertEqual(self.ls(depth=2), "a.py\ndeep/\ndeep/b.py\ndeep/deeper/")
+
+    def test_list_dir_depth_3_reaches_the_last_level(self):
+        self.assertEqual(
+            self.ls(depth=3),
+            "a.py\ndeep/\ndeep/b.py\ndeep/deeper/\ndeep/deeper/c.py",
+        )
+
+    def test_list_dir_deep_listing_is_capped_and_says_depth_can_help(self):
+        for i in range(600):
+            self.w(f"many/d{i % 5}/f{i}.txt", "x")
+        out = h.search.tool_list_dir({"path": self.tmp, "depth": 2, "limit": 10})
+        self.assertEqual(len(out.split("\n")), 11)
+        self.assertIn("[truncated: listing stopped at 10 entries, more exist;", out)
+        self.assertIn("lower depth", out.split("\n")[-1])
+
+    def test_list_dir_deep_of_an_empty_directory_is_still_empty(self):
+        os.makedirs(os.path.join(self.tmp, "void"), exist_ok=True)
+        self.assertEqual(h.search.tool_list_dir({"path": f"{self.tmp}/void", "depth": 4}), "(empty)")
+
+    def test_the_cap_keeps_the_head_of_a_wide_directory(self):
+        """A capped deep listing shows the *first* entries, not the ones it queued.
+
+        The walk queues no more than the cap can print — a project with a wide
+        directory is not enumerated to the last file just to count it — and what it
+        drops is the tail of each directory, so the head still comes back.
+        """
+        for i in range(300):
+            open(os.path.join(self.tmp, f"f{i:03d}.txt"), "w").close()
+        out = h.search.tool_list_dir({"path": self.tmp, "depth": 2, "limit": 5})
+        lines = out.split("\n")
+        self.assertEqual(len(lines), 6)
+        self.assertEqual(lines[:5], [f"f{i:03d}.txt" for i in range(5)])
+        self.assertIn("listing stopped at 5 entries, more exist", lines[-1])
+
+    def test_a_linked_directory_is_listed_but_not_entered(self):
+        """A cycle through a link must not turn a deep listing into an endless one.
+
+        A Windows junction is not what this tests: search.py decides with
+        is_symlink(), and git for Windows reports a junction as an ordinary
+        directory (os.path.islink() says False for one), so only a real symlink
+        exercises the rule.
+        """
+        link = self.p("link")
+        try:
+            os.symlink(self.p("src/deep"), link, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("cannot create a directory symlink")
+        try:
+            out = h.search.tool_list_dir({"path": self.tmp, "depth": 3})
+            self.assertIn("link/", out)
+            self.assertNotIn("link/b.py", out)
+        finally:
+            _remove_dir_link(link)
+
+    def test_depth_reader(self):
+        self.assertIsNone(h.caps._depth_arg({}))
+        self.assertIsNone(h.caps._depth_arg({"depth": None}))
+        self.assertIsNone(h.caps._depth_arg({"depth": "a few"}))
+        self.assertEqual(h.caps._depth_arg({"depth": 3}), 3)
+        self.assertEqual(h.caps._depth_arg({"depth": "2"}), 2)
+        self.assertEqual(h.caps._depth_arg({"depth": 0}), 1)
+        self.assertEqual(h.caps._depth_arg({"depth": -5}), 1)
+
+
+
 class TestSearchPathDefault(Base):
     """`path` is optional for grep/glob/list_dir: without one they work on CWD itself.
 
@@ -1609,6 +1814,23 @@ class TestOutputCaps(unittest.TestCase):
                           f"{name} path description should name its default")
             self.assertIn("optional", fn["description"].lower(),
                           f"{name} description should say path is optional")
+
+    def test_depth_knob_is_exposed_in_the_search_schemas(self):
+        """A narrowing knob is worth nothing if the model is not told it is there."""
+        for name in ("grep", "glob", "list_dir"):
+            fn = h.toolspec.SPECS[name]["function"]
+            props = fn["parameters"]["properties"]
+            self.assertIn("depth", props, f"{name} schema should expose depth")
+            self.assertEqual(props["depth"]["type"], "integer")
+            self.assertNotIn("depth", fn["parameters"]["required"],
+                             f"{name} should not demand depth")
+            self.assertIn("Optional", props["depth"]["description"],
+                          f"{name} depth description should name its default")
+            self.assertIn("depth", fn["description"],
+                          f"{name} description should mention depth")
+        # list_dir is the one whose behaviour changes, so its contract says what the
+        # default is rather than leaving the model to guess how deep it looked
+        self.assertIn("default 1", h.toolspec.SPECS["list_dir"]["function"]["description"])
 
     def test_run_shell_tail_flag_is_exposed(self):
         """A cap the model can aim is only useful if the contract tells it the aim is there."""

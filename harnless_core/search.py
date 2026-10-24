@@ -1,8 +1,9 @@
 """The file search tools: CWD-contained walking, .gitignore honouring, and the
 grep/glob/list_dir/patch_file/read-side helpers they share.
 
-A model-supplied pattern never escapes the working directory, and ignored files are
-skipped unless the caller asks for them."""
+A model-supplied pattern never escapes the working directory, ignored files are
+skipped unless the caller asks for them, and `depth` says how far down the walk
+may go."""
 
 import os
 import re
@@ -184,7 +185,26 @@ def _gitignored_note(ignored: int) -> str:
         f"{config.GITIGNORE_NAME}; pass respect_gitignore:false to include them]"
     )
 
-def _iter_files(root: str, respect_gitignore: bool = True, ignored: list = None):
+def _depth_note(pruned: int, depth: int | None) -> str:
+    """Say why a search that stopped at a depth limit may have missed the file.
+
+    Only the empty answer needs it: `depth` is a knob the agent chose, so a
+    result that found something already tells it where the search stopped, while
+    `no matches` reads as 'it is not in the project' when it is really 'not in
+    the first two levels'.
+    """
+    if not depth or not pruned:
+        return ""
+    return (
+        f"\n... [depth {depth} stopped at {pruned} "
+        f"director{'y' if pruned == 1 else 'ies'}"
+        f"; pass a larger depth (or omit it) to search {'it' if pruned == 1 else 'them'}]"
+    )
+
+def _iter_files(
+    root: str, respect_gitignore: bool = True, ignored: list = None, depth: int = None,
+    pruned: list = None,
+):
     """Yield the files to scan for grep/glob.
 
     `root` itself when it is a file: a path the agent named explicitly is
@@ -195,7 +215,10 @@ def _iter_files(root: str, respect_gitignore: bool = True, ignored: list = None)
     is false — everything the .gitignore files covering the tree ignore. An
     ignored directory is pruned rather than entered, as git prunes it, so a
     `build/` or `.venv/` costs nothing to skip; `ignored`, a one-slot list when
-    given, counts the paths refused. A missing path yields nothing (callers check
+    given, counts the paths refused. `depth` (None for no limit) counts levels
+    with `root` as level 1, so 1 yields only the files sitting in `root`, and
+    `pruned` counts the directories that limit refused — the depth counterpart of
+    `ignored`. A missing path yields nothing (callers check
     existence first so they can report it explicitly).
     """
     if os.path.isfile(root):
@@ -207,10 +230,11 @@ def _iter_files(root: str, respect_gitignore: bool = True, ignored: list = None)
         local = _gitignore_file(root)
         if local:
             rules = local + rules
-    pending = [(root, rules)]
+    pending = [(root, rules, 1)]
     while pending:
-        dir_abs, inherited = pending.pop()
+        dir_abs, inherited, level = pending.pop()
         view = _ignore_view(inherited, dir_abs) if inherited else None
+        descend = depth is None or level < depth
         try:
             entries = sorted(os.scandir(dir_abs), key=lambda e: e.name)
         except OSError:
@@ -230,8 +254,14 @@ def _iter_files(root: str, respect_gitignore: bool = True, ignored: list = None)
             if is_dir:
                 if entry.is_symlink():
                     continue  # os.walk(followlinks=False): a linked dir is not descended
+                if not descend:
+                    if pruned is not None:
+                        pruned[0] += 1  # the depth limit, not git, refused this subtree
+                    continue
                 local = _gitignore_file(entry.path)
-                subdirs.append((entry.path, local + inherited if local else inherited))
+                subdirs.append(
+                    (entry.path, local + inherited if local else inherited, level + 1)
+                )
             else:
                 yield entry
         pending.extend(reversed(subdirs))  # keep the subtrees in directory order
@@ -254,8 +284,11 @@ def tool_grep(args: dict) -> str:
     pattern = re.compile(args["pattern"], paths._case_flags(case_sensitive))
     around = max(0, int(args.get("context", 0)))
     limit = caps._limit_arg(args, "limit", config.GREP_MATCH_LIMIT, config.MAX_COUNT_LIMIT)
-    ignored = [0]
-    walk = _iter_files(root, caps._bool_arg(args, "respect_gitignore", True), ignored)
+    depth = caps._depth_arg(args)
+    ignored, pruned = [0], [0]
+    walk = _iter_files(
+        root, caps._bool_arg(args, "respect_gitignore", True), ignored, depth, pruned
+    )
     file_pattern = args.get("file_pattern")
     file_re = (
         paths._glob_to_regex(file_pattern, case_sensitive) if file_pattern else None
@@ -315,7 +348,7 @@ def tool_grep(args: dict) -> str:
     # A capped answer already carries its own recover-the-rest hint; the empty
     # one is the case where the agent might conclude a file is not there at all.
     if not matches:
-        return "no matches" + _gitignored_note(ignored[0])
+        return "no matches" + _gitignored_note(ignored[0]) + _depth_note(pruned[0], depth)
     return "\n".join(matches)
 
 def tool_patch_file(args: dict) -> str:
@@ -376,25 +409,85 @@ def tool_glob(args: dict) -> str:
     regex = paths._glob_to_regex(pattern, case_sensitive)
     results = []
     roots = paths._cwd_roots()
-    ignored = [0]
-    walk = _iter_files(root, caps._bool_arg(args, "respect_gitignore", True), ignored)
+    depth = caps._depth_arg(args)
+    ignored, pruned = [0], [0]
+    walk = _iter_files(
+        root, caps._bool_arg(args, "respect_gitignore", True), ignored, depth, pruned
+    )
     for fp in walk:
         rel = paths._rel_to_cwd(fp, roots)
         if regex.search(rel):
             results.append(rel)
     if not results:
-        return "no files matched" + _gitignored_note(ignored[0])
+        return "no files matched" + _gitignored_note(ignored[0]) + _depth_note(pruned[0], depth)
     limit = caps._limit_arg(args, "limit", config.LIST_LIMIT, config.MAX_COUNT_LIMIT)
     return caps._cap_count(
         sorted(results), limit, unit="files", hint="narrow the pattern, or raise limit"
     )
 
+def _list_dir_tree(root: str, depth: int, limit: int) -> str:
+    """list_dir's recursive listing: a depth-bounded walk in tree order.
+
+    Each entry is its path relative to `root` and a directory still ends with '/',
+    so this is the flat listing reading downward: a directory's own entries come
+    straight after it and before its next sibling. The walk never queues more than
+    the cap can show — a project with a `node_modules/` is not walked to the last
+    file — so when it stops, the note can only promise that more exist. Like
+    _iter_files, a linked directory is listed but not entered.
+    """
+    # The stack is the listing still to print, next entry last: (directory path or
+    # None, the label, its level). A directory's entries land on top of what is
+    # left of its parent, which is what makes the output follow the tree instead of
+    # fanning out level by level.
+    out = []
+    pending = []
+
+    def queue(dir_abs: str, prefix: str, level: int):
+        try:
+            entries = sorted(os.scandir(dir_abs), key=lambda e: e.name)
+        except OSError:
+            return  # a directory that cannot be read has nothing to show
+        room = limit + 1 - len(out) - len(pending)
+        if room < len(entries):
+            entries = entries[: max(0, room)]  # the tail cannot be shown, only counted as more
+        for entry in reversed(entries):
+            try:
+                is_dir = entry.is_dir()
+            except OSError:
+                continue
+            pending.append(
+                (entry.path if is_dir else None, prefix + entry.name + ("/" if is_dir else ""), level)
+            )
+
+    queue(root, "", 1)
+    more = False
+    while pending:
+        dir_abs, label, level = pending.pop()
+        out.append(label)
+        if len(out) >= limit:
+            more = True  # the cap fell with entries still queued behind it
+            break
+        if dir_abs is not None and level < depth and not os.path.islink(dir_abs):
+            queue(dir_abs, label, level + 1)
+    if not out:
+        return "(empty)"
+    result = "\n".join(out)
+    if more:
+        result += caps._cap_note(
+            f"listing stopped at {limit} entries, more exist",
+            "raise limit, lower depth, or glob the directory for a narrower match",
+        )
+    return result
+
 def tool_list_dir(args: dict) -> str:
     root, asked = _search_root(args)
     if not os.path.isdir(root):
         return f"error: not a directory: {asked}"
-    entries = sorted(os.listdir(root))
     limit = caps._limit_arg(args, "limit", config.LIST_LIMIT, config.MAX_COUNT_LIMIT)
+    depth = caps._depth_arg(args)
+    if depth is not None and depth > 1:
+        return _list_dir_tree(root, depth, limit)
+    entries = sorted(os.listdir(root))  # depth 1 (the default): this directory only
     out = []
     for name in entries[:limit]:
         full = os.path.join(root, name)

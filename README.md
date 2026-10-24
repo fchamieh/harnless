@@ -240,6 +240,21 @@ A file you name explicitly as `path` is searched whatever git thinks of it, and 
 skipping is what made an answer empty, the result says so:
 `no matches` + `... [2 gitignored paths skipped per .gitignore; pass respect_gitignore:false to include them]`.
 
+`grep`, `glob` and `list_dir` take **`depth`**: how many directory levels to work on,
+counting the path searched as **1**. Omit it and the whole subtree is searched; `1` is
+only what sits directly in `path`, `2` adds one level of subdirectories. For `list_dir`
+the default is 1 — that directory only, as before — and a larger `depth` reads the tree,
+a directory's own entries printed right after it as `sub/`, `sub/file.py`:
+
+```
+grep     {"path": "./src", "pattern": "TODO", "depth": 2}   # src and src/*/ only, no deeper
+list_dir {"path": "./", "depth": 2}                         # the working directory, one level down
+```
+
+It can only ever ask for *less* than the default, and when it is what made an answer
+empty, the result says so: `no matches ... [depth 1 stopped at 3 directories; pass a
+larger depth (or omit it) to search them]`.
+
 `run_shell` waits for the command **and everything it started**. At `timeout` (default 120s,
 max 3600s) the whole process tree is killed and whatever it printed so far is returned as
 `[partial output]` — no orphaned test runners, no drain that never finishes.

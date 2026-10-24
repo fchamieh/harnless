@@ -38,6 +38,25 @@ def _limit_arg(args: dict, key: str, default: int, ceiling: int) -> int:
     except (TypeError, ValueError):
         return default
     return max(1, min(value, ceiling))
+def _depth_arg(args: dict, key: str = "depth") -> int | None:
+    """Read an optional "how deep may this search go" tool argument.
+
+    Returns the depth the walk must obey, or None for no limit — the tool's
+    default, and also the fallback for a blank or unparseable value, exactly as
+    `_limit_arg` falls back to its default. Levels count the directory searched
+    as 1, so a depth of 1 means "do not descend at all"; a zero or negative
+    value is raised to 1, the shallowest search that can still find something.
+    There is no ceiling: the knob can only ask for *less* than the default walk,
+    so a huge depth costs nothing the unlimited one does not already pay.
+    """
+    raw = args.get(key)
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None  # "a few", true: the default walk, not a shallow one
+    return max(1, value)
 def _clamp_int(value: int, low: int, high: int) -> int:
     """Clamp a CLI-supplied integer into [low, high].
 

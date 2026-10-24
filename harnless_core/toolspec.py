@@ -147,7 +147,7 @@ SPECS = {
         "type": "function",
         "function": {
             "name": "grep",
-            "description": "Search file contents with a regex pattern (case-sensitive by default; case_sensitive=false ignores case). path may be a directory (searched recursively) or a single file, and is optional: omit it to search the whole working directory from its root. Files git would ignore (.gitignore) are skipped unless respect_gitignore is false.",
+            "description": "Search file contents with a regex pattern (case-sensitive by default; case_sensitive=false ignores case). path may be a directory (searched recursively) or a single file, and is optional: omit it to search the whole working directory from its root. Files git would ignore (.gitignore) are skipped unless respect_gitignore is false, and depth narrows the recursion to that many directory levels.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -179,6 +179,14 @@ SPECS = {
                         "description": (
                             "Skip paths that .gitignore rules hide (default true); "
                             "set false to search them too"
+                        ),
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "description": (
+                            "How many directory levels to search, counting the searched path as 1 "
+                            "(1 = only the files directly inside it, 2 = it plus its immediate "
+                            "subdirectories). Optional — omit it to search the whole subtree"
                         ),
                     },
                     "limit": {
@@ -234,7 +242,7 @@ SPECS = {
         "type": "function",
         "function": {
             "name": "glob",
-            "description": "Find files by glob pattern (e.g. **/*.py) or regex, matched against relative file paths with exact case by default (case_sensitive=false ignores case). path may be a directory (searched recursively) or a single file, and is optional: omit it to search the whole working directory from its root. Files git would ignore (.gitignore) are skipped unless respect_gitignore is false.",
+            "description": "Find files by glob pattern (e.g. **/*.py) or regex, matched against relative file paths with exact case by default (case_sensitive=false ignores case). path may be a directory (searched recursively) or a single file, and is optional: omit it to search the whole working directory from its root. Files git would ignore (.gitignore) are skipped unless respect_gitignore is false, and depth narrows the recursion to that many directory levels.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -260,6 +268,14 @@ SPECS = {
                             "set false to list them too"
                         ),
                     },
+                    "depth": {
+                        "type": "integer",
+                        "description": (
+                            "How many directory levels to search, counting the searched path as 1 "
+                            "(1 = only the files directly inside it, 2 = it plus its immediate "
+                            "subdirectories). Optional — omit it to search the whole subtree"
+                        ),
+                    },
                     "limit": {
                         "type": "integer",
                         "description": (
@@ -275,13 +291,21 @@ SPECS = {
         "type": "function",
         "function": {
             "name": "list_dir",
-            "description": "List the contents of a directory given its relative path to CWD. Directories end with '/'. path is optional: omit it (or pass \"./\") to list the working directory itself.",
+            "description": "List the contents of a directory given its relative path to CWD. Directories end with '/'. path is optional: omit it (or pass \"./\") to list the working directory itself. depth says how many levels to list (default 1: that directory only; 2 adds each subdirectory's own entries, shown as 'sub/', 'sub/file.py' in tree order).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
                         "description": "Relative directory path, e.g. ./src. Optional — omit it (or pass \"./\") to list the working directory",
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "description": (
+                            "How many directory levels to list, counting the listed directory as 1 "
+                            "(default 1 = that directory only; 2 = it plus what is inside each of its "
+                            "subdirectories). Optional — a larger depth reads the tree, level by level"
+                        ),
                     },
                     "limit": {
                         "type": "integer",
