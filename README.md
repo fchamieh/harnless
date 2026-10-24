@@ -253,7 +253,9 @@ list_dir {"path": "./", "depth": 2}                         # the working direct
 
 It can only ever ask for *less* than the default, and when it is what made an answer
 empty, the result says so: `no matches ... [depth 1 stopped at 3 directories; pass a
-larger depth (or omit it) to search them]`.
+larger depth (or omit it) to search them]`. A deeper `list_dir` never walks into
+`.git/`, `node_modules/` or `__pycache__` — the entries stay, their contents do not
+(naming one as `path` still reads it).
 
 `run_shell` waits for the command **and everything it started**. At `timeout` (default 120s,
 max 3600s) the whole process tree is killed and whatever it printed so far is returned as

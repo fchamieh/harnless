@@ -430,10 +430,14 @@ def _list_dir_tree(root: str, depth: int, limit: int) -> str:
 
     Each entry is its path relative to `root` and a directory still ends with '/',
     so this is the flat listing reading downward: a directory's own entries come
-    straight after it and before its next sibling. The walk never queues more than
-    the cap can show — a project with a `node_modules/` is not walked to the last
-    file — so when it stops, the note can only promise that more exist. Like
-    _iter_files, a linked directory is listed but not entered.
+    straight after it and before its next sibling. The names grep and glob refuse —
+    `.git`, `node_modules`, `__pycache__` — are listed but never entered, because a
+    listing of their contents is the noise the agent was trying to avoid by asking
+    for a shallow one (naming one as `path` still reads it, as _iter_files does).
+    The walk never queues more than the cap can show — a project with a wide
+    directory is not walked to the last file — so when it stops, the note can only
+    promise that more exist. Like _iter_files, a linked directory is listed but not
+    entered.
     """
     # The stack is the listing still to print, next entry last: (directory path or
     # None, the label, its level). A directory's entries land on top of what is
@@ -468,6 +472,8 @@ def _list_dir_tree(root: str, depth: int, limit: int) -> str:
             more = True  # the cap fell with entries still queued behind it
             break
         if dir_abs is not None and level < depth and not os.path.islink(dir_abs):
+            if os.path.basename(dir_abs) in config.GITIGNORE_SKIP_NAMES:
+                continue  # .git/, node_modules/, __pycache__: listed, never walked into
             queue(dir_abs, label, level + 1)
     if not out:
         return "(empty)"

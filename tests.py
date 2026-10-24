@@ -763,6 +763,31 @@ class TestSearchDepth(Base):
         self.assertEqual(lines[:5], [f"f{i:03d}.txt" for i in range(5)])
         self.assertIn("listing stopped at 5 entries, more exist", lines[-1])
 
+    def test_a_deep_listing_never_walks_into_the_names_grep_and_glob_refuse(self):
+        """.git/, node_modules/, __pycache__ stay in the listing; their contents do not.
+
+        The flat listing has always reported what is really on disk, so the entries
+        stay; what would flood a deep one is the insides, which is exactly the noise
+        the agent asked to avoid by asking for a shallow depth.
+        """
+        self.w("node_modules/pkg/index.js", "x\n")
+        self.w("__pycache__/m.pyc", "x\n")
+        os.makedirs(os.path.join(self.tmp, ".git"), exist_ok=True)
+        with open(os.path.join(self.tmp, ".git", "config"), "w", encoding="utf-8") as f:
+            f.write("x\n")
+        out = h.search.tool_list_dir({"path": self.tmp, "depth": 3})
+        self.assertIn("node_modules/", out)
+        self.assertNotIn("node_modules/pkg", out)
+        self.assertIn("__pycache__/", out)
+        self.assertNotIn("__pycache__/m.pyc", out)
+        self.assertIn(".git/", out)
+        self.assertNotIn(".git/config", out)
+
+    def test_naming_one_of_those_directories_still_reads_it(self):
+        self.w("node_modules/pkg/index.js", "x\n")
+        out = h.search.tool_list_dir({"path": f"{self.tmp}/node_modules", "depth": 2})
+        self.assertEqual(out, "pkg/\npkg/index.js")
+
     def test_a_linked_directory_is_listed_but_not_entered(self):
         """A cycle through a link must not turn a deep listing into an endless one.
 

@@ -291,7 +291,7 @@ SPECS = {
         "type": "function",
         "function": {
             "name": "list_dir",
-            "description": "List the contents of a directory given its relative path to CWD. Directories end with '/'. path is optional: omit it (or pass \"./\") to list the working directory itself. depth says how many levels to list (default 1: that directory only; 2 adds each subdirectory's own entries, shown as 'sub/', 'sub/file.py' in tree order).",
+            "description": "List the contents of a directory given its relative path to CWD. Directories end with '/'. path is optional: omit it (or pass \"./\") to list the working directory itself. depth says how many levels to list (default 1: that directory only; 2 adds each subdirectory's own entries, shown as 'sub/', 'sub/file.py' in tree order). A deep listing never walks into .git/, node_modules/ or __pycache__ (naming one as path still reads it).",
             "parameters": {
                 "type": "object",
                 "properties": {
