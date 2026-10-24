@@ -15,7 +15,7 @@ Pure Python standard library — **no dependencies, no venv, no build step**.
 - **Sub-agents** — the `task` tool delegates self-contained work to a nested agent (configurable depth) and hands the result back as the sub-agent's closing summary
 - **State tools** — `todo` (task list) and `memory` (persistent notes) survive across turns
 - **Session log** — every message of a conversation is journaled as JSON Lines under `.harnless/sessions/` (each sub-agent run in its own file), and `--resume` / `/resume` continues a recorded session
-- **Context compaction** — when the context fills up, the oldest turns are replaced by one handoff note the model wrote; the turns it replaced stay readable in the session log (the `sessions` tool reads them back by `seq`)
+- **Context compaction** — when the context fills up, the oldest turns are replaced by one handoff note the model wrote; the turns it replaced stay readable in the session log (the `sessions` tool reads them back by `seq`, and it is only offered to runs that keep that log)
 - **Streaming** — token-by-token output with Markdown rendering; press `ESC` twice to interrupt a running generation (it stops sub-agents and their parents too)
 - **MCP support** — plug in external tools via [Model Context Protocol](https://modelcontextprotocol.io) servers (stdio or HTTP)
 - **Standalone binaries** — build a self-contained executable for Windows, Linux, or macOS with Nuitka
@@ -85,7 +85,7 @@ context and compaction could not help — plus whatever code the agent's own `ex
 | `--no-auto-compact` | Do not compact the conversation automatically (a rejected-for-size prompt then ends the run with exit code 3; `/compact` still works) |
 | `--compact-threshold PCT` | Auto-compact once the conversation reaches this percentage of the context window (default `85`, max `99`) |
 | `--sessions-dir DIR` | Where session logs are written (default `.harnless/sessions`, or `HARNLESS_SESSIONS_DIR`) |
-| `--no-session-log` | Do not journal the session |
+| `--no-session-log` | Do not journal the session (the `sessions` tool is then not offered at all, and a handoff note says the turns it drops are gone) |
 | `--resume SPEC` | Continue a recorded session: a session id, a `"<id>.<chain>"` sub-agent log, `latest`, or a path to a `.jsonl` |
 | `--resume-last [N]` | Continue the **newest** recorded session, keeping only its last N messages (no value or `0` = all). With `--resume` it only trims that session. Nothing recorded yet → warns and starts a fresh session |
 | `--version` | Print the version and exit |
@@ -116,8 +116,9 @@ The dotted chain id in a sub-agent file says who delegated it. Each line is one 
 compaction — a stable id for each message, which is what a `compact` record names the replaced
 turns with. Inline images (`@[cwd://img.png]`) are recorded as a note naming them rather than as
 base64 megabytes (`chars` still reports their real size). A log that cannot be written is dropped
-with one warning and the session continues without it. Nothing is written when `--no-session-log`
-is given.
+with one warning and the session continues without it — from the next request the `sessions` tool
+is no longer offered either, since there is nothing left to read back. Nothing is written when
+`--no-session-log` is given.
 
 **Resuming** (`--resume <id|latest|path>`, or `/resume <id>` in the REPL) reads such a
 file back and continues that conversation: the recorded turns are replayed, the *system
@@ -170,12 +171,20 @@ produced its turn stops being replayed. If the summarising request itself fails,
 go — that is what made the room — and a placeholder stands in for the note, said out loud and
 recorded.
 
-Nothing is lost for good. Every turn was journaled when it entered the conversation, and the
-`compact` record names the seqs it replaced, so the **`sessions`** tool can read them back: `list`
-the recorded logs, `spans` for a session's compactions and the ranges they replaced, `read` the
-transcript of a seq range (a `compact` record shows up in a read as the gap it made). A handoff
-note in the conversation names the session and the range it stands for, so the agent can look a
-fact up instead of re-running the tool that already found it.
+Nothing is lost for good — in a run that journals. Every turn was journaled when it entered
+the conversation, and the `compact` record names the seqs it replaced, so the **`sessions`**
+tool can read them back: `list` the recorded logs, `spans` for a session's compactions and the
+ranges they replaced, `read` the transcript of a seq range (a `compact` record shows up in a
+read as the gap it made). A handoff note in the conversation names the session and the range it
+stands for, so the agent can look a fact up instead of re-running the tool that already found
+it.
+
+`--no-session-log` is the honest version of the same story: with no journal there is nothing
+to read back, so the `sessions` tool is not advertised in any request, a handoff note says the
+turns it dropped are gone instead of pointing at a log that does not exist, and an elided tool
+result says its middle is gone for good. `list` still lists what earlier runs left, and an
+explicit `session` argument reads one of those logs by name — never as this conversation's
+memory.
 
 A sub-agent compacts its own run in its own log. If a prompt is still too big after the one
 compaction attempt, the run stops with exit code `3` and says where the transcript is.
@@ -200,6 +209,18 @@ Built-in tools: `get_cwd`, `run_shell`, `mkdir`, `read_file`, `write_file`, `pat
 All file paths are relative to the working directory and sandboxed to it. An `AGENTS.md`
 in the working directory (case-insensitive) is auto-loaded and appended to the system prompt.
 
+`grep`, `glob` and `list_dir` take `path` **optionally**: leave it out (or pass `""`) and the
+tool works on the working directory itself, so `{"pattern": "TODO"}` is the whole project.
+
+`run_shell` keeps the **first** `max_output` characters of stdout+stderr. `tail: true` keeps
+the **last** ones instead — for output whose verdict is at the end (a test or build summary, a
+traceback, the last thing a hung command said before it was killed) — snapped to a line start,
+and the truncation note then says which end survived.
+
+```
+run_shell  {"command": "python tests.py", "tail": true}   # the summary at the end, not the first 20k chars
+```
+
 `grep` and `glob` match with **exact case** by default — pass `case_sensitive: false` to ignore
 case (`grep` applies it to both the search pattern and `file_pattern`).
 
@@ -210,8 +231,9 @@ the matching is our own (`harnless_core/paths.py`), so it behaves the same outsi
 repository and on every platform. `list_dir` still reports what is really on disk.
 
 ```
-grep  {"path": "./", "pattern": "TODO"}                        # .gitignored files skipped
-grep  {"path": "./", "pattern": "TODO", "respect_gitignore": false}   # search them anyway
+grep  {"pattern": "TODO"}                                   # whole working directory (path omitted)
+grep  {"path": "./src", "pattern": "TODO"}                  # just that subtree
+grep  {"path": "./", "pattern": "TODO", "respect_gitignore": false}   # search gitignored files anyway
 ```
 
 A file you name explicitly as `path` is searched whatever git thinks of it, and when the

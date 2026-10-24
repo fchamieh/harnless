@@ -53,9 +53,21 @@ def _closing_summary(messages: list, exit_note: str) -> str:
     return ""
 
 def _active_tools(interactive: bool) -> list:
-    """Tool specs to send to the API, excluding tools toggled off via /tools."""
+    """Tool specs to send to the API, excluding tools toggled off via /tools and journal
+    readers this run has no journal for.
+
+    `sessions` reads the transcript this conversation is being written into; a run that
+    journals nothing (--no-session-log, or a log _session_disable dropped mid-run) would be
+    offering a way back to turns it is not keeping. `_all_tool_names` still names it, so
+    `/tools sessions` stays a toggle you can make, and a call that reaches it anyway gets
+    an answer that says there is nothing to read.
+    """
     base = toolspec.OPENAI_TOOLS_INTERACTIVE if interactive else toolspec.OPENAI_TOOLS
-    return [s for s in base + state.MCP_TOOLS if s["function"]["name"] not in state.DISABLED_TOOLS]
+    return [
+        s for s in base + state.MCP_TOOLS
+        if s["function"]["name"] not in state.DISABLED_TOOLS
+        and (state.SESSION_LOG or s["function"]["name"] not in toolspec.JOURNAL_ONLY)
+    ]
 
 def _all_tool_names() -> set:
     return {s["function"]["name"] for s in toolspec.OPENAI_TOOLS_INTERACTIVE + state.MCP_TOOLS}

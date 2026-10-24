@@ -48,6 +48,14 @@ SPECS = {
                             f"max {config.TOOL_RESULT_LIMIT}); the rest is dropped with a truncation note"
                         ),
                     },
+                    "tail": {
+                        "type": "boolean",
+                        "description": (
+                            "When true, max_output keeps the LAST max_output characters instead of the "
+                            "first — for output whose verdict is at the end (a test or build summary, "
+                            "a traceback). The note then says which end survived (default false)"
+                        ),
+                    },
                 },
                 "required": ["command"],
             },
@@ -139,13 +147,13 @@ SPECS = {
         "type": "function",
         "function": {
             "name": "grep",
-            "description": "Search file contents with a regex pattern (case-sensitive by default; case_sensitive=false ignores case). path may be a directory (searched recursively) or a single file. Files git would ignore (.gitignore) are skipped unless respect_gitignore is false.",
+            "description": "Search file contents with a regex pattern (case-sensitive by default; case_sensitive=false ignores case). path may be a directory (searched recursively) or a single file, and is optional: omit it to search the whole working directory from its root. Files git would ignore (.gitignore) are skipped unless respect_gitignore is false.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path to search: a directory (searched recursively) or a single file, e.g. ./x/y/z",
+                        "description": "Relative path to search: a directory (searched recursively) or a single file, e.g. ./x/y/z. Optional — omit it (or pass \"./\") to search the whole working directory",
                     },
                     "pattern": {
                         "type": "string",
@@ -181,7 +189,7 @@ SPECS = {
                         ),
                     },
                 },
-                "required": ["path", "pattern"],
+                "required": ["pattern"],
             },
         },
     },
@@ -226,13 +234,13 @@ SPECS = {
         "type": "function",
         "function": {
             "name": "glob",
-            "description": "Find files by glob pattern (e.g. **/*.py) or regex, matched against relative file paths with exact case by default (case_sensitive=false ignores case). path may be a directory (searched recursively) or a single file. Files git would ignore (.gitignore) are skipped unless respect_gitignore is false.",
+            "description": "Find files by glob pattern (e.g. **/*.py) or regex, matched against relative file paths with exact case by default (case_sensitive=false ignores case). path may be a directory (searched recursively) or a single file, and is optional: omit it to search the whole working directory from its root. Files git would ignore (.gitignore) are skipped unless respect_gitignore is false.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path to search: a directory (searched recursively) or a single file, e.g. ./x/y/z",
+                        "description": "Relative path to search: a directory (searched recursively) or a single file, e.g. ./x/y/z. Optional — omit it (or pass \"./\") to search the whole working directory",
                     },
                     "pattern": {
                         "type": "string",
@@ -259,7 +267,7 @@ SPECS = {
                         ),
                     },
                 },
-                "required": ["path", "pattern"],
+                "required": ["pattern"],
             },
         },
     },
@@ -267,13 +275,13 @@ SPECS = {
         "type": "function",
         "function": {
             "name": "list_dir",
-            "description": "List the contents of a directory given its relative path to CWD. Directories end with '/'.",
+            "description": "List the contents of a directory given its relative path to CWD. Directories end with '/'. path is optional: omit it (or pass \"./\") to list the working directory itself.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative directory path, e.g. ./src",
+                        "description": "Relative directory path, e.g. ./src. Optional — omit it (or pass \"./\") to list the working directory",
                     },
                     "limit": {
                         "type": "integer",
@@ -282,7 +290,7 @@ SPECS = {
                         ),
                     },
                 },
-                "required": ["path"],
+                "required": [],
             },
         },
     },
@@ -601,6 +609,12 @@ SPECS = {
 
 # `exit` ends a run: it is a tool a one-shot run may call, never one the REPL offers.
 NOT_FOR_REPL = frozenset({"exit"})
+
+# `sessions` is the read side of this run's journal: with journaling off (--no-session-log,
+# or a log dropped after a failed write) there is nothing in it to read, so the agent layer
+# leaves it out of what a turn advertises (see agent._active_tools). It stays in both lists
+# below — those name the tools that exist, not the ones a particular request sends.
+JOURNAL_ONLY = frozenset({"sessions"})
 
 OPENAI_TOOLS = [spec for spec in SPECS.values()]
 OPENAI_TOOLS_INTERACTIVE = [

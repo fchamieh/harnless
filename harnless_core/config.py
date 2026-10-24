@@ -80,6 +80,16 @@ COMPACT_FALLBACK_NOTE = (
     "were dropped without being rewritten — the full transcript is in the "
     "session log)"
 )
+# The same said by a run that keeps no journal: there the turns really are gone, and a
+# note must not point at a log that does not exist (see journal.journaling()).
+COMPACT_FALLBACK_NOTE_UNJOURNALED = (
+    "(no model summary: the summarizing request failed, so the earlier turns "
+    "were dropped without being rewritten — and this run keeps no session log, "
+    "so they are gone)"
+)
+# Said about a handoff note the harness had to cut short: where the rest of it still is.
+COMPACT_NOTE_HINT = "the full transcript is in the session log (sessions tool)"
+COMPACT_NOTE_HINT_UNJOURNALED = "this run keeps no session log, so the rest of it is gone"
 CONTEXT_OVERFLOW_CODE = 3  # exit code: context full, and compaction could not help
 # Given to the model to write the note that replaces the turns about to go. The
 # todo list and memory notes are re-injected by the harness anyway, so the note

@@ -589,6 +589,50 @@ class TestGlob(Base):
         self.assertEqual(out, "error: path not found: ./_test_tmp/nope")
 
 
+class TestSearchPathDefault(Base):
+    """`path` is optional for grep/glob/list_dir: without one they work on CWD itself.
+
+    These run with the temp tree *as* the working directory, so the default root is
+    the whole project the model sees and the results stay CWD-relative.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.w("top.txt", "AAA\n")
+        self.w("src/deep.py", "def calc(x):\n")
+        self._old_cwd = h.state.CWD
+        h.state.CWD = self.p("")  # the tree becomes the working directory, as at launch
+
+    def tearDown(self):
+        h.state.CWD = self._old_cwd
+        super().tearDown()
+
+    def test_grep_without_path_searches_cwd(self):
+        self.assertEqual(h.search.tool_grep({"pattern": "AAA"}), "top.txt:1: AAA")
+        self.assertEqual(h.search.tool_grep({"pattern": "def calc"}), "src/deep.py:1: def calc(x):")
+
+    def test_glob_without_path_searches_cwd(self):
+        self.assertEqual(h.search.tool_glob({"pattern": "**/*.py"}), "src/deep.py")
+        self.assertEqual(h.search.tool_glob({"pattern": "*.txt"}), "top.txt")
+
+    def test_list_dir_without_path_lists_cwd(self):
+        self.assertEqual(h.search.tool_list_dir({}), "src/\ntop.txt")
+
+    def test_empty_or_null_path_means_cwd(self):
+        """A model that sends "" or null gets the default rather than an error."""
+        for empty in ("", None):
+            self.assertEqual(h.search.tool_grep({"path": empty, "pattern": "AAA"}), "top.txt:1: AAA")
+            self.assertEqual(h.search.tool_glob({"path": empty, "pattern": "*.txt"}), "top.txt")
+            self.assertEqual(h.search.tool_list_dir({"path": empty}), "src/\ntop.txt")
+
+    def test_default_is_the_same_search_as_explicit_dot_slash(self):
+        self.assertEqual(h.search.tool_grep({"pattern": "AAA"}),
+                         h.search.tool_grep({"path": "./", "pattern": "AAA"}))
+        self.assertEqual(h.search.tool_glob({"pattern": "**/*.py"}),
+                         h.search.tool_glob({"path": "./", "pattern": "**/*.py"}))
+        self.assertEqual(h.search.tool_list_dir({}), h.search.tool_list_dir({"path": "./"}))
+
+
 class TestGitignoreRules(unittest.TestCase):
     """The .gitignore semantics grep/glob apply, asserted line by line. Each
     expectation was read off `git check-ignore` (gitignore(5) is not precise
@@ -1149,6 +1193,59 @@ class TestRunShell(Base):
         self.assertTrue(r.startswith("exit code: 0\n" + "x" * 500))
         self.assertIn("[truncated: 3000 chars total, showing first 500;", r)
 
+    # 2000 numbered lines: enough to overflow any max_output, and every kept line
+    # is whole, so a mid-line cut is visible as a broken line number.
+    LINES = "python -c \"import sys; sys.stdout.write('\\n'.join('l%d' % i for i in range(2000)))\""
+
+    def test_head_is_still_the_default(self):
+        """`tail` defaults false: output is cut from the back exactly as before."""
+        r = self.sh(self.LINES, max_output=200)
+        self.assertTrue(r.startswith("exit code: 0\nl0\nl1"), r)
+        self.assertIn("showing first 200;", r)
+        self.assertTrue(r.endswith("read_file]"), r)  # the marker sits under kept output
+
+    def test_tail_keeps_the_end_of_the_output(self):
+        """For a test summary or a build failure the verdict is the *last* line."""
+        r = self.sh(self.LINES, max_output=200, tail=True)
+        self.assertTrue(r.startswith("exit code: 0\n[truncated: "), r)
+        self.assertIn("showing the last ", r)
+        self.assertIn("cut forward to the next line start)", r)
+        self.assertIn("tail:false", r)  # the note names the end it did not keep
+        self.assertTrue(r.endswith("l1999"), r)
+        # the marker sits *above* the kept tail, which is what keeps the direction
+        # honest: a note under a tail reads as "the end is missing"
+        self.assertLess(r.index("[truncated:"), r.index("l19"))
+        self.assertRegex(r.split("\n")[2], r"^l\d+$")  # it starts at a line start
+
+    def test_tail_keeps_the_stderr_heading_with_the_block_it_labels(self):
+        """A tail window smaller than the stderr block starts below its heading."""
+        r = self.sh(
+            "python -c \"import sys; sys.stdout.write('o'*5000); "
+            "sys.stderr.write('\\n'.join('e%d' % i for i in range(12)))\"",
+            max_output=20,
+            tail=True,
+        )
+        self.assertRegex(r, r"\[stderr\]\ne\d+\ne10\ne11$")  # label back above what survived
+
+    def test_tail_applies_to_a_killed_commands_partial_output_too(self):
+        """The last thing a hung command said is the most useful thing it said."""
+        r = self.sh(
+            "python -c \"import time; "
+            "[print('step%d done' % i, flush=True) for i in range(20)]; time.sleep(3)\"",
+            timeout=1,
+            max_output=20,
+            tail=True,
+        )
+        self.assertIn("[partial output]", r)
+        self.assertIn("step19 done", r)
+        self.assertLess(r.index("[truncated:"), r.index("step1"))
+
+    def test_tail_accepts_what_models_actually_send(self):
+        for yes in (True, "true", "yes"):
+            self.assertIn("showing the last", self.sh(self.LINES, max_output=200, tail=yes))
+        for no in (False, "false", "no"):
+            self.assertIn("showing first 200;", self.sh(self.LINES, max_output=200, tail=no))
+
     def test_timeout(self):
         out = self.sh("python -c \"import time; time.sleep(2)\"", timeout=1)
         self.assertTrue(out.startswith("error: command timed out after 1s"), out)
@@ -1499,6 +1596,60 @@ class TestOutputCaps(unittest.TestCase):
             self.assertIn("default true", knob["description"])
         self.assertNotIn("case_sensitive",
                          h.toolspec.SPECS["list_dir"]["function"]["parameters"]["properties"])
+
+    def test_search_tool_path_is_optional_in_the_contract(self):
+        """The schemas match the behaviour: no path is demanded, and the description says
+        what happens without one (CWD), so the model knows it may leave it out."""
+        for name in ("grep", "glob", "list_dir"):
+            fn = h.toolspec.SPECS[name]["function"]
+            self.assertNotIn("path", fn["parameters"]["required"],
+                             f"{name} should not require path")
+            self.assertIn("path", fn["parameters"]["properties"])
+            self.assertIn("Optional", fn["parameters"]["properties"]["path"]["description"],
+                          f"{name} path description should name its default")
+            self.assertIn("optional", fn["description"].lower(),
+                          f"{name} description should say path is optional")
+
+    def test_run_shell_tail_flag_is_exposed(self):
+        """A cap the model can aim is only useful if the contract tells it the aim is there."""
+        params = h.toolspec.SPECS["run_shell"]["function"]["parameters"]
+        props = params["properties"]
+        self.assertIn("tail", props)
+        self.assertEqual(props["tail"]["type"], "boolean")
+        self.assertIn("default false", props["tail"]["description"])
+        self.assertIn("max_output", props["tail"]["description"],
+                      "tail sizes itself against max_output, so the description should say so")
+        self.assertNotIn("tail", params["required"])
+
+    def test_truncate_still_keeps_the_head(self):
+        """The default end every other cap depends on, said out loud."""
+        self.assertEqual(
+            h.caps._truncate("abcdefgh", 4),
+            "abcd\n... [truncated: 8 chars total, showing first 4]",
+        )
+
+    def test_cap_note_above_is_the_head_marker_flipped(self):
+        note = h.caps._cap_note_above("30 chars total, showing the last 10", "raise max_output")
+        self.assertEqual(note, "[truncated: 30 chars total, showing the last 10; raise max_output]\n")
+
+    def test_tail_window_snaps_to_a_line_start(self):
+        text = "\n".join(f"line{i}" for i in range(100))
+        kept, dropped = h.caps._tail_window(text, 30)
+        self.assertLessEqual(len(kept), 30)
+        self.assertTrue(text.endswith(kept))
+        self.assertEqual(dropped, len(text) - len(kept))
+        self.assertTrue(kept.startswith("line"), kept)  # never mid-line
+        self.assertGreater(dropped, len(text) - 30)  # the snap gave back more than it had to
+
+    def test_tail_window_falls_back_when_one_line_is_wider_than_the_window(self):
+        """Nothing can be snapped out of one long line, so it is cut as characters."""
+        text = "short line\n" + "z" * 200
+        kept, dropped = h.caps._tail_window(text, 50)
+        self.assertEqual(kept, "z" * 50)
+        self.assertEqual(dropped, len(text) - 50)
+
+    def test_tail_window_leaves_short_text_alone(self):
+        self.assertEqual(h.caps._tail_window("abc", 50), ("abc", 0))
 
     def test_cap_constants_are_ordered(self):
         # The backstop must sit above every per-tool cap, otherwise a tool that
@@ -2777,10 +2928,20 @@ class TestProbeContextWindow(unittest.TestCase):
         self.assertIn("api url: http://example.com/v1/chat/completions", out)
 
     def test_tool_names(self):
+        old = h.state.SESSION_LOG
+        h.state.SESSION_LOG = True  # a journalling run is shown the journal reader too
+        self.addCleanup(setattr, h.state, "SESSION_LOG", old)
         out = h.format_status([{"role": "system", "content": "x"}])
         names = sorted(s["function"]["name"] for s in h.toolspec.OPENAI_TOOLS_INTERACTIVE)
         self.assertIn("tools: " + ", ".join(names), out)
         self.assertNotIn("exit", out.split("tools: ")[1])
+
+    def test_tool_names_without_a_journal(self):
+        out = h.format_status([{"role": "system", "content": "x"}])  # journaling is off here
+        tools_line = out.split("tools: ")[1].split("\n")[0]
+        self.assertNotIn("sessions", tools_line)  # nothing journaled, nothing to read back
+        self.assertIn("grep", tools_line)
+        self.assertIn("session log: off (--no-session-log)", out)
 
 
 class TestNormalizeApiUrl(unittest.TestCase):
@@ -6072,12 +6233,12 @@ class TestToolsArePassedDown(unittest.TestCase):
     """
 
     def setUp(self):
-        self._saved = (h.state.API_URL, h.state.MCP_TOOLS, h.state.DISABLED_TOOLS)
+        self._saved = (h.state.API_URL, h.state.MCP_TOOLS, h.state.DISABLED_TOOLS, h.state.SESSION_LOG)
         h.state.API_URL = "http://127.0.0.1:1/v1/chat/completions"
         self._stream_once = h.request.stream_once
 
     def tearDown(self):
-        h.state.API_URL, h.state.MCP_TOOLS, h.state.DISABLED_TOOLS = self._saved
+        h.state.API_URL, h.state.MCP_TOOLS, h.state.DISABLED_TOOLS, h.state.SESSION_LOG = self._saved
         h.request.stream_once = self._stream_once
 
     def _sent(self, fn, *args, **kw):
@@ -6177,6 +6338,39 @@ class TestToolsArePassedDown(unittest.TestCase):
             execute=h.toolkit.execute_tool, interactive=True, temperature=0.2,
         )
         self.assertNotIn("exit", calls[0])
+
+    def test_the_journal_reader_is_offered_only_with_a_journal(self):
+        """`sessions` reads this run's transcript. A run that journals nothing is offered
+        neither the tool nor a way back it cannot honour."""
+        h.state.SESSION_LOG = False
+        calls = self._tool_names(
+            h.agent.run_agent, [{"role": "user", "content": "go"}], "m",
+            execute=h.toolkit.execute_tool, interactive=True, temperature=0.2,
+        )
+        self.assertNotIn("sessions", calls[0])
+        self.assertIn("grep", calls[0])  # the rest of the table is untouched
+
+        h.state.SESSION_LOG = True  # the same run with a journal keeps its read side
+        calls = self._tool_names(
+            h.agent.run_agent, [{"role": "user", "content": "go"}], "m",
+            execute=h.toolkit.execute_tool, interactive=True, temperature=0.2,
+        )
+        self.assertIn("sessions", calls[0])
+
+    def test_a_one_shot_run_is_gated_the_same_way(self):
+        h.state.SESSION_LOG = False
+        names = {s["function"]["name"] for s in h.agent._active_tools(False)}
+        self.assertNotIn("sessions", names)
+        self.assertIn("exit", names)  # the gate follows the journal, not the mode
+
+    def test_a_gated_tool_is_still_a_tool(self):
+        """Left out of a request is not taken out of the harness: the name stays in the
+        table /tools toggles, and a call that arrives anyway is answered, not 'unknown'."""
+        h.state.SESSION_LOG = False
+        self.assertIn("sessions", h.agent._all_tool_names())
+        self.assertIn("sessions", h.toolkit.DISPATCH)
+        self.assertIn("keeps no session log",
+                      h.toolkit.execute_tool("sessions", json.dumps({"action": "read"})))
 
 
 class TestContextProgress(unittest.TestCase):
@@ -7514,6 +7708,31 @@ class TestCompaction(unittest.TestCase):
         self.assertIn("sessions tool", content)  # the way back, named in the conversation
         self.assertIn("test-session", content)
 
+    def test_a_run_with_no_journal_promises_no_transcript(self):
+        """--no-session-log, or a log _session_disable dropped mid-run: the handoff note
+        and every elision it wrote must stop pointing at a log this run is not writing."""
+        messages = self._seed(8, tool_at=2, tool_size=30_000)
+        h.state.SESSION_LOG = False
+        self.assertTrue(self._compact(messages)[0])
+        content = messages[1]["content"]
+        self.assertNotIn("sessions tool", content)
+        self.assertNotIn("session log", content)
+        self.assertIn("not journaled", content)
+        bodies = [m.get("content") or "" for m in self._summary_request() if m.get("role") == "tool"]
+        self.assertTrue(any("gone for good" in b for b in bodies))  # pruned bodies say the same
+
+    def test_the_fallback_note_calls_the_loss_a_loss_when_there_is_no_journal(self):
+        def broken(messages, model, tools=None, temperature=0.2,
+                   conv_id=None):
+            raise urllib.error.URLError("no route to the summariser")
+
+        h.request.chat = broken
+        messages = self._seed(8)
+        h.state.SESSION_LOG = False
+        self.assertTrue(self._compact(messages)[0])
+        self.assertIn(h.config.COMPACT_FALLBACK_NOTE_UNJOURNALED, messages[1]["content"])
+        self.assertNotIn(h.config.COMPACT_FALLBACK_NOTE, messages[1]["content"])
+
     # ---- what the journal says about it
 
     def test_compact_record_names_the_turns_it_replaced(self):
@@ -7605,6 +7824,18 @@ class TestCompaction(unittest.TestCase):
         self.assertIn("test-session", out)
         self.assertIn("interactive (test-model)", out)  # what the run was, from its header
         self.assertIn("/resume", out)  # the other way back, named in the same answer
+
+    def test_a_run_with_no_journal_is_not_handed_another_ones_transcript(self):
+        """'latest' resolves to the newest log in the directory — which, for a run that
+        journals nothing, is some earlier session's. The tool says so instead."""
+        self._seed(8)  # a log in the directory, written by a run that did journal
+        h.state.SESSION_LOG = False
+        out = h.journal.tool_sessions({"action": "read"})
+        self.assertIn("keeps no session log", out)
+        self.assertNotIn("u0 xxx", out)  # the earlier session's turns are not passed off as this one's
+        self.assertIn("test-session", h.journal.tool_sessions({"action": "list"}))  # list still lists
+        named = h.journal.tool_sessions({"action": "read", "session": "test-session"})
+        self.assertIn("records 0-", named)  # asking for that log by name is still a read
 
     def test_read_returns_the_words_the_note_condensed(self):
         _, record = self._compacted_once(tool_at=2, tool_size=4000)

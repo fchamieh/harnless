@@ -160,6 +160,44 @@ def _shell_timeout(args: dict) -> tuple:
         return 0, f"error: timeout must be >= {config.SHELL_TIMEOUT_MIN}"
     return min(timeout, config.SHELL_TIMEOUT_CEILING), None
 
+def _output_limit(args: dict) -> tuple:
+    """run_shell's output pair: how many characters to keep, and from which end.
+
+    `tail` is the model saying *the answer is at the end* — a test summary, a build
+    failure, the last frame of a traceback. `max_output` stays the budget either
+    way, so the two never fight over the same characters: one sizes the window, the
+    other says where the window sits.
+    """
+    limit = caps._limit_arg(args, "max_output", config.SHELL_OUTPUT_LIMIT, config.TOOL_RESULT_LIMIT)
+    return limit, caps._bool_arg(args, "tail", False)
+
+def _cap_output(text: str, limit: int, tail: bool, heading: str, hint: str) -> str:
+    """Cap run_shell's output at `limit` characters, keeping the beginning or the end.
+
+    `heading` is the `[stderr]` label when the output carries one (empty otherwise).
+    It sits *between* the two blocks, so a tail window smaller than stderr itself
+    starts below it and hands back stderr lines with no label on them — which reads
+    as stdout. A kept tail always reaches the end of the text, so a heading that
+    survived is still in it; when the cut swallowed one it goes back on top of what
+    remained, and room for it comes off the tail rather than off the ceiling.
+    """
+    if not tail:
+        return caps._truncate(text, limit, hint=hint)
+    room = limit - (len(heading) + 1) if heading else limit
+    kept, dropped = caps._tail_window(text, max(1, room))
+    if heading:
+        at = text.rfind("\n" + heading)
+        if at == -1 and text.startswith(heading):
+            at = 0
+        if at != -1 and dropped > at:  # the window starts below the label
+            kept = heading + "\n" + kept
+    snapped = dropped > len(text) - room  # the snap gave back more than the window needed
+    return caps._cap_note_above(
+        f"{len(text)} chars total, showing the last {len(text) - dropped}"
+        + (" (cut forward to the next line start)" if snapped else ""),
+        hint + ", or pass tail:false to keep the beginning instead",
+    ) + kept
+
 def tool_run_shell(args: dict) -> str:
     command = args.get("command", "")
     if not command.strip():
@@ -167,7 +205,7 @@ def tool_run_shell(args: dict) -> str:
     timeout, bad_timeout = _shell_timeout(args)
     if bad_timeout:
         return bad_timeout
-    limit = caps._limit_arg(args, "max_output", config.SHELL_OUTPUT_LIMIT, config.TOOL_RESULT_LIMIT)
+    limit, tail = _output_limit(args)
     argv_prefix, command_prefix = _resolve_shell(state.SHELL_PREFERRED)
     if argv_prefix is not None:
         # PowerShell -Command maps any non-zero native exit code to 1; append
@@ -221,13 +259,12 @@ def tool_run_shell(args: dict) -> str:
         if chunks:
             parts.append(
                 "[partial output]\n"
-                + caps._truncate(
+                + _cap_output(
                     "\n".join(chunks),
                     limit,
-                    hint=(
-                        "re-run with a larger timeout, or redirect to a file and "
-                        "read it with read_file"
-                    ),
+                    tail,
+                    "[stderr]" if stderr.strip() else "",
+                    "re-run with a larger timeout, or redirect to a file and read it with read_file",
                 )
             )
         return "\n".join(parts)
@@ -237,9 +274,11 @@ def tool_run_shell(args: dict) -> str:
     if stderr:
         out.append(f"[stderr]\n{stderr.rstrip()}")
     result = "\n".join(out) if out else "(no output)"
-    result = caps._truncate(
+    result = _cap_output(
         result,
         limit,
-        hint="re-run with a larger max_output, or redirect to a file and read it with read_file",
+        tail,
+        "[stderr]" if stderr else "",
+        "re-run with a larger max_output, or redirect to a file and read it with read_file",
     )
     return f"exit code: {proc.returncode}\n{result}"

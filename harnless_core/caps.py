@@ -48,8 +48,37 @@ def _clamp_int(value: int, low: int, high: int) -> int:
 def _cap_note(stat: str, hint: str) -> str:
     """The marker appended to a capped result: how much was dropped + how to recover."""
     return f"\n... [truncated: {stat}{'; ' + hint if hint else ''}]"
+def _cap_note_above(stat: str, hint: str) -> str:
+    """The same marker placed *above* kept output, for a cap that kept the end.
+
+    Below a kept tail the usual wording lies: it reads as "the end is missing",
+    which is the opposite of what happened, and the model re-runs a command whose
+    answer it is already holding.
+    """
+    return f"[truncated: {stat}{'; ' + hint if hint else ''}]\n"
+def _tail_window(text: str, limit: int) -> tuple:
+    """The last `limit` characters of `text`, as (kept, dropped_from_the_front).
+
+    The cut moves forward to the next line start, so a kept tail never begins
+    mid-line and the window holds slightly less than `limit`. When the cut cannot
+    be snapped — the final line alone is wider than the window, or snapping would
+    keep nothing — it stays a plain character cut, which the returned pair reports
+    by dropping less. `text` itself is returned untouched when it already fits.
+    """
+    if len(text) <= limit:
+        return text, 0
+    cut = len(text) - limit
+    nl = text.find("\n", cut)
+    start = cut if nl == -1 else nl + 1
+    if start >= len(text):  # a snap that would keep nothing keeps characters instead
+        start = cut
+    return text[start:], start
 def _truncate(text: str, limit: int, *, unit: str = "chars", hint: str = "") -> str:
-    """Cap `text` at `limit` characters, appending what was dropped and a recovery hint."""
+    """Cap `text` at `limit` characters, appending what was dropped and a recovery hint.
+
+    The beginning is what survives — the one tool that wants the other end is
+    run_shell's `tail`, which reads the kept tail out of `_tail_window` instead.
+    """
     if len(text) <= limit:
         return text
     return text[:limit] + _cap_note(

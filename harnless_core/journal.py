@@ -12,6 +12,15 @@ import time
 from harnless_core import caps, config, journal, render, state
 
 
+def journaling() -> bool:
+    """Is this run writing a journal that its transcript could be read back out of?
+
+    One answer everything else points at: whether the `sessions` tool is worth offering at
+    all (agent._active_tools), and what a handoff note or an elision note may promise about
+    the turns it dropped. It is a call, not a constant — `_session_disable` can turn the
+    answer off in the middle of a run that started with it on."""
+    return bool(state.SESSION_LOG)
+
 def _session_stamp() -> str:
     """Timestamp for a journal record (local time, whole seconds — `seq` is what
     orders records inside the same second)."""
@@ -624,6 +633,10 @@ def tool_sessions(args: dict) -> str:
     not a session that forgot things. The `compact` record names the seqs it replaced,
     so `read` can fetch the exact turns the handoff note condensed — a fact that went
     back in the summary is re-readable, not something to re-derive by re-running tools.
+
+    It only says that about a run that is journaling: with the log off this tool is not
+    advertised (agent._active_tools) and, if a call reaches it anyway, it says so rather
+    than passing off an older session's log as this conversation's memory.
     """
     action = (args.get("action") or "list").strip().lower()
     if action == "list":
@@ -632,7 +645,17 @@ def tool_sessions(args: dict) -> str:
                          hint="narrow it with the 'limit' argument")
     if action not in ("read", "spans", "compactions"):
         return "error: unknown action (use list, read, or spans)"
-    path, error = _session_resolve(args.get("session") or "latest")
+    spec = (args.get("session") or "").strip()
+    if not spec and not journaling():
+        # 'latest' would quietly resolve to some *earlier* run's log and hand it over as if
+        # it were this one's transcript. A named session or an explicit path is a deliberate
+        # read of that log, and `list` has always been about the other runs.
+        return (
+            "this run keeps no session log (--no-session-log), so it has no transcript to "
+            "read back; 'list' shows the logs earlier runs left, and a 'session' argument "
+            "(an id, a chain id, or a path) reads one of those"
+        )
+    path, error = _session_resolve(spec or "latest")
     if not path:
         return f"error: {error}"
     kinds = ("compact",) if action in ("spans", "compactions") else ("message", "compact")
@@ -662,10 +685,16 @@ def tool_sessions(args: dict) -> str:
                      hint="narrow from/to, raise max_chars, or read the .jsonl file directly")
 
 def _elision_note(dropped: int) -> str:
-    """Says, inside an elided message, what is missing and where the full text is."""
+    """Says, inside an elided message, what is missing and where the full text is —
+    which is a different promise when this run keeps no journal at all."""
+    where = (
+        "the full text is in the session log (the sessions tool)"
+        if journaling()
+        else "this run keeps no session log, so the elided text is gone for good"
+    )
     return (
         f"\n\n[... harnless elided {dropped} chars of this message when compacting the "
-        "session; the full text is in the session log (the sessions tool) ...]\n\n"
+        f"session; {where} ...]\n\n"
     )
 
 def _session_span(key, start: int, end: int) -> list:
@@ -678,7 +707,7 @@ def _transcript_note(conv_key, span: list) -> str:
     """Names the transcript a handoff note stands for, inside the conversation itself:
     the model can ask for the exact turns the note condensed (sessions tool) instead of
     re-deriving them with fresh tool calls."""
-    if not state.SESSION_LOG:
+    if not journaling():
         return "[transcript: not journaled (--no-session-log), so these turns are gone]"
     path = state.SESSION_FILES.get(conv_key) or _session_path()
     replaced = f"seqs {span[0]}-{span[1]}" if len(span) == 2 else "the turns above"
@@ -689,7 +718,7 @@ def _transcript_note(conv_key, span: list) -> str:
 
 def _transcript_hint(conv_key) -> str:
     """Tells a stranded run where its transcript still is (out-of-context report)."""
-    if not state.SESSION_LOG:
+    if not journaling():
         return "the transcript was not journaled (--no-session-log), so there is nothing to read back"
     path = state.SESSION_FILES.get(conv_key) or _session_path()
     return (

@@ -3,9 +3,10 @@ import urllib.error
 and writing the handoff note the model is left with.
 
 The tail (the turns kept verbatim) is chosen in the server's own token units when the
-server reports usage, so a cut means what the server says it means. Everything replaced
-stays in the journal (see harnless_core/journal.py) and the `compact` record names the
-seqs it replaced."""
+server reports usage, so a cut means what the server says it means. Everything a run that
+journals replaces stays in its journal (see harnless_core/journal.py) and the `compact`
+record names the seqs it replaced; a run with the journal off says so in the note instead
+of promising a transcript it is not writing."""
 
 import urllib
 
@@ -220,10 +221,12 @@ def compact_messages(messages: list, conv_key, model: str = "", reason: str = "m
     conversation gives it up for that note, marked with COMPACT_SUMMARY_HEADER so the
     model knows the harness did the cutting rather than the user.
 
-    Nothing is lost for good — every turn was journaled as it entered the conversation,
-    and the `compact` record names the seqs it replaced, so the sessions tool (or a
-    resume) can read them back. A run that keeps its own journal (a sub-agent) keeps its
-    own compact record in it: the record always goes to `conv_key`'s log.
+    Nothing is lost for good — in a run that journals: every turn was journaled as it
+    entered the conversation, and the `compact` record names the seqs it replaced, so the
+    sessions tool (or a resume) can read them back. A run that keeps its own journal (a
+    sub-agent) keeps its own compact record in it: the record always goes to `conv_key`'s
+    log. With journaling off the cut is what it is — the note says the turns are gone
+    instead of pointing at a log this run is not writing.
 
     Returns (compacted, note) — `note` is what the user is told: what was replaced, or
     why nothing was.
@@ -267,18 +270,23 @@ def compact_messages(messages: list, conv_key, model: str = "", reason: str = "m
     note, note_error = _compact_summary(head, budget, model, scale)
 
     span = journal._session_span(conv_key, start, cut)
+    # What this note may promise about the turns it stands for: only a run that journals
+    # has a transcript to point back at, and the note must not dangle one it cannot read.
+    if journal.journaling():
+        note_hint, no_note = config.COMPACT_NOTE_HINT, config.COMPACT_FALLBACK_NOTE
+    else:
+        note_hint, no_note = (
+            config.COMPACT_NOTE_HINT_UNJOURNALED,
+            config.COMPACT_FALLBACK_NOTE_UNJOURNALED,
+        )
     summary_msg = {
         "role": "user",
         "content": config.COMPACT_SUMMARY_HEADER
         + "\n\n"
         + (
-            caps._truncate(
-                note,
-                config.COMPACT_SUMMARY_LIMIT,
-                hint="the full transcript is in the session log (sessions tool)",
-            )
+            caps._truncate(note, config.COMPACT_SUMMARY_LIMIT, hint=note_hint)
             if note
-            else config.COMPACT_FALLBACK_NOTE
+            else no_note
         )
         + "\n\n"
         + journal._transcript_note(conv_key, span),

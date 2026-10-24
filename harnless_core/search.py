@@ -236,10 +236,20 @@ def _iter_files(root: str, respect_gitignore: bool = True, ignored: list = None)
                 yield entry
         pending.extend(reversed(subdirs))  # keep the subtrees in directory order
 
+def _search_root(args: dict) -> tuple:
+    """What grep/glob/list_dir work on: (absolute path, the label to report back).
+
+    `path` is optional in all three schemas: a call without it searches the working
+    directory itself, which is what 'look at the project' means to the model. An
+    empty or missing value means the same as "./".
+    """
+    rel = args.get("path") or "."
+    return paths.safe_resolve(rel), rel
+
 def tool_grep(args: dict) -> str:
-    root = paths.safe_resolve(args["path"])
+    root, asked = _search_root(args)
     if not os.path.exists(root):
-        return f"error: path not found: {args['path']}"
+        return f"error: path not found: {asked}"
     case_sensitive = caps._bool_arg(args, "case_sensitive", True)
     pattern = re.compile(args["pattern"], paths._case_flags(case_sensitive))
     around = max(0, int(args.get("context", 0)))
@@ -358,9 +368,9 @@ def tool_patch_file(args: dict) -> str:
     return f"patched {path}: replaced {n} occurrence(s)"
 
 def tool_glob(args: dict) -> str:
-    root = paths.safe_resolve(args["path"])
+    root, asked = _search_root(args)
     if not os.path.exists(root):
-        return f"error: path not found: {args['path']}"
+        return f"error: path not found: {asked}"
     pattern = args["pattern"]
     case_sensitive = caps._bool_arg(args, "case_sensitive", True)
     regex = paths._glob_to_regex(pattern, case_sensitive)
@@ -380,14 +390,14 @@ def tool_glob(args: dict) -> str:
     )
 
 def tool_list_dir(args: dict) -> str:
-    path = paths.safe_resolve(args["path"])
-    if not os.path.isdir(path):
-        return f"error: not a directory: {args['path']}"
-    entries = sorted(os.listdir(path))
+    root, asked = _search_root(args)
+    if not os.path.isdir(root):
+        return f"error: not a directory: {asked}"
+    entries = sorted(os.listdir(root))
     limit = caps._limit_arg(args, "limit", config.LIST_LIMIT, config.MAX_COUNT_LIMIT)
     out = []
     for name in entries[:limit]:
-        full = os.path.join(path, name)
+        full = os.path.join(root, name)
         out.append(name + "/" if os.path.isdir(full) else name)
     if not out:
         return "(empty)"
