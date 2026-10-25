@@ -39,15 +39,15 @@ tests make.
 | `shell.py` | shell resolution, process-tree killing, timeouts, `run_shell` |
 | `mcp.py` | the MCP client: JSON-RPC over stdio or HTTP, discovery, registration |
 | `agent.py` | the loop: `run_agent`/`_agent_loop`, what a turn advertises, closing summaries |
-| `toolkit.py` | the tools a model calls, `DISPATCH`, and `execute_tool` (the executor a run is handed) |
+| `toolkit.py` | the tools a model calls, `DISPATCH`, and `execute_tool` (the executor a run is handed) — named `toolkit`, not `tools`, so a local `tools` list can't shadow the module alias |
 | `harnless.py` | the CLI: argument parsing, the REPL loop, the status/help text, and the facade |
 
 Three rules keep the layers honest:
 
 - **A core module never imports `harnless`.** If one needs a name that is still in the entry
-  point, that name moves down first (the link stage refuses it, and
+  point, that name moves down first;
   `TestAgentSeam.test_no_core_module_reaches_up_to_the_entry_point` checks it from the test
-  side too).
+  side.
 - **Nothing above the agent layer decides which tools a request advertises.**
   `chat`/`stream_chat`/`stream_once`/`_request_body` take `tools: list | None`; the agent
   loop hands them `_active_tools(interactive)`, and a request meant only to write something
@@ -59,34 +59,6 @@ Three rules keep the layers honest:
   `TestAgentSeam` tests it). The tool halves are split too: `toolspec.SPECS` is the contract
   (data, ordered), `toolkit.DISPATCH` is the behaviour (name → function), and a test asserts
   the two name the same tools in the same order.
-
-## Moving code
-
-`refactor/codemod.py` is the tool for it, and `refactor/registry.json` records where every
-name lives:
-
-```
-python refactor/codemod.py pre              # renames that must happen before a move
-python refactor/codemod.py extract <stage>  # create harnless_core/<stage>.py from its manifest
-python refactor/codemod.py move <module> <name> ...   # add names to a module that exists
-python refactor/codemod.py cycle            # relink + retarget tests + shadow audit
-python refactor/codemod.py facade           # rebuild the forwarding import block alone
-python refactor/codemod.py audit            # counts, facade writes left, duplicates
-```
-
-It rewrites references (bare name → `module.name`, never an alias), derives each file's
-imports from what it actually uses (including the by-name imports a stage needs, which travel
-with the code that needs them), and **refuses a local binding that shadows a module alias** —
-a function with a local named `tools` would read that list every time the link stage wrote
-`tools.<name>`. `refactor/rename_local.py` (token-based, so keyword argument names and string
-literals are untouched) frees such a name; it is also why the tools module is called `toolkit`.
-`relink()` likewise refuses a module that uses a name still living in the entry point: that
-name moves down first, as `REPL_COMMANDS` (to config) and the `/` command menu (to lineedit)
-did for the tools stage.
-
-An extract is one-way: to undo one, `git checkout harnless.py tests.py refactor/registry.json`
-*and* delete the new `harnless_core/<module>.py`, or its names stay behind as duplicates
-(`audit` reports those).
 
 ## Notes
 
