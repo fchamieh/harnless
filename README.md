@@ -195,6 +195,9 @@ External tools can be added via [Model Context Protocol](https://modelcontextpro
 
 - `~/.harnless/mcp.json` is auto-loaded at startup if present
 - `--mcp-config FILE` (repeatable; JSON `{"mcpServers": {...}}` or a bare `{...}`)
+
+Both config files are read as JSONC: `//` and `/* */` comments and trailing commas are
+allowed (a file whose servers are all commented out is a valid "no servers" config).
 - `--mcp-stdio 'NAME:COMMAND ARGS...'`
 - `--mcp-http 'NAME=URL'`
 

@@ -4499,6 +4499,66 @@ class TestMcpConfig(Base):
         self.assertEqual(servers, {})
         self.assertIn("failed to load mcp config", buf.getvalue())
 
+    def test_loads_jsonc_comments_and_trailing_commas(self):
+        self.assertEqual(
+            h.mcp.loads_jsonc(
+                """
+                // line comment
+                {
+                    /* block
+                       comment */
+                    "mcpServers": {
+                        "a": {"transport": "http", "url": "http://a",},
+                        "b": {"transport": "stdio", "command": "node", "args": ["s",],},
+                    },
+                }
+                // trailing comment
+                """
+            ),
+            {
+                "mcpServers": {
+                    "a": {"transport": "http", "url": "http://a"},
+                    "b": {"transport": "stdio", "command": "node", "args": ["s"]},
+                }
+            },
+        )
+
+    def test_loads_jsonc_comment_only_is_empty(self):
+        self.assertEqual(h.mcp.loads_jsonc("// nothing here\n/* and nothing here */\n"), {})
+        self.assertEqual(h.mcp.loads_jsonc("   \n\t "), {})
+
+    def test_loads_jsonc_keeps_comment_markers_in_strings(self):
+        self.assertEqual(
+            h.mcp.loads_jsonc('{"url": "http://x//y", "note": "a /* not a comment */ b", "path": "C:\\\\dir"}'),
+            {"url": "http://x//y", "note": "a /* not a comment */ b", "path": "C:\\dir"},
+        )
+        self.assertEqual(h.mcp.loads_jsonc('{"a": ["x,", "y]"],}'), {"a": ["x,", "y]"]})
+
+    def test_loads_jsonc_bad_document_still_fails(self):
+        with self.assertRaises(json.JSONDecodeError):
+            h.mcp.loads_jsonc("{not jsonc")
+
+    def test_load_jsonc_file(self):
+        path = os.path.join(self.tmp, "cfg.jsonc")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(
+                "// mcp config\n"
+                '{\n'
+                '  "mcpServers": {\n'
+                '    "s": {"transport": "http", "url": "http://x",}, // the only server\n'
+                "  },\n"
+                "}\n"
+            )
+        self.assertEqual(h.mcp.load_mcp_config(path), {"s": {"transport": "http", "url": "http://x"}})
+
+    def test_load_jsonc_file_all_commented_out(self):
+        path = os.path.join(self.tmp, "cfg.jsonc")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("// all servers disabled\n// {\"mcpServers\": {}}\n")
+        servers = {}
+        h.mcp._load_mcp_config_into(servers, path)
+        self.assertEqual(servers, {})
+
     def test_parse_stdio(self):
         name, cfg = h.mcp._parse_mcp_stdio("fs:npx -y server ./data")
         self.assertEqual(name, "fs")

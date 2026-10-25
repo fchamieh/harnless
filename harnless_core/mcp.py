@@ -57,14 +57,93 @@ def _expand_env(value):
         value,
     )
 
+def _strip_jsonc_comments(text: str) -> str:
+    """Drop // line comments and /* block */ comments, leaving string contents alone."""
+    out = []
+    i, n = 0, len(text)
+    in_string = False
+    while i < n:
+        c = text[i]
+        if in_string:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                in_string = False
+            i += 1
+            continue
+        if c == '"':
+            in_string = True
+            out.append(c)
+            i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            end = text.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+def _strip_trailing_commas(text: str) -> str:
+    """Drop a comma that sits directly before a } or ] (past whitespace), inside no string."""
+    out = []
+    i, n = 0, len(text)
+    in_string = False
+    while i < n:
+        c = text[i]
+        if in_string:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                in_string = False
+            i += 1
+            continue
+        if c == '"':
+            in_string = True
+            out.append(c)
+            i += 1
+            continue
+        if c == ",":
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j < n and text[j] in "}]":
+                i += 1
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+def loads_jsonc(text: str):
+    """Parse a JSONC document: JSON plus // and /* */ comments and trailing commas.
+
+    Text holding only comments and whitespace parses to {} (an empty config),
+    so a file whose servers are all commented out is a valid "no servers" file.
+    """
+    stripped = _strip_trailing_commas(_strip_jsonc_comments(text))
+    if not stripped.strip():
+        return {}
+    return json.loads(stripped)
+
 def load_mcp_config(path: str) -> dict:
-    """Load an MCP config file. Accepts {"mcpServers": {...}} or a bare {...}.
+    """Load an MCP config file. Accepts JSONC (comments, trailing commas), and
+    either {"mcpServers": {...}} or a bare {...}.
 
     Returns a dict of server name -> config, with ${VAR} expansion applied to
     command/args/env/headers/url.
     """
     with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+        data = loads_jsonc(f.read())
     servers = data.get("mcpServers", data) if isinstance(data, dict) else {}
     out = {}
     for name, cfg in servers.items():
