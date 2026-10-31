@@ -9,6 +9,7 @@ import json
 import os
 import pathlib
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -55,6 +56,20 @@ class Base(unittest.TestCase):
         args = {"path": os.path.join(self.tmp, rel).replace("\\", "/"), "line_numbers": False}
         args.update(kw)
         return h.toolkit.tool_read_file(args)
+
+    def kill_pid(self, pid: int):
+        """Stop a stray process a test left holding pipes or a terminal."""
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True,
+                timeout=15,
+            )
+        else:
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
 
 
 class TestSafeResolve(Base):
@@ -1547,6 +1562,216 @@ class TestRunShell(Base):
         out = self.sh("Write-Output 'héllo'")
         self.assertEqual(out, "exit code: 0\nhéllo")
 
+    # --- when a process outlives the command that started it --------------------
+    # A Start-Process child (Windows) or a `&` child (bash) keeps an inherited
+    # copy of the command's stdout/stderr handles, so the pipes stay open after
+    # the command itself ends. run_shell must say that plainly and return —
+    # waiting it out and then tree-killing would kill the very server the model
+    # was trying to start, which is exactly how the "hangs forever" reports
+    # started.
+
+    def _spawn_holder(self, tag):
+        """(command, pid_file, alive_marker): a command that starts a process
+        which holds the pipes for 30 s (writing its pid, then an alive-marker
+        at +4 s) while the command itself exits at once."""
+        child = self.p(f"{tag}_child.py")
+        spawner = self.p(f"{tag}_spawner.py")
+        pid_file = self.p(f"{tag}.pid")
+        alive = self.p(f"{tag}_alive.marker")
+        self.w(
+            f"{tag}_child.py",
+            "import pathlib, time\n"
+            f"time.sleep(4)\npathlib.Path({alive!r}).write_text('survived')\ntime.sleep(30)\n",
+        )
+        self.w(
+            f"{tag}_spawner.py",
+            "import subprocess, sys, pathlib\n"
+            f"child = subprocess.Popen([sys.executable, {child!r}])\n"
+            f"pathlib.Path({pid_file!r}).write_text(str(child.pid))\n"
+            "print('started', flush=True)\n",
+        )
+        return f"python '{spawner}'", pid_file, alive
+
+    def test_a_process_left_holding_the_pipes_is_reported_not_killed(self):
+        command, pid_file, alive = self._spawn_holder("hold")
+        pid = None
+        try:
+            t0 = time.monotonic()
+            out = self.sh(command, timeout=25)
+            elapsed = time.monotonic() - t0
+            with open(pid_file) as f:
+                pid = int(f.read())
+            self.assertLess(
+                elapsed, 12,
+                f"run_shell waited out the timeout instead of reporting the stray: {out}",
+            )
+            self.assertTrue(out.startswith("exit code: 0\nstarted"), out)
+            self.assertIn("[detached:", out)
+            self.assertIn("NOT killed", out)
+            time.sleep(4.5)  # long enough for a surviving holder to write its marker
+            self.assertTrue(os.path.exists(alive), "the finished command's process was killed anyway")
+        finally:
+            if pid:
+                self.kill_pid(pid)
+
+    @unittest.skipUnless(sys.platform == "win32", "Start-Process is PowerShell only")
+    def test_start_process_with_redirects_survives_and_returns_promptly(self):
+        """The exact shape of the real complaint: Start-Process -RedirectStandardOutput
+        ... for a dev server. The child redirects its own std handles to files yet
+        still inherits the shell's pipe handles — the wrapper is long gone while the
+        pipes stay open, and the call must return with the server alive."""
+        sleeper = self.p("sp_sleeper.py")
+        pid_file = self.p("sp.pid")
+        alive = self.p("sp_alive.marker")
+        log = self.p("sp_server.log")
+        self.w(
+            "sp_sleeper.py",
+            "import os, pathlib, time\n"
+            f"pathlib.Path({pid_file!r}).write_text(str(os.getpid()))\n"
+            "print('server up', flush=True)\n"
+            "time.sleep(4)\n"
+            f"pathlib.Path({alive!r}).write_text('survived')\n"
+            "time.sleep(30)\n",
+        )
+        pid = None
+        try:
+            # -ArgumentList joins into a raw command line, so hand the sleeper as
+            # a path without spaces (relative to CWD) instead of the absolute one.
+            rel = os.path.relpath(sleeper, h.state.CWD).replace("\\", "/")
+            t0 = time.monotonic()
+            out = self.sh(
+                f"Start-Process -FilePath python -ArgumentList '{rel}' "
+                f"-RedirectStandardOutput '{log}' -WindowStyle Hidden; Write-Host started",
+                timeout=25,
+            )
+            elapsed = time.monotonic() - t0
+            self.assertLess(elapsed, 12, f"the Start-Process call stalled: {out}")
+            self.assertIn("started", out)
+            self.assertIn("[detached:", out)
+            deadline = time.monotonic() + 10
+            while not os.path.exists(pid_file) and time.monotonic() < deadline:
+                time.sleep(0.2)
+            with open(pid_file) as f:
+                pid = int(f.read())
+            time.sleep(4.5)
+            self.assertTrue(os.path.exists(alive), "the Start-Process child was killed anyway")
+            with open(log, encoding="utf-8", errors="replace") as f:
+                self.assertIn("server up", f.read())  # its own redirect kept working
+        finally:
+            if pid:
+                self.kill_pid(pid)
+
+
+class TestBackground(Base):
+    """run_shell background:true: start detached, return at once, survive calls."""
+
+    def setUp(self):
+        super().setUp()
+        h.shell.cleanup_background()  # nothing carried in from an earlier test
+        self._saved_bg = h.state.BG_DIR, h.state.BACKGROUND_SEQ, h.state.BACKGROUND_PROCS
+        h.state.BG_DIR = self.p("bg")
+        h.state.BACKGROUND_SEQ = 0
+        h.state.BACKGROUND_PROCS = []
+
+    def tearDown(self):
+        h.shell.cleanup_background()  # ... and nothing carried out
+        h.state.BG_DIR, h.state.BACKGROUND_SEQ, h.state.BACKGROUND_PROCS = self._saved_bg
+        super().tearDown()
+
+    def bg(self, command, **kw):
+        args = {"command": command, "background": True}
+        args.update(kw)
+        return h.shell.tool_run_shell(args)
+
+    def server_script(self, name="bg_srv.py", run_seconds=6):
+        self.w(
+            name,
+            "import time\n"
+            "print('up', flush=True)\n"
+            f"time.sleep({run_seconds})\n"
+            "print('done', flush=True)\n",
+        )
+        return self.p(name)
+
+    @staticmethod
+    def pid_of(out: str) -> int:
+        return int(out.split("pid ", 1)[1].split("\n", 1)[0])
+
+    @staticmethod
+    def log_of(out: str) -> str:
+        rel = out.split("log: ", 1)[1].split(" (", 1)[0]
+        return os.path.join(h.state.CWD, rel.replace("/", os.sep))
+
+    def log_text(self, log: str) -> str:
+        try:
+            with open(log, encoding="utf-8", errors="replace") as f:
+                return f.read()
+        except OSError:
+            return ""
+
+    def wait_for_log(self, log: str, text: str, seconds: float = 15) -> bool:
+        """Python startup is not instant; give the log time to say `text`."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if text in self.log_text(log):
+                return True
+            time.sleep(0.3)
+        return False
+
+    def test_returns_at_once_and_the_process_keeps_running(self):
+        srv = self.server_script()
+        t0 = time.monotonic()
+        out = self.bg(f"python '{srv}'")
+        self.assertLess(time.monotonic() - t0, 3, f"background start blocked: {out}")
+        self.assertTrue(out.startswith("started in background: pid "), out)
+        entry = h.state.BACKGROUND_PROCS[-1]
+        self.assertEqual(entry["pid"], self.pid_of(out))
+        self.assertEqual(os.path.normcase(self.log_of(out)), os.path.normcase(entry["log"]))
+        time.sleep(1.5)
+        self.assertIsNone(entry["proc"].poll(), "the process died with the call that started it")
+        self.assertTrue(self.wait_for_log(entry["log"], "up"), "its output is not in the log")
+        deadline = time.monotonic() + 12
+        while entry["proc"].poll() is None and time.monotonic() < deadline:
+            time.sleep(0.2)
+        self.assertIsNotNone(entry["proc"].poll(), "the process never finished on its own")
+        self.assertIn("done", self.log_text(entry["log"]))
+
+    def test_cleanup_stops_a_still_running_one(self):
+        srv = self.server_script(run_seconds=30)
+        self.bg(f"python '{srv}'")
+        entry = h.state.BACKGROUND_PROCS[-1]
+        time.sleep(1.0)
+        self.assertIsNone(entry["proc"].poll())
+        self.assertEqual(h.shell.cleanup_background(), 1)
+        self.assertIsNotNone(entry["proc"].poll(), "cleanup_background left it running")
+        self.assertEqual(h.state.BACKGROUND_PROCS, [])
+
+    def test_cleanup_ignores_processes_that_already_finished(self):
+        srv = self.server_script(run_seconds=1)
+        self.bg(f"python '{srv}'")
+        entry = h.state.BACKGROUND_PROCS[-1]
+        deadline = time.monotonic() + 12
+        while entry["proc"].poll() is None and time.monotonic() < deadline:
+            time.sleep(0.2)
+        self.assertEqual(h.shell.cleanup_background(), 0)
+        self.assertEqual(h.state.BACKGROUND_PROCS, [])
+
+    def test_log_names_are_never_reused(self):
+        srv = self.server_script(run_seconds=1)
+        out1 = self.bg(f"python '{srv}'")
+        out2 = self.bg(f"python '{srv}'")
+        log1, log2 = self.log_of(out1), self.log_of(out2)
+        self.assertNotEqual(log1, log2)  # a second server never truncates the first one's log
+        for log in (log1, log2):
+            self.assertTrue(self.wait_for_log(log, "up"), f"{log} never got its own output")
+
+    def test_background_accepts_what_models_actually_send(self):
+        srv = self.server_script(run_seconds=1)
+        out = self.bg(f"python '{srv}'", background="true")
+        self.assertTrue(out.startswith("started in background: pid "), out)
+        out = self.bg(f"python '{srv}'", background="no")
+        self.assertTrue(out.startswith("exit code: 0\nup\ndone"), out)  # still a normal call
+
 
 class TestResolveShell(Base):
     def setUp(self):
@@ -1867,6 +2092,18 @@ class TestOutputCaps(unittest.TestCase):
         self.assertIn("max_output", props["tail"]["description"],
                       "tail sizes itself against max_output, so the description should say so")
         self.assertNotIn("tail", params["required"])
+
+    def test_run_shell_background_flag_is_exposed(self):
+        """Starting a dev server is the model's call to make — the contract has to
+        say the option exists, or the model reaches for Start-Process tricks."""
+        params = h.toolspec.SPECS["run_shell"]["function"]["parameters"]
+        props = params["properties"]
+        self.assertIn("background", props)
+        self.assertEqual(props["background"]["type"], "boolean")
+        self.assertNotIn("background", params["required"])
+        for word in ("detached", "pid", "log", "default false"):
+            self.assertIn(word, props["background"]["description"])
+        self.assertIn("background:true", h.config.SHELL_NOTE)
 
     def test_truncate_still_keeps_the_head(self):
         """The default end every other cap depends on, said out loud."""

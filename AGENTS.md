@@ -36,7 +36,7 @@ tests make.
 | `request.py` | request building, the abortable/counting opener, chat + streaming, SSE |
 | `compact.py` | the cut, the pruning, the handoff note, both triggers |
 | `search.py` | the walking/.gitignore engine and the grep, glob, list_dir, patch, move, copy tools |
-| `shell.py` | shell resolution, process-tree killing, timeouts, `run_shell` |
+| `shell.py` | shell resolution, process-tree killing, timeouts, background processes, `run_shell` |
 | `mcp.py` | the MCP client: JSON-RPC over stdio or HTTP, discovery, registration |
 | `agent.py` | the loop: `run_agent`/`_agent_loop`, what a turn advertises, closing summaries |
 | `toolkit.py` | the tools a model calls, `DISPATCH`, and `execute_tool` (the executor a run is handed) — named `toolkit`, not `tools`, so a local `tools` list can't shadow the module alias |
@@ -64,5 +64,12 @@ Three rules keep the layers honest:
 
 - `tests.py` imports the module directly (`import harnless`) and patches the module that
   owns each name (`h.request.chat = ...`).
+- `run_shell` waits on the command *wrapper*, with daemon readers draining the pipes;
+  a process the command started that still holds the pipes after the wrapper exits is
+  reported as `[detached: …]` and deliberately left alive — tree-killing it would kill
+  the very servers models try to start. `background:true` is the first-class answer:
+  detached spawn, stdout+stderr to `state.BG_DIR` (inside CWD, so `read_file` reaches
+  it), registry `state.BACKGROUND_PROCS`, reaped by `shell.cleanup_background()`
+  (`atexit` in `main()`, and every `TestBackground` teardown).
 - The Windows/Linux release builds are `python build.py` and `python build.py --target
   linux` (podman `harnless-builder`); see the release notes in `README.md`.

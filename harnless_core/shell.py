@@ -9,14 +9,27 @@ the output kept is the window around whatever the harness stopped: the tail of a
 it ran to the end, the head of a hung one.
 
 Cancellation is separate from the timeout on purpose: ESC in the REPL must stop a run even in
-a one-shot call that has no watcher thread of its own."""
+a one-shot call that has no watcher thread of its own.
 
+Output is read by daemon reader threads, never by `communicate`. That distinction is what
+tells "the command is still running" apart from "someone still holds the pipes": the call
+waits on the command wrapper, and when the wrapper is done but a pipe stays open — the
+started process kept a handle it inherited from the shell, e.g. `Start-Process` with
+redirects on Windows, `cmd &` on bash — the call returns with what it collected and names
+the stray instead of waiting out the full timeout and then killing the very process the
+model was trying to detach. `background:true` is the first-class answer to the same need:
+the command runs detached, logging to a file under BG_DIR, and the call returns at once;
+`cleanup_background` stops whatever is still running when the harness exits."""
+
+import locale
 import os
 import shutil
 import signal
 import subprocess
+import threading
+import time
 
-from harnless_core import caps, config, state
+from harnless_core import caps, config, paths, state
 
 
 def _resolve_shell(preferred: str = "auto") -> tuple:
@@ -113,36 +126,6 @@ def _kill_tree(proc) -> None:
     except OSError:
         pass
 
-def _drain_killed(proc, exc) -> tuple:
-    """The output a killed command had already produced.
-
-    On Windows the reader threads hold it until communicate() collects it (the
-    TimeoutExpired fields are empty there); on POSIX the exception already
-    carries it. The drain is bounded: a pipe still held by something the tree
-    kill missed must not hang the harness.
-    """
-    exc_out = getattr(exc, "stdout", None)
-    exc_err = getattr(exc, "stderr", None)
-    if isinstance(getattr(exc, "output", None), tuple):
-        exc_out, exc_err = exc.output
-    try:
-        out, err = proc.communicate(timeout=config.KILL_DRAIN_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        out, err = None, None  # give up on the pipes rather than wait forever
-        for pipe in (proc.stdout, proc.stderr):
-            if pipe:
-                try:
-                    pipe.close()
-                except OSError:
-                    pass
-    except (OSError, ValueError):
-        out, err = None, None
-    try:
-        proc.wait(timeout=config.KILL_DRAIN_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        pass  # already killed: stop caring instead of hanging on it
-    return (out or exc_out or ""), (err or exc_err or "")
-
 def _shell_timeout(args: dict) -> tuple:
     """run_shell's timeout as (seconds, error_message).
 
@@ -198,6 +181,139 @@ def _cap_output(text: str, limit: int, tail: bool, heading: str, hint: str) -> s
         hint + ", or pass tail:false to keep the beginning instead",
     ) + kept
 
+def _pump(pipe, chunks: list) -> None:
+    """A daemon reader: append a pipe's bytes to `chunks` as they arrive.
+
+    Draining the pipes while the command runs is what keeps a chatty command
+    from blocking on a full pipe buffer while the harness waits for it to exit;
+    read1 hands over whatever is available instead of waiting for a full buffer.
+    Closing the pipe (or the process behind it dying) ends the loop; a pipe the
+    harness gave up on closes the reader with an OSError it swallows.
+    """
+    try:
+        while True:
+            data = pipe.read1(65536)
+            if not data:
+                break
+            chunks.append(data)
+    except (OSError, ValueError):
+        pass
+    try:
+        # EOF reached (or given up on): the reader hands its side of the pipe
+        # back. _close_pipes then finds it already closed, which it tolerates.
+        pipe.close()
+    except (OSError, ValueError):
+        pass
+
+def _join_readers(readers: list, seconds: float) -> bool:
+    """Give the pipe readers *seconds* to finish; True when all of them did.
+
+    After the command wrapper exits this is the grace window that separates a
+    finished command — its pipes hit EOF at once — from one that left a process
+    behind holding an inherited copy of the pipe handles.
+    """
+    deadline = time.monotonic() + seconds
+    for reader in readers:
+        reader.join(max(0.0, deadline - time.monotonic()))
+    return not any(reader.is_alive() for reader in readers)
+
+def _close_pipes(proc) -> None:
+    for pipe in (proc.stdout, proc.stderr):
+        if pipe:
+            try:
+                pipe.close()
+            except (OSError, ValueError):
+                pass
+
+def _decode(chunks: list, encoding) -> str:
+    """The bytes a reader collected, as text — with the universal-newline
+    translation text-mode used to do (`\r\n` and a lone `\r` become `\n`), so
+    the capping and the model see one kind of line break. A stray non-UTF-8
+    byte (a native command writing in the ANSI code page) becomes U+FFFD
+    instead of wiping the output; None means the locale's own encoding."""
+    if not chunks:
+        return ""
+    text = b"".join(list(chunks)).decode(
+        encoding or locale.getpreferredencoding(False), "replace"
+    )
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+def _background_log() -> str:
+    """A fresh log path for a background run: bg-<n>-<timestamp>.log in BG_DIR.
+
+    Inside CWD so read_file/grep reach it, and never reused: a second server
+    must not truncate the log a still-running first one is writing."""
+    os.makedirs(state.BG_DIR, exist_ok=True)
+    while True:
+        state.BACKGROUND_SEQ += 1
+        full = os.path.join(
+            state.BG_DIR, f"bg-{state.BACKGROUND_SEQ}-{time.strftime('%Y%m%d-%H%M%S')}.log"
+        )
+        if not os.path.exists(full):
+            return full
+
+def _start_background(cmd, use_shell: bool) -> str:
+    """Spawn the command detached and return at once: no pipes to wait on, no
+    output to collect — the call's job is only to start the thing and say where
+    its output lives. stdout and stderr share the log file; on POSIX the process
+    gets its own session (kill -- -<pid> reaches everything it forked), on
+    Windows its own process group (a Ctrl+C aimed at the harness console does
+    not reach it)."""
+    log_full = _background_log()
+    try:
+        log_file = open(log_full, "wb")
+    except OSError as e:
+        return f"error: could not open the background log: {e}"
+    spawn = {
+        "shell": use_shell,
+        "cwd": state.CWD,
+        "stdin": subprocess.DEVNULL,  # never let it eat the REPL's keystrokes
+        "stdout": log_file,
+        "stderr": log_file,
+    }
+    if os.name != "nt":
+        spawn["start_new_session"] = True
+    else:
+        spawn["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    try:
+        proc = subprocess.Popen(cmd, **spawn)
+    except (OSError, ValueError) as e:
+        log_file.close()
+        try:
+            os.remove(log_full)
+        except OSError:
+            pass
+        return f"error: could not run the command: {e}"
+    log_file.close()  # the child has its own handle; the harness's copy would just leak
+    state.BACKGROUND_PROCS.append({"pid": proc.pid, "log": log_full, "proc": proc})
+    stop = f"taskkill /PID {proc.pid} /T /F" if os.name == "nt" else f"kill -- -{proc.pid}"
+    return (
+        f"started in background: pid {proc.pid}\n"
+        f"log: {paths._rel_to_cwd(log_full)} (grows while the process writes; read it with read_file)\n"
+        f"the process keeps running after this call returns; stop it with {stop}. "
+        "A leftover background process is killed when harnless exits."
+    )
+
+def cleanup_background() -> int:
+    """Stop every background:true process that is still running; say how many.
+
+    The promise behind background:true is *across calls*, not *across sessions*:
+    main() registers this at exit so the harness never leaves a server it started
+    running behind it (tests call it from tearDown too)."""
+    killed = 0
+    for entry in state.BACKGROUND_PROCS:
+        proc = entry.get("proc")
+        if proc is None or proc.poll() is not None:
+            continue  # already finished on its own
+        _kill_tree(proc)
+        try:
+            proc.wait(timeout=config.KILL_DRAIN_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            pass  # already killed: stop caring instead of hanging on it
+        killed += 1
+    state.BACKGROUND_PROCS.clear()
+    return killed
+
 def tool_run_shell(args: dict) -> str:
     command = args.get("command", "")
     if not command.strip():
@@ -220,47 +336,61 @@ def tool_run_shell(args: dict) -> str:
         cmd = command
         use_shell = True
         encoding = None
+    if caps._bool_arg(args, "background", False):
+        return _start_background(cmd, use_shell)
     spawn = {
         "shell": use_shell,
         "cwd": state.CWD,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
-        "text": True,
-        "encoding": encoding,
-        # A stray non-UTF-8 byte (e.g. a native command writing in the
-        # ANSI code page) must not crash the reader thread and wipe the
-        # whole output; degrade to U+FFFD instead.
-        "errors": "replace",
     }
     if os.name != "nt":
         # Its own process group, so _kill_tree can signal the shell *and*
         # everything it forked (taskkill /T plays that role on Windows).
         spawn["start_new_session"] = True
     try:
-        # Popen rather than run(timeout=...): run() kills only the direct child
-        # and then drains the pipes with no deadline of its own.
         proc = subprocess.Popen(cmd, **spawn)
     except (OSError, ValueError) as e:
         return f"error: could not run the command: {e}"
+    # Wait on the *command wrapper*, not on the pipes closing: communicate()
+    # conflates the two, and a process the command merely started — a
+    # Start-Process child inherits the shell's handle copies even with its own
+    # std handles redirected — then reads as "the command still runs" forever.
+    chunks = [[], []]  # stdout bytes, stderr bytes, as the readers collect them
+    readers = [
+        threading.Thread(target=_pump, args=(proc.stdout, chunks[0]), daemon=True),
+        threading.Thread(target=_pump, args=(proc.stderr, chunks[1]), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired as e:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
         _kill_tree(proc)
-        stdout, stderr = _drain_killed(proc, e)
+        # Whether the readers finished or not, the harness-side pipe handles
+        # close here: a tree kill that missed something stops being a reason to
+        # wait on its output forever.
+        _join_readers(readers, config.KILL_DRAIN_TIMEOUT)
+        _close_pipes(proc)
+        try:
+            proc.wait(timeout=config.KILL_DRAIN_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            pass  # already killed: stop caring instead of hanging on it
+        stdout, stderr = _decode(chunks[0], encoding), _decode(chunks[1], encoding)
         parts = [
             f"error: command timed out after {timeout}s — it was killed, "
             "along with everything it started"
         ]
-        chunks = []
+        bits = []
         if stdout.strip():
-            chunks.append(stdout.rstrip())
+            bits.append(stdout.rstrip())
         if stderr.strip():
-            chunks.append(f"[stderr]\n{stderr.rstrip()}")
-        if chunks:
+            bits.append(f"[stderr]\n{stderr.rstrip()}")
+        if bits:
             parts.append(
                 "[partial output]\n"
                 + _cap_output(
-                    "\n".join(chunks),
+                    "\n".join(bits),
                     limit,
                     tail,
                     "[stderr]" if stderr.strip() else "",
@@ -268,7 +398,17 @@ def tool_run_shell(args: dict) -> str:
                 )
             )
         return "\n".join(parts)
+    # The command is done. Its own pipes closing is the normal ending; readers
+    # still busy after the grace window mean a process it started is holding a
+    # handle — leave that process alone (it is the model's attempt at a server,
+    # not at a runaway) and say so plainly. The blocked readers retire on the
+    # stray's own EOF or when the harness exits; closing a pipe another thread
+    # is blocked reading is not safe, so the harness never force-closes those.
+    detached = not _join_readers(readers, config.SHELL_DETACHED_GRACE)
+    if not detached:
+        _close_pipes(proc)  # the normal ending: hand the pipe handles back
     out = []
+    stdout, stderr = _decode(chunks[0], encoding), _decode(chunks[1], encoding)
     if stdout:
         out.append(stdout.rstrip())
     if stderr:
@@ -281,4 +421,15 @@ def tool_run_shell(args: dict) -> str:
         "[stderr]" if stderr else "",
         "re-run with a larger max_output, or redirect to a file and read it with read_file",
     )
+    if detached:
+        stray = (
+            "Get-Process / tasklist, then taskkill /PID <pid> /T /F"
+            if os.name == "nt"
+            else "ps, then kill -- -<pid>"
+        )
+        result += (
+            "\n[detached: the command finished, but a process it left running is still holding "
+            "the output pipes — its further output went unread and it was NOT killed. "
+            f"Find it with {stray}; for long-running commands prefer background:true.]"
+        )
     return f"exit code: {proc.returncode}\n{result}"

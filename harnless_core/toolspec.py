@@ -33,6 +33,17 @@ SPECS = {
                         "type": "string",
                         "description": "The command to run",
                     },
+                    "background": {
+                        "type": "boolean",
+                        "description": (
+                            "When true, start the command detached and return immediately with its "
+                            "pid and a log file (under .harnless/bg/, readable with read_file) "
+                            "instead of waiting — the answer to long-running commands like dev "
+                            "servers. The process survives across calls; stop it with taskkill "
+                            "/PID <pid> /T /F (Windows) or kill -- -<pid> (bash). Leftovers are "
+                            "killed when harnless exits (default false)"
+                        ),
+                    },
                     "timeout": {
                         "type": "integer",
                         "description": (

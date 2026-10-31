@@ -157,14 +157,18 @@ SHELL_TIMEOUT_MIN = 1
 SHELL_TIMEOUT_CEILING = 3_600  # a tool call that never returns stalls the turn
 KILL_DRAIN_TIMEOUT = 5  # seconds spent collecting output after the kill
 TASKKILL_TIMEOUT = 15  # seconds to let taskkill itself tear the tree down
+SHELL_DETACHED_GRACE = 2  # after a command exits, seconds its pipes get to close;
+# a pipe still open then belongs to a process the command started, not to it
 SHELL_NOTE = (
     " Commands run in PowerShell (pwsh, falling back to powershell.exe); use PowerShell syntax "
     "(e.g. Get-ChildItem, Select-String, Get-Content, Copy-Item) — bash/cmd syntax will not work."
     if os.name == "nt"
     else " Commands run in bash."
 ) + (
-    " The call waits for everything still holding the output pipes, so do not leave "
-    "background processes running: at the timeout the command and its whole process tree are killed."
+    " A normal call waits for the command and for everything still holding its output pipes: "
+    "at the timeout the command and its whole process tree are killed. For a long-running "
+    "command (a dev server, a watcher) pass background:true instead — the call returns at "
+    "once with the pid and a log file, and the process keeps running."
 )
 # What the terminal shows of a tool call about to run and of the answer it returned.
 # The agent loop prints these and a resumed session replays them with the very same

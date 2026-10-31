@@ -325,6 +325,10 @@ def main():
 
         atexit.register(_close_mcp)
 
+    # A background:true process outlives its call, never the harness: whatever
+    # is still running when the process exits is killed here.
+    atexit.register(shell.cleanup_background)
+
     system_prompt_additions = (
         ""
         if args.prompt is None

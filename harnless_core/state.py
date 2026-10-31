@@ -89,6 +89,12 @@ _NEXT_CONV_ID = 1  # monotonically increasing usage keys for sub-agent runs
 # Preferred shell for run_shell on Windows: "auto" (pwsh → powershell → cmd),
 # or force "pwsh" / "powershell" / "cmd". Set from --shell in main().
 SHELL_PREFERRED = "auto"
+# run_shell background:true: each started process logs to BG_DIR — inside CWD,
+# so read_file/grep can reach it — and is listed in BACKGROUND_PROCS, which the
+# harness reaps at exit (shell.cleanup_background, registered in main()).
+BG_DIR = os.path.join(CWD, ".harnless", "bg")
+BACKGROUND_PROCS: list = []  # [{"pid": int, "log": str, "proc": Popen}]
+BACKGROUND_SEQ = 0  # log naming: bg-<n>-<timestamp>.log, never reused
 COLORS_ENABLED = True
 def _stdout_can_encode_emoji() -> bool:
     """True if sys.stdout's encoding can encode every emoji icon."""
