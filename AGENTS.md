@@ -71,5 +71,6 @@ Three rules keep the layers honest:
   detached spawn, stdout+stderr to `state.BG_DIR` (inside CWD, so `read_file` reaches
   it), registry `state.BACKGROUND_PROCS`, reaped by `shell.cleanup_background()`
   (`atexit` in `main()`, and every `TestBackground` teardown).
-- The Windows/Linux release builds are `python build.py` and `python build.py --target
-  linux` (podman `harnless-builder`); see the release notes in `README.md`.
+- Releases — the version bump, the work-then-`release:` commit pair, the tag, the two
+  binaries (`python build.py`, `python build.py --target linux`) and `dist/RELEASE-X.Y.Z.md`:
+  full instructions and gotchas in `RELEASING.md`.
