@@ -146,22 +146,33 @@ def _headers() -> dict:
         headers["Authorization"] = f"Bearer {state.API_KEY}"
     return headers
 
-def probe_context_window() -> int:
-    """Best-effort: query the API's /models endpoint for the context window size.
+def _fetch_models() -> list:
+    """Best-effort: the model objects the API advertises at /models.
 
-    Returns the model's context window in tokens, or 0 if it cannot be
-    determined (server unreachable, no /models endpoint, field missing).
-    """
+    Empty on any failure (server unreachable, no /models endpoint, malformed JSON).
+    In router mode this lists every preset; in single-model mode it lists the one."""
     if not state.API_URL.endswith("/chat/completions"):
-        return 0
+        return []
     models_url = state.API_URL[: -len("/chat/completions")] + "/models"
     try:
         req = urllib.request.Request(models_url, headers=_headers())
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except Exception:
-        return 0
-    models = data.get("data") or []
+        return []
+    return data.get("data") or []
+
+def list_models() -> list[str]:
+    """The model ids the API advertises, for telling a user what a router offers."""
+    return [m.get("id") for m in _fetch_models() if m.get("id")]
+
+def probe_context_window() -> int:
+    """Best-effort: query the API's /models endpoint for the context window size.
+
+    Returns the model's context window in tokens, or 0 if it cannot be
+    determined (server unreachable, no /models endpoint, field missing).
+    """
+    models = _fetch_models()
     if not models:
         return 0
     model = models[0]

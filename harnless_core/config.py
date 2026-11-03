@@ -226,6 +226,13 @@ _CONTEXT_OVERFLOW_RE = re.compile(
     re.IGNORECASE,
 )
 _CONTEXT_OVERFLOW_STATUS = (400, 413, 422)  # rejections worth reading the body of
+# What a rejection says when the server routes by model name (llama.cpp router mode):
+# "model 'local-model' not found", "unknown model", "model name is missing".
+_MODEL_NOT_FOUND_RE = re.compile(
+    r"(?:unknown|invalid|missing)\s+model|model[^.]{0,120}?(?:not found|does not exist|missing)",
+    re.IGNORECASE,
+)
+_MODEL_NOT_FOUND_STATUS = (400, 404)  # rejections worth reading the body of
 _HTML_BLOCK_TAGS = {
     "address", "article", "aside", "blockquote", "br", "dd", "div", "dl", "dt",
     "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4",

@@ -123,7 +123,10 @@ def main():
     parser.add_argument(
         "--model",
         default="local-model",
-        help="model name to send in the request (llama-server usually ignores it)",
+        help=(
+            "model name to send in the request (single-model llama-server ignores it; "
+            "router mode needs a preset model id)"
+        ),
     )
     parser.add_argument(
         "--system-prompt",

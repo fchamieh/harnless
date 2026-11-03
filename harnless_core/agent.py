@@ -72,6 +72,33 @@ def _active_tools(interactive: bool) -> list:
 def _all_tool_names() -> set:
     return {s["function"]["name"] for s in toolspec.OPENAI_TOOLS_INTERACTIVE + state.MCP_TOOLS}
 
+def _print_model_not_found(model: str, reason: str) -> None:
+    """Tell the user the server routes by model name and this one is not there.
+
+    Router-mode llama-server starts with no model loaded and routes each request by the
+    `"model"` field, so its default placeholder ("local-model") is a 400. Printing the
+    server's own reason and the ids it advertises turns a bare "Bad Request" into the
+    one command that fixes it."""
+    print(
+        state.OUTPUT_INDENT
+        + render.colorize(
+            f"{render.icon('error')} the server rejected the model name '{model}' ({reason})",
+            "error",
+        )
+    )
+    models = request.list_models()
+    if models:
+        print(
+            state.OUTPUT_INDENT
+            + render.colorize("available models: " + ", ".join(models), "dim")
+        )
+    print(
+        state.OUTPUT_INDENT
+        + render.colorize(
+            "pass a model id with --model (router-mode servers require one)", "dim"
+        )
+    )
+
 def run_agent(
     messages: list,
     model: str,
@@ -212,6 +239,10 @@ def _agent_loop(
                     raise
                 return 0
             except (urllib.error.URLError, ConnectionError, OSError) as e:
+                reason = errors._model_not_found_reason(e)
+                if reason:
+                    _print_model_not_found(model, reason)
+                    return 1
                 print(
                     state.OUTPUT_INDENT
                     + render.colorize(
@@ -239,6 +270,10 @@ def _agent_loop(
                     attempts += 1
                     continue
                 except urllib.error.URLError as e:
+                    reason = errors._model_not_found_reason(e)
+                    if reason:
+                        _print_model_not_found(model, reason)
+                        return 1
                     print(
                         state.OUTPUT_INDENT
                         + render.colorize(f"{render.icon('error')} connection error: {e}", "error")

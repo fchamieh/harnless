@@ -17,6 +17,25 @@ class ContextOverflow(Exception):
 
     Raised by `chat`/`stream_chat` in place of the bare HTTP error so the agent loop
     can tell "compact and retry" from "the API is unhappy about something else"."""
+def _http_error_body(exc) -> str:
+    """The response body of an HTTP error, read once and cached on the exception.
+
+    urllib's HTTPError is its own response object: reading it consumes the body, so a
+    caller that reads it to classify the failure (context overflow) would leave nothing
+    for the next caller (the model-not-found hint). Caching keeps both answers."""
+    cached = getattr(exc, "_harnless_body", None)
+    if cached is not None:
+        return cached
+    try:
+        body = exc.read().decode("utf-8", "replace")  # an HTTPError is its own response
+    except (OSError, AttributeError, ValueError):
+        body = ""
+    try:
+        exc._harnless_body = body
+    except AttributeError:
+        pass
+    return body
+
 def _context_overflow_reason(exc) -> str:
     """Why a request was rejected, when it looks like the context being full
     ('' when it does not). Status plus a snippet: the wording is the server's own,
@@ -28,12 +47,24 @@ def _context_overflow_reason(exc) -> str:
         status = 0
     if status not in config._CONTEXT_OVERFLOW_STATUS:
         return ""
-    try:
-        body = exc.read().decode("utf-8", "replace")  # an HTTPError is its own response
-    except (OSError, AttributeError, ValueError):
-        body = ""
-    text = " ".join((body or str(exc)).split())
+    text = " ".join((_http_error_body(exc) or str(exc)).split())
     if not text or not config._CONTEXT_OVERFLOW_RE.search(text):
+        return ""
+    return f"HTTP {status}: {text[:300]}{'…' if len(text) > 300 else ''}"
+
+def _model_not_found_reason(exc) -> str:
+    """Why a request was rejected because the server could not find the model it named
+    ('' when it does not look like that). Router-mode llama-server answers a request for
+    a model it has no preset for with HTTP 400 "model '<name>' not found"."""
+    status = getattr(exc, "code", None) or getattr(exc, "status", None) or 0
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        status = 0
+    if status not in config._MODEL_NOT_FOUND_STATUS:
+        return ""
+    text = " ".join((_http_error_body(exc) or str(exc)).split())
+    if not text or not config._MODEL_NOT_FOUND_RE.search(text):
         return ""
     return f"HTTP {status}: {text[:300]}{'…' if len(text) > 300 else ''}"
 

@@ -3404,6 +3404,19 @@ class TestProbeContextWindow(unittest.TestCase):
         ):
             self.assertEqual(h.request.probe_context_window(), 0)
 
+    def test_list_models_returns_ids(self):
+        payload = {"data": [{"id": "qwen-q5"}, {"id": "gemma4-31b"}]}
+        with mock.patch(
+            "urllib.request.urlopen", return_value=self._fake_response(payload)
+        ):
+            self.assertEqual(h.request.list_models(), ["qwen-q5", "gemma4-31b"])
+
+    def test_list_models_is_empty_when_the_probe_fails(self):
+        with mock.patch(
+            "urllib.request.urlopen", side_effect=urllib.error.URLError("down")
+        ):
+            self.assertEqual(h.request.list_models(), [])
+
     def test_api_url_line(self):
         old = h.state.API_URL
         h.state.API_URL = "http://example.com/v1/chat/completions"
@@ -8811,6 +8824,26 @@ class TestCompaction(unittest.TestCase):
             else:
                 self.assertEqual(reason, "")
 
+    def test_model_not_found_recognition_is_about_the_model_name(self):
+        def rejected(code, body):
+            return urllib.error.HTTPError(
+                "http://127.0.0.1:11434/v1/chat/completions", code, "Bad Request", {},
+                io.BytesIO(body.encode("utf-8")),
+            )
+
+        cases = [
+            (400, '{"error": {"message": "model \'local-model\' not found"}}', True),
+            (404, "model name is missing from the request", True),
+            (400, '{"error": {"message": "invalid tool schema: expected object"}}', False),
+            (500, "model 'local-model' not found", False),  # a crash is not a model rejection
+        ]
+        for code, body, is_model_not_found in cases:
+            reason = h.errors._model_not_found_reason(rejected(code, body))
+            if is_model_not_found:
+                self.assertIn(f"HTTP {code}", reason)
+            else:
+                self.assertEqual(reason, "")
+
     def test_chat_raises_context_overflow_for_a_refused_prompt(self):
         h.request.chat = self._saved["chat"]  # the real one, this time
 
@@ -8979,6 +9012,67 @@ class TestAgentSeam(Base):
         code = h.agent.run_agent([{"role": "user", "content": "go"}], "m", execute=spy)
         self.assertEqual(code, 0)
         self.assertEqual(seen, [(0, "task"), (1, "made_up")])
+
+    def test_a_model_not_found_rejection_says_to_pass_a_model(self):
+        def refuse(*args, **kwargs):
+            raise urllib.error.HTTPError(
+                "http://127.0.0.1:11434/v1/chat/completions", 400, "Bad Request", {},
+                io.BytesIO(
+                    b'{"error":{"code":400,"message":"model \'local-model\' not found",'
+                    b'"type":"invalid_request_error"}}'
+                ),
+            )
+
+        old_stream = h.request.stream_once
+        h.request.stream_once = refuse
+        self.addCleanup(setattr, h.request, "stream_once", old_stream)
+        old_list = h.request.list_models
+        h.request.list_models = lambda: ["qwen-q5", "gemma4-31b"]
+        self.addCleanup(setattr, h.request, "list_models", old_list)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = h.agent.run_agent(
+                [{"role": "user", "content": "go"}], "local-model",
+                execute=h.toolkit.execute_tool,
+            )
+        out = buf.getvalue()
+        self.assertEqual(code, 1)
+        self.assertIn("rejected the model name 'local-model'", out)
+        self.assertIn("available models: qwen-q5, gemma4-31b", out)
+        self.assertIn("--model", out)
+
+    def test_a_model_not_found_rejection_on_the_fallback_path_says_so(self):
+        def no_deltas(*args, **kwargs):
+            return None, False
+
+        def refuse(*args, **kwargs):
+            raise urllib.error.HTTPError(
+                "http://127.0.0.1:11434/v1/chat/completions", 400, "Bad Request", {},
+                io.BytesIO(
+                    b'{"error":{"code":400,"message":"model \'local-model\' not found",'
+                    b'"type":"invalid_request_error"}}'
+                ),
+            )
+
+        old_stream = h.request.stream_once
+        h.request.stream_once = no_deltas
+        self.addCleanup(setattr, h.request, "stream_once", old_stream)
+        old_chat = h.request.chat
+        h.request.chat = refuse
+        self.addCleanup(setattr, h.request, "chat", old_chat)
+        old_list = h.request.list_models
+        h.request.list_models = lambda: ["qwen-q5"]
+        self.addCleanup(setattr, h.request, "list_models", old_list)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = h.agent.run_agent(
+                [{"role": "user", "content": "go"}], "local-model",
+                execute=h.toolkit.execute_tool,
+            )
+        out = buf.getvalue()
+        self.assertEqual(code, 1)
+        self.assertIn("rejected the model name 'local-model'", out)
+        self.assertIn("available models: qwen-q5", out)
 
     def test_no_core_module_reaches_up_to_the_entry_point(self):
         """The rule the split rests on: a module under harnless_core may read anything below
