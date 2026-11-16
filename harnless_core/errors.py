@@ -4,7 +4,7 @@ rejection is recognised.
 These are signals rather than error strings: execute_tool re-raises them so the agent
 loop can act on them instead of feeding them back to the model as a tool failure."""
 
-from harnless_core import config
+from harnless_core import config, content
 
 
 class ExitSignal(Exception):
@@ -22,13 +22,17 @@ def _http_error_body(exc) -> str:
 
     urllib's HTTPError is its own response object: reading it consumes the body, so a
     caller that reads it to classify the failure (context overflow) would leave nothing
-    for the next caller (the model-not-found hint). Caching keeps both answers."""
+    for the next caller (the model-not-found hint). Caching keeps both answers.
+
+    The body is read through content.py like every other response: a proxy that gzips
+    an error leaves the server's own wording unreadable, and both patterns below match
+    against that wording — the failure would be silent, with compaction never firing."""
     cached = getattr(exc, "_harnless_body", None)
     if cached is not None:
         return cached
     try:
-        body = exc.read().decode("utf-8", "replace")  # an HTTPError is its own response
-    except (OSError, AttributeError, ValueError):
+        body = content.decode(exc).decode("utf-8", "replace")  # an HTTPError is its own response
+    except (OSError, AttributeError, ValueError):  # no body at all, or a coding nothing here reads
         body = ""
     try:
         exc._harnless_body = body

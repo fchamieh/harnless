@@ -41,6 +41,11 @@ CONTEXT_PROGRESS_THRESHOLD = 30_000
 # Chunk size the counting opener writes the request body in, so upload
 # progress is observable (http.client would otherwise sendall() it at once).
 PROGRESS_CHUNK = 64 * 1024
+# Chunk size a content-coded *response* is read in (see content.py): read as it
+# arrives, so a compressed SSE stream is still cut into lines while it streams.
+RESPONSE_CHUNK = 64 * 1024
+# gzip level for `--upstream-gzip` request bodies: zlib's own default.
+GZIP_LEVEL = 6
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_REMOTE_BYTES = 10 * 1024 * 1024
 # Output caps. Two layers: a tool's `limit`-style argument is model-facing (the

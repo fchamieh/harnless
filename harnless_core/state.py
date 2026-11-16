@@ -14,6 +14,13 @@ API_URL = "http://127.0.0.1:11434/v1/chat/completions"
 API_KEY = None
 MODEL = "local-model"
 TEMPERATURE = 1.0
+# gzip the *request* body (--upstream-gzip). Off by default, and deliberately the
+# user's call rather than ours: decoding Content-Encoding on the way in is a server
+# capability llama-server and most gateways do not have, and it is a property of the
+# one endpoint a run talks to. The other direction needs no flag — a response is
+# read decoded whenever the server sends it that way (see content.py). MCP servers
+# and fetch_url are separate endpoints, so this says nothing about them.
+UPSTREAM_GZIP = False
 MAX_SUBAGENT_DEPTH = 2
 # Runaway guard: how many model turns (API calls) a single sub-agent may take
 # before its run is stopped; 0 disables the guard. Only sub-agents are capped —

@@ -11,7 +11,7 @@ import threading
 import time
 import urllib
 
-from harnless_core import config, errors, journal, lineedit, measure, render, state
+from harnless_core import config, content, errors, journal, lineedit, measure, render, state
 
 
 def _response_socket(resp):
@@ -140,11 +140,38 @@ def normalize_api_url(url: str | None) -> str:
         return endpoint
     return endpoint + "/chat/completions"
 
-def _headers() -> dict:
-    headers = {"Content-Type": "application/json"}
+def _headers(extra: dict = None) -> dict:
+    """What every request to the API sends.
+
+    `Accept-Encoding` is the half urllib does not do on its own: without it a
+    conforming server sends plain text, and a proxy that compresses anyway would
+    leave us reading gzip bytes as UTF-8 (see content.py for the reading half).
+    Only codings we can decode are advertised. `extra` is what the *request*
+    side adds — the `Content-Encoding` a `--upstream-gzip` body carries."""
+    headers = {"Content-Type": "application/json", "Accept-Encoding": content.ACCEPT_ENCODING}
     if state.API_KEY:
         headers["Authorization"] = f"Bearer {state.API_KEY}"
+    if extra:
+        headers.update(extra)
     return headers
+
+
+def _encode_body(body: dict) -> tuple:
+    """The request body as bytes, and the header that says so.
+
+    `state.UPSTREAM_GZIP` — the `--upstream-gzip` flag — is the user's answer to
+    "does the endpoint I am connecting to decode gzip", because it is the one
+    endpoint a run talks to. Nothing here guesses, and nothing here is a promise:
+    a body gzip would only enlarge is sent plain (content.compress says so), and
+    urllib sets Content-Length from whatever bytes come back, so the compressed
+    length is the one that goes on the wire."""
+    payload = json.dumps(body).encode("utf-8")
+    if not state.UPSTREAM_GZIP:
+        return payload, {}
+    packed = content.compress(payload)
+    if packed is None:
+        return payload, {}
+    return packed, {"Content-Encoding": "gzip"}
 
 def _fetch_models() -> list:
     """Best-effort: the model objects the API advertises at /models.
@@ -157,7 +184,7 @@ def _fetch_models() -> list:
     try:
         req = urllib.request.Request(models_url, headers=_headers())
         with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+            data = json.loads(content.decode(resp).decode("utf-8"))
     except Exception:
         return []
     return data.get("data") or []
@@ -263,15 +290,15 @@ def chat(
     temperature: float = 1.0,
     conv_id: int = None,
 ) -> dict:
-    payload = json.dumps(
+    payload, encoded = _encode_body(
         _request_body(messages, model, tools=tools, temperature=temperature)
-    ).encode("utf-8")
-    req = urllib.request.Request(state.API_URL, data=payload, headers=_headers())
+    )
+    req = urllib.request.Request(state.API_URL, data=payload, headers=_headers(encoded))
     spinner = ContextProgress(messages, tools)
     spinner.start()
     try:
         with _open_request(req, spinner if spinner.active else None) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+            data = json.loads(content.decode(resp).decode("utf-8"))
     except urllib.error.HTTPError as e:
         # A prompt the server refuses because it is too long is something the agent can
         # act on — compact and retry. Anything else stays the error it was.
@@ -317,10 +344,10 @@ def _build_request(
     tools: list = None,
     temperature: float = 1.0,
 ) -> urllib.request.Request:
-    payload = json.dumps(
+    payload, encoded = _encode_body(
         _request_body(messages, model, stream, tools=tools, temperature=temperature)
-    ).encode("utf-8")
-    return urllib.request.Request(state.API_URL, data=payload, headers=_headers())
+    )
+    return urllib.request.Request(state.API_URL, data=payload, headers=_headers(encoded))
 
 def parse_sse_line(line: str):
     """Parse one SSE line from a streaming chat response.
@@ -388,7 +415,7 @@ def stream_chat(
         if watcher is not None:
             watcher.attach_socket(_response_socket(resp))
         try:
-            for raw in resp:
+            for raw in content.iter_lines(resp):
                 if watcher is not None and watcher.triggered:
                     break
                 parsed = parse_sse_line(raw.decode("utf-8"))

@@ -11,7 +11,7 @@ import subprocess
 import threading
 import urllib
 
-from harnless_core import caps, config, render, state
+from harnless_core import caps, config, content, render, state
 
 
 class MCPError(Exception):
@@ -350,6 +350,7 @@ class MCPClient:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
+            "Accept-Encoding": content.ACCEPT_ENCODING,
         }
         headers.update(self._headers)
         if self._session_id:
@@ -361,7 +362,7 @@ class MCPClient:
             if sid:
                 self._session_id = sid
             ctype = resp.headers.get("Content-Type", "")
-            body = resp.read().decode("utf-8")
+            body = content.decode(resp).decode("utf-8")
         return ctype, body
 
     def _parse_sse_response(self, body: str, want_id):

@@ -75,6 +75,7 @@ context and compaction could not help — plus whatever code the agent's own `ex
 |---|---|
 | `--api-url URL` | OpenAI-compatible endpoint (a base URL like `https://host/v1` or a full `.../chat/completions` URL) |
 | `--api-key KEY` | Sent as `Authorization: Bearer <key>` (omit for unauthenticated local servers) |
+| `--upstream-gzip` | Compress every request body with gzip and send it as `Content-Encoding: gzip` — only for an endpoint **known to decode it**: llama-server, and most providers and gateways, reject a compressed body. A body gzip would only enlarge is sent plain. See [Wire encoding](#wire-encoding) |
 | `--model NAME` | Model name sent in the request |
 | `--system-prompt TEXT` | Replace the built-in system prompt |
 | `--temperature N` | Sampling temperature (default `1.0`) |
@@ -89,6 +90,23 @@ context and compaction could not help — plus whatever code the agent's own `ex
 | `--resume SPEC` | Continue a recorded session: a session id, a `"<id>.<chain>"` sub-agent log, `latest`, or a path to a `.jsonl` |
 | `--resume-last [N]` | Continue the **newest** recorded session, keeping only its last N messages (no value or `0` = all). With `--resume` it only trims that session. Nothing recorded yet → warns and starts a fresh session |
 | `--version` | Print the version and exit |
+
+### Wire encoding
+
+Responses need no flag. urllib advertises nothing and hands back exactly the bytes a
+server sent, so a server — or a proxy or CDN in front of one — that gzips an answer would
+leave the harness decoding compressed bytes as text. `harnless_core/content.py` is the one
+place that knows content-codings: every request says `Accept-Encoding: gzip, deflate`, every
+body (a completion, an SSE stream, an error message, the `/models` probe, an MCP response, a
+`fetch_url` page) is read back through it, and a coding the stdlib cannot decode — `br`,
+`zstd` — is an error rather than mojibake. A stream is inflated as it arrives, so a compressed
+stream still streams.
+
+The other direction needs the server's agreement, so it is opt-in and global: `--upstream-gzip`
+gzips each request body for the one endpoint a run talks to. Nothing is guessed, a body that
+would grow goes out plain, and a zlib failure sends plain JSON instead of failing the request.
+The saving is real for text (a 3 KB prompt of repeated context became 113 bytes) and modest for
+base64 image data, which still gives up about a quarter of its size.
 
 ### Session log
 

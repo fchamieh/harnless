@@ -9094,5 +9094,507 @@ class TestAgentSeam(Base):
             self.assertEqual(sorted(used & owned), [], f"{path.name} uses a name owned by harnless.py")
 
 
+class TestContentCoding(unittest.TestCase):
+    """content.py: the half urllib does not do — what a response may come back as,
+    and what `--upstream-gzip` asks for on the way out."""
+
+    class _Resp:
+        """A response with the one header that matters, and a read() like urllib's."""
+
+        def __init__(self, body: bytes, encoding: str = None):
+            self._data = body
+            self.headers = email.message.Message()
+            if encoding:
+                self.headers["Content-Encoding"] = encoding
+
+        def read(self, n=-1):
+            return self._data if n is None or n < 0 else self._data[:n]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def test_advertises_only_what_it_can_read(self):
+        advertised = [name.strip() for name in h.content.ACCEPT_ENCODING.split(",")]
+        self.assertIn("gzip", advertised)
+        self.assertIn("deflate", advertised)
+        # br and zstd have no codec in the stdlib: advertising one would be asking
+        # the server for bytes nothing here can read.
+        self.assertNotIn("br", advertised)
+        self.assertNotIn("zstd", advertised)
+        for name in advertised:
+            self.assertIn(name, h.content.DECODABLE)
+
+    def test_api_request_headers_advertise_it(self):
+        headers = h.request._headers()
+        self.assertEqual(headers["Accept-Encoding"], h.content.ACCEPT_ENCODING)
+        self.assertEqual(headers["Content-Type"], "application/json")
+        packed = h.request._headers({"Content-Encoding": "gzip"})
+        self.assertEqual(packed["Content-Encoding"], "gzip")  # the --upstream-gzip half
+        self.assertEqual(packed["Accept-Encoding"], h.content.ACCEPT_ENCODING)  # still asked
+
+    def test_plain_body_comes_back_untouched(self):
+        self.assertEqual(h.content.decode(self._Resp(b'{"a":1}')), b'{"a":1}')
+
+    def test_gzip_body(self):
+        import gzip
+
+        body = json.dumps({"choices": [{"message": {"content": "hi"}}]}).encode("utf-8")
+        out = h.content.decode(self._Resp(gzip.compress(body), "gzip"))
+        self.assertEqual(json.loads(out), json.loads(body))
+
+    def test_x_gzip_body(self):
+        import gzip
+
+        self.assertEqual(
+            h.content.decode(self._Resp(gzip.compress(b"hi"), "x-gzip")), b"hi"
+        )
+
+    def test_deflate_body_zlib_wrapped_or_raw(self):
+        import zlib
+
+        self.assertEqual(
+            h.content.decode(self._Resp(zlib.compress(b"hi"), "deflate")), b"hi"
+        )
+        deflater = zlib.compressobj(wbits=-zlib.MAX_WBITS)  # raw deflate: no zlib header
+        raw = deflater.compress(b"hi") + deflater.flush()
+        self.assertEqual(h.content.decode(self._Resp(raw, "deflate")), b"hi")
+
+    def test_coding_chain_unwinds_outermost_first(self):
+        # 'gzip, deflate' is the order it was applied in, so deflate is what is on the wire.
+        import gzip
+        import zlib
+
+        wire = zlib.compress(gzip.compress(b'{"a":1}'))
+        self.assertEqual(h.content.decode(self._Resp(wire, "gzip, deflate")), b'{"a":1}')
+
+    def test_identity_claim_is_not_a_coding(self):
+        self.assertEqual(h.content.codings(self._Resp(b"hi", "identity")), [])
+        self.assertEqual(h.content.decode(self._Resp(b"hi", "identity")), b"hi")
+
+    def test_truncated_body_keeps_what_arrived(self):
+        import gzip
+
+        plain = json.dumps({"a": 1, "b": "x" * 8000}).encode("utf-8")
+        wire = gzip.compress(plain)
+        # A connection that died mid-stream: what arrived is still the body's head.
+        out = h.content.decode(self._Resp(wire[:-12], "gzip"))
+        self.assertTrue(out.startswith(b'{"a"'))
+        self.assertLess(len(out), len(plain))
+        self.assertGreater(len(out), 1000)
+        self.assertEqual(h.content.decode(self._Resp(wire, "gzip")), plain)
+
+    def test_unreadable_coding_raises_rather_than_mojibake(self):
+        with self.assertRaises(h.content.ContentEncodingError):
+            h.content.decode(self._Resp(b"\x28\xb5\x2f\xfd\x00", "zstd"))
+        # A ValueError, so fetch_url keeps reporting it as a tool error and
+        # _http_error_body keeps falling back to an empty body.
+        self.assertTrue(issubclass(h.content.ContentEncodingError, ValueError))
+
+    def test_response_that_is_not_really_a_response(self):
+        # What the probe tests hand in as a response: a bare BytesIO, no headers.
+        self.assertEqual(h.content.decode(io.BytesIO(b'{"data":[]}')), b'{"data":[]}')
+        self.assertEqual(list(h.content.iter_lines(io.BytesIO(b"a\nb\n"))), [b"a\n", b"b\n"])
+
+    def test_limit_caps_the_wire_read(self):
+        self.assertEqual(h.content.decode(self._Resp(b"x" * 1000), 10), b"x" * 10)
+        import gzip
+
+        # Incompressible payload, so the ceiling on the wire is a ceiling on the body.
+        payload = b'{"a":"' + base64.b64encode(os.urandom(100_000)) + b'"}'
+        out = h.content.decode(self._Resp(gzip.compress(payload), "gzip"), 64)
+        self.assertTrue(out.startswith(b'{"a":"'))
+        self.assertLess(len(out), 200)
+
+    def test_compress_only_when_it_shrinks(self):
+        import gzip
+
+        body = json.dumps(
+            [{"role": "user", "content": "hello there " * 60}] * 12
+        ).encode("utf-8")
+        packed = h.content.compress(body)
+        self.assertIsNotNone(packed)
+        self.assertLess(len(packed), len(body) // 2)
+        self.assertEqual(gzip.decompress(packed), body)
+        self.assertIsNone(h.content.compress(b""))  # nothing to send
+        self.assertIsNone(h.content.compress(b"{}"))  # a body gzip would only enlarge
+        self.assertIsNone(h.content.compress(os.urandom(100_000)))  # the truly incompressible
+        # Base64 — how images ride along — is not opaque to gzip: it carries 6
+        # entropy bits per byte, so it gives up about a quarter of its size.
+        b64 = base64.b64encode(os.urandom(8192))
+        packed_b64 = h.content.compress(b64)
+        self.assertIsNotNone(packed_b64)
+        self.assertLess(len(packed_b64), len(b64))
+
+    def test_compress_failure_sends_plain_instead_of_failing(self):
+        with mock.patch.object(h.content.gzip, "compress", side_effect=RuntimeError("no zlib")):
+            self.assertIsNone(h.content.compress(b"hello" * 500))
+
+    def test_iter_lines_leaves_the_plain_path_alone(self):
+        # What the stream tests hand in: an iterator of lines, no headers, no read().
+        lines = [b"data: a\n", b"data: b\n", b"data: [DONE]\n"]
+        self.assertEqual(list(h.content.iter_lines(iter(lines))), lines)
+
+    def test_iter_lines_cuts_a_coded_stream_as_it_arrives(self):
+        import gzip
+
+        wire = gzip.compress(b"data: one\ndata: two\ndata: [DONE]\n")
+
+        class Chunked:
+            """Hands the wire back in pieces smaller than one SSE line."""
+
+            def __init__(self, blob: bytes, step: int):
+                self.headers = email.message.Message()
+                self.headers["Content-Encoding"] = "gzip"
+                self._pieces = [blob[i : i + step] for i in range(0, len(blob), step)]
+                self._next = 0
+
+            def read(self, size):
+                if self._next >= len(self._pieces):
+                    return b""
+                piece = self._pieces[self._next]
+                self._next += 1
+                return piece
+
+        # A gzip member that arrives 3 bytes at a time still becomes 3 SSE lines,
+        # which is what a token-by-token stream needs: no waiting for the whole body.
+        self.assertEqual(
+            list(h.content.iter_lines(Chunked(wire, 3))),
+            [b"data: one\n", b"data: two\n", b"data: [DONE]\n"],
+        )
+
+    def test_iter_lines_refuses_an_unreadable_coding(self):
+        with self.assertRaises(h.content.ContentEncodingError):
+            list(h.content.iter_lines(self._Resp(b"data: x\n", "br")))
+
+
+class TestEncodedResponses(unittest.TestCase):
+    """End to end: a server — or the proxy in front of one — that content-codes its
+    answers. Before content.py every one of these readers decoded gzip bytes as text."""
+
+    def _serve(self, handler_cls):
+        import threading
+        from http.server import ThreadingHTTPServer
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)  # cleanups run last-added-first: stop, then close
+        return server
+
+    def test_chat_reads_a_gzipped_completion(self):
+        import gzip
+        from http.server import BaseHTTPRequestHandler
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                payload = gzip.compress(
+                    json.dumps(
+                        {
+                            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                            "usage": {"prompt_tokens": 11, "completion_tokens": 1},
+                        }
+                    ).encode("utf-8")
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        server = self._serve(Handler)
+        old_url = h.state.API_URL
+        h.state.API_URL = f"http://127.0.0.1:{server.server_address[1]}/v1/chat/completions"
+        self.addCleanup(setattr, h.state, "API_URL", old_url)
+        data = h.request.chat([{"role": "user", "content": "hi"}], "m")
+        self.assertEqual(data["choices"][0]["message"]["content"], "ok")
+
+    def test_stream_chat_reads_a_chunked_gzipped_sse_stream(self):
+        import gzip
+        from http.server import BaseHTTPRequestHandler
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                text = (
+                    "data: " + json.dumps({"choices": [{"delta": {"content": "hello"}}]}) + "\n"
+                    + "data: " + json.dumps({"choices": [{"delta": {"content": " world"}}]}) + "\n"
+                    + "data: [DONE]\n"
+                )
+                blob = gzip.compress(text.encode("utf-8"))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                # 17-byte chunks: the decompressor is fed far less than a line at a time.
+                for i in range(0, len(blob), 17):
+                    piece = blob[i : i + 17]
+                    self.wfile.write(b"%x\r\n" % len(piece) + piece + b"\r\n")
+                    self.wfile.flush()
+                self.wfile.write(b"0\r\n\r\n")
+
+        server = self._serve(Handler)
+        old_url = h.state.API_URL
+        h.state.API_URL = f"http://127.0.0.1:{server.server_address[1]}/v1/chat/completions"
+        self.addCleanup(setattr, h.state, "API_URL", old_url)
+        deltas = list(h.request.stream_chat([{"role": "user", "content": "hi"}], "m"))
+        self.assertEqual(deltas, [{"content": "hello"}, {"content": " world"}])
+
+    def test_gzipped_overflow_rejection_still_reads_as_an_overflow(self):
+        """The silent one: a gzipped rejection used to decode into mojibake, the
+        server's wording stopped matching, and compaction never fired."""
+        import gzip
+        from http.server import BaseHTTPRequestHandler
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                payload = gzip.compress(
+                    json.dumps(
+                        {"error": {"message": "this model context length is exceeded"}}
+                    ).encode("utf-8")
+                )
+                self.send_response(413)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        server = self._serve(Handler)
+        old_url = h.state.API_URL
+        h.state.API_URL = f"http://127.0.0.1:{server.server_address[1]}/v1/chat/completions"
+        self.addCleanup(setattr, h.state, "API_URL", old_url)
+        with self.assertRaises(h.errors.ContextOverflow) as caught:
+            h.request.chat([{"role": "user", "content": "hi"}], "m")
+        self.assertIn("context length is exceeded", str(caught.exception))
+
+    def test_gzipped_error_body_is_readable_to_both_rejection_patterns(self):
+        """Both rejection probes read the server's own wording out of the body —
+        which is exactly what a gzipped error used to make impossible."""
+        import gzip
+
+        headers = email.message.Message()
+        headers["Content-Encoding"] = "gzip"
+        for status, probe, needle in (
+            (400, h.errors._context_overflow_reason, "this model context length is exceeded"),
+            (404, h.errors._model_not_found_reason, "model local-model not found"),
+        ):
+            body = gzip.compress(json.dumps({"error": {"message": needle}}).encode("utf-8"))
+            err = urllib.error.HTTPError(
+                "http://127.0.0.1/x", status, "Bad Request", headers, io.BytesIO(body)
+            )
+            self.assertIn(needle, probe(err))
+            self.assertEqual(h.errors._http_error_body(err), json.dumps({"error": {"message": needle}}))
+
+    def test_models_probe_reads_a_gzipped_payload(self):
+        import gzip
+
+        payload = gzip.compress(
+            json.dumps({"data": [{"id": "m1", "context_length": 8192}]}).encode("utf-8")
+        )
+        resp = TestContentCoding._Resp(payload, "gzip")
+        with mock.patch("urllib.request.urlopen", return_value=resp):
+            self.assertEqual(h.request.probe_context_window(), 8192)
+            self.assertEqual(h.request.list_models(), ["m1"])
+
+    def test_fetch_url_reads_a_gzipped_page(self):
+        import gzip
+
+        class Resp:
+            def __init__(self, body: bytes, encoding: str):
+                self._data = body
+                self.headers = email.message.Message()
+                self.headers["Content-Encoding"] = encoding
+                self.headers["Content-Type"] = "text/html; charset=utf-8"
+
+            def read(self, n=-1):
+                return self._data if n is None or n < 0 else self._data[:n]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with mock.patch(
+            "urllib.request.urlopen",
+            return_value=Resp(gzip.compress(b"<h1>Title</h1><p>ok</p>"), "gzip"),
+        ):
+            self.assertEqual(
+                h.toolkit.tool_fetch_url({"url": "https://x", "strip_html": True}), "Title\n\nok"
+            )
+
+    def test_fetch_url_reports_a_coding_it_cannot_read(self):
+        class Resp:
+            def __init__(self):
+                self.headers = email.message.Message()
+                self.headers["Content-Encoding"] = "br"
+
+            def read(self, n=-1):
+                return b"\x0b\x06\x00"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with mock.patch("urllib.request.urlopen", return_value=Resp()):
+            out = h.toolkit.tool_fetch_url({"url": "https://x"})
+        self.assertTrue(out.startswith("error: could not fetch https://x:"))
+        self.assertIn("br", out)
+
+    def test_mcp_http_transport_reads_a_gzipped_response(self):
+        import gzip
+
+        result = {"jsonrpc": "2.0", "id": 1, "result": {"tools": [{"name": "t"}]}}
+        resp = TestContentCoding._Resp(gzip.compress(json.dumps(result).encode("utf-8")), "gzip")
+        client = h.mcp.MCPClient("srv", {"transport": "http", "url": "http://127.0.0.1:1/mcp"})
+        client._connect_http()
+        with mock.patch.object(h.mcp.urllib.request, "urlopen", return_value=resp) as sent:
+            ctype, body = client._http_post({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        self.assertEqual(json.loads(body), result)
+        request_headers = {k.lower(): v for k, v in sent.call_args[0][0].headers.items()}
+        self.assertEqual(request_headers.get("accept-encoding"), h.content.ACCEPT_ENCODING)
+
+
+class TestUpstreamGzip(Base):
+    """`--upstream-gzip`: compressing the request body is the half the *server* has
+    to agree to, so it is a global flag the user sets for the one endpoint a run
+    talks to — never a guess, and never at the cost of a request that fails."""
+
+    def setUp(self):
+        super().setUp()  # Base makes ./_test_tmp, which the CLI test writes its session log into
+        self.old_flag = h.state.UPSTREAM_GZIP
+        self.old_url = h.state.API_URL
+        self.addCleanup(setattr, h.state, "UPSTREAM_GZIP", self.old_flag)
+        self.addCleanup(setattr, h.state, "API_URL", self.old_url)
+
+    def _echo_server(self):
+        """Answers with what it was sent, so a test can see the wire it produced."""
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import gzip as _gzip
+
+        seen = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                encoding = (self.headers.get("Content-Encoding") or "").lower()
+                body = _gzip.decompress(raw) if encoding == "gzip" else raw
+                seen.clear()
+                seen.update(
+                    {
+                        "content_encoding": encoding or None,
+                        "wire": len(raw),
+                        "inflated": len(body),
+                        "json": json.loads(body) if body[:1] == b"{" else None,
+                    }
+                )
+                payload = json.dumps(
+                    {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)  # cleanups run last-added-first: stop, then close
+        h.state.API_URL = f"http://127.0.0.1:{server.server_address[1]}/v1/chat/completions"
+        self.seen = seen
+        return server
+
+    def _ask(self, content="hi"):
+        return h.request.chat([{"role": "user", "content": content}], "m")
+
+    def test_off_by_default_and_sends_plain_json(self):
+        self._echo_server()
+        h.state.UPSTREAM_GZIP = False
+        self.assertEqual(self._ask()["choices"][0]["message"]["content"], "ok")
+        self.assertIsNone(self.seen["content_encoding"])
+        self.assertEqual(self.seen["json"]["messages"][0]["content"], "hi")
+
+    def test_on_compresses_the_body_and_says_so(self):
+        self._echo_server()
+        h.state.UPSTREAM_GZIP = True
+        self._ask("context " * 400)
+        self.assertEqual(self.seen["content_encoding"], "gzip")
+        self.assertLess(self.seen["wire"], self.seen["inflated"])
+        # The endpoint sees the same JSON it would have been sent plain.
+        self.assertEqual(self.seen["json"]["messages"][0]["content"], "context " * 400)
+        self.assertEqual(self.seen["json"]["model"], "m")
+
+    def test_a_body_gzip_would_only_enlarge_goes_out_plain(self):
+        # 82 bytes of JSON: gzip's header, deflate block and trailer alone cost more
+        # than the body, so the guard sends it plain even with the flag on.
+        self._echo_server()
+        h.state.UPSTREAM_GZIP = True
+        self._ask("x")
+        self.assertIsNone(self.seen["content_encoding"])
+        self.assertEqual(self.seen["wire"], self.seen["inflated"])
+
+    def test_streaming_requests_are_compressed_too(self):
+        """`_build_request` is the other path to the same endpoint."""
+        self._echo_server()
+        h.state.UPSTREAM_GZIP = True
+        list(h.request.stream_chat([{"role": "user", "content": "context " * 400}], "m"))
+        self.assertEqual(self.seen["content_encoding"], "gzip")
+        self.assertTrue(self.seen["json"]["stream"])
+        self.assertEqual(self.seen["json"]["stream_options"], {"include_usage": True})
+
+    def test_status_reports_the_half_the_user_opted_into(self):
+        messages = [{"role": "user", "content": "hi"}]
+        h.state.UPSTREAM_GZIP = False
+        self.assertNotIn("gzipped", h.format_status(messages))
+        h.state.UPSTREAM_GZIP = True
+        self.assertIn("request bodies gzipped", h.format_status(messages))
+
+    def test_cli_flag_is_accepted(self):
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "harnless.py",
+                "--upstream-gzip",
+                "--no-color",
+                "--context-window",
+                "1000",
+                "--sessions-dir",
+                os.path.join(self.tmp, "sessions"),
+            ],
+            input="/exit\n",
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=60,
+        )
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("(api:", proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

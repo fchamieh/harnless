@@ -28,6 +28,7 @@ tests make.
 | `caps.py` | output ceilings and how a capped value says so |
 | `paths.py` | CWD containment and path resolution |
 | `measure.py` | what the next request costs (`estimate_context_tokens`) |
+| `content.py` | a body's content-codings: what we advertise (`Accept-Encoding`), how a coded body is read back whole (`decode`) or as it arrives (`iter_lines`), and how `--upstream-gzip` packs one (`compress`) |
 | `render.py` | colour/icon tables, the Markdown renderer, printers, terminal widths |
 | `toolspec.py` | the contract the model is shown: one OpenAI schema per built-in tool |
 | `journal.py` | the session journal: records, resume, replay, the `sessions` tool |
@@ -62,6 +63,11 @@ Three rules keep the layers honest:
 
 ## Notes
 
+- **Only `content.py` knows content-codings.** urllib advertises no `Accept-Encoding` and hands
+  back exactly the bytes a server sent, so every body reader — `chat`, `stream_chat`, the
+  `/models` probe, `errors._http_error_body`, the MCP transport, `fetch_url` — reads through it.
+  The one that would fail quietly is `errors._http_error_body`: a gzipped rejection decoded as
+  text stops `_CONTEXT_OVERFLOW_RE` matching, and compaction never fires.
 - `tests.py` imports the module directly (`import harnless`) and patches the module that
   owns each name (`h.request.chat = ...`).
 - `run_shell` waits on the command *wrapper*, with daemon readers draining the pipes;

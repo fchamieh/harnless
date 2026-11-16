@@ -24,7 +24,7 @@ import urllib
 import urllib.error
 import urllib.request
 
-from harnless_core import agent, caps, config, context, errors, journal, lineedit, mcp, paths, render, search, shell, state, toolspec
+from harnless_core import agent, caps, config, content, context, errors, journal, lineedit, mcp, paths, render, search, shell, state, toolspec
 
 def tool_get_cwd(args: dict) -> str:
     return state.CWD
@@ -192,12 +192,13 @@ def tool_fetch_url(args: dict) -> str:
         headers={
             "User-Agent": "harnless/1.0",
             "Accept": "text/html,application/xhtml+xml,application/json,text/plain,*/*",
+            "Accept-Encoding": content.ACCEPT_ENCODING,
         },
     )
     max_bytes = 2_000_000
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = resp.read(max_bytes + 1)
+            data = content.decode(resp, max_bytes + 1)
             charset = resp.headers.get_content_charset() or "utf-8"
     except urllib.error.HTTPError as e:
         return f"error: HTTP {e.code} {e.reason} for {url}"

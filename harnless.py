@@ -6,8 +6,8 @@ import atexit
 import os
 import sys
 
-from harnless_core import agent, caps, compact, config, context, errors, journal, lineedit, mcp, measure, paths, render, request, search, shell, state, toolkit, toolspec
-_MODULES = (agent, caps, compact, config, context, errors, journal, lineedit, mcp, measure, paths, render, request, search, shell, state, toolkit, toolspec)  # facade: moved modules
+from harnless_core import agent, caps, compact, config, content, context, errors, journal, lineedit, mcp, measure, paths, render, request, search, shell, state, toolkit, toolspec
+_MODULES = (agent, caps, compact, config, content, context, errors, journal, lineedit, mcp, measure, paths, render, request, search, shell, state, toolkit, toolspec)  # facade: moved modules
 
 
 def format_status(messages: list, context_window: int = 0, conv_id: int = None) -> str:
@@ -22,6 +22,9 @@ def format_status(messages: list, context_window: int = 0, conv_id: int = None) 
         else 0
     )
     tool_names = ", ".join(sorted(s["function"]["name"] for s in tools))
+    # What the wire looks like on the way out: the reading half is automatic, so
+    # only the half the user opted into (or did not) is worth a line here.
+    wire = "  (request bodies gzipped)" if state.UPSTREAM_GZIP else ""
     if prompt_tokens:
         ctx = f"context: {prompt_tokens} tokens (server-reported) in {len(messages)} messages"
     else:
@@ -33,7 +36,7 @@ def format_status(messages: list, context_window: int = 0, conv_id: int = None) 
         ctx += f" ({pct_str} of {context_window} window)"
     lines = [
         ctx,
-        f"api url: {state.API_URL}",
+        f"api url: {state.API_URL}{wire}",
         f"tools: {tool_names}",
         f"session: {state.SESSION_ID or '(no session id)'}  {journal._session_note()}",
         compact.format_compaction(),
@@ -119,6 +122,16 @@ def main():
         "--api-key",
         default=None,
         help="API key sent as 'Authorization: Bearer <key>' (omit for local servers that need no auth)",
+    )
+    parser.add_argument(
+        "--upstream-gzip",
+        action="store_true",
+        help=(
+            "gzip every request body and send it as Content-Encoding: gzip — only for "
+            "an endpoint known to decode it: llama-server, and most providers and "
+            "gateways, reject a compressed body. A body gzip would only enlarge is sent "
+            "plain. Responses are read decoded either way, compressed or not"
+        ),
     )
     parser.add_argument(
         "--model",
@@ -265,6 +278,7 @@ def main():
 
     state.API_URL = request.normalize_api_url(args.api_url)
     state.API_KEY = args.api_key
+    state.UPSTREAM_GZIP = args.upstream_gzip
     state.MODEL = args.model
     state.TEMPERATURE = args.temperature
     state.MAX_SUBAGENT_DEPTH = caps._clamp_int(args.max_subagents, 0, config.SUBAGENT_DEPTH_CEILING)
